@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Русификатор игр</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="app">
+  <!-- ============ боковая панель ============ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 32 32"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8b7bff"/><stop offset="1" stop-color="#ff6b9a"/></linearGradient></defs>
+          <path d="M9 2h14a8 8 0 0 1 8 8v8a8 8 0 0 1-8 8h-9l-6 5v-5.4A8 8 0 0 1 1 18v-8a8 8 0 0 1 8-8Z" fill="url(#lg)"/>
+          <text x="16" y="19.6" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-weight="700" font-size="12.5" fill="#fff">Ру</text></svg>
+      </div>
+      <div>
+        <div class="brand-title">Русификатор</div>
+        <div class="brand-sub">игр · <span id="ver">2.0</span></div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <button class="nav-item active" data-page="main"><span class="i" data-icon="globe"></span>Русификация</button>
+      <button class="nav-item" data-page="models"><span class="i" data-icon="layers"></span>Модели</button>
+      <button class="nav-item" data-page="settings"><span class="i" data-icon="gear"></span>Настройки</button>
+    </nav>
+
+    <div class="sidebar-foot">
+      <button class="order-cta" id="orderCta">
+        <span class="i" data-icon="pen"></span>
+        <span><b>Заказать перевод</b><small>ручная работа от автора</small></span>
+      </button>
+      <div class="engines">Ren'Py · RPG Maker · Unity</div>
+    </div>
+  </aside>
+
+  <main class="content">
+    <!-- ============ главная ============ -->
+    <section class="page active" id="page-main">
+      <header class="page-head">
+        <h1>Русификация игры</h1>
+        <p>Три шага — и игра на русском. Оригинальные файлы сохраняются, вернуть всё как было можно одной кнопкой.</p>
+      </header>
+
+      <!-- шаг 1 -->
+      <div class="card step">
+        <div class="step-num">1</div>
+        <div class="step-body">
+          <h2>Папка с игрой</h2>
+          <div class="game-empty" id="gameEmpty">
+            <span class="i big" data-icon="folder"></span>
+            <div class="grow"><b>Выберите папку с игрой</b><span class="muted">Корень игры — там, где лежит её .exe. Движок определится сам.</span></div>
+            <button class="btn" id="pickGame"><span class="i" data-icon="folder-open"></span>Обзор…</button>
+          </div>
+          <div class="game-info hidden" id="gameInfo">
+            <div class="game-main">
+              <div class="game-name" id="gameName"></div>
+              <div class="game-path" id="gamePath"></div>
+              <div class="chips" id="gameChips"></div>
+              <div class="notes" id="gameNotes"></div>
+            </div>
+            <button class="btn ghost" id="changeGame">Сменить</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- шаг 2 -->
+      <div class="card step">
+        <div class="step-num">2</div>
+        <div class="step-body">
+          <h2>Способ перевода</h2>
+          <div class="modes">
+            <button class="mode" data-mode="machine">
+              <span class="mode-ico"><span class="i" data-icon="cpu"></span></span>
+              <b>Машинный перевод</b>
+              <span class="mode-desc">Для слабых и старых ПК. Офлайн, бесплатно.</span>
+              <span class="mode-meta"><span class="q q2"></span>черновое качество</span>
+            </button>
+            <button class="mode" data-mode="local">
+              <span class="mode-ico"><span class="i" data-icon="chip"></span></span>
+              <b>Нейросеть на ПК</b>
+              <span class="mode-desc">Для мощных ПК. Офлайн, бесплатно, приватно.</span>
+              <span class="mode-meta"><span class="q q4"></span>хорошее качество</span>
+            </button>
+            <button class="mode" data-mode="cloud">
+              <span class="mode-ico"><span class="i" data-icon="cloud"></span></span>
+              <b>Облачная нейросеть</b>
+              <span class="mode-desc">Любой ПК. Нужен API-ключ провайдера.</span>
+              <span class="mode-meta"><span class="q q5"></span>отличное качество</span>
+            </button>
+            <button class="mode mode-order" data-mode="order">
+              <span class="mode-ico"><span class="i" data-icon="pen"></span></span>
+              <b>Заказать у автора</b>
+              <span class="mode-desc">Ручной перевод с вычиткой и проверкой в игре.</span>
+              <span class="mode-meta"><span class="q q6"></span>студийное качество</span>
+            </button>
+          </div>
+
+          <!-- панель: машинный -->
+          <div class="panel hidden" id="panel-machine">
+            <div class="status-row">
+              <span class="dot" id="mtDot"></span>
+              <div class="grow">
+                <b id="mtTitle">Модель машинного перевода</b>
+                <div class="muted" id="mtText"></div>
+              </div>
+              <button class="btn" id="mtDownload"><span class="i" data-icon="download"></span>Скачать сейчас</button>
+            </div>
+            <div class="dl hidden" id="mtProgress"><div class="bar"><div class="bar-fill"></div></div><div class="dl-text muted"></div></div>
+            <p class="hint">Нейросетевой машинный переводчик Argos (en→ru) работает на процессоре без видеокарты и без интернета.
+              Кнопки и меню переводятся по встроенному игровому словарю. Для художественных диалогов лучше нейросеть.</p>
+          </div>
+
+          <!-- панель: нейросеть на ПК -->
+          <div class="panel hidden" id="panel-local">
+            <div class="hw" id="hwLine"><span class="i" data-icon="monitor"></span><span id="hwText">Определяю железо…</span></div>
+            <div class="presets" id="presets"></div>
+            <div class="row gap">
+              <label class="switch"><input type="checkbox" id="useGpu" checked><span></span>Использовать видеокарту</label>
+              <span class="muted small">Ускоряет перевод в разы (NVIDIA, AMD, Intel — через Vulkan).</span>
+            </div>
+            <div class="dl hidden" id="localProgress"><div class="bar"><div class="bar-fill"></div></div><div class="dl-text muted"></div></div>
+            <p class="hint">Модели Gemma 4 от Google (Apache 2.0) скачиваются один раз и работают полностью офлайн.
+              Первый запуск на CPU может быть неспешным — это нормально.</p>
+          </div>
+
+          <!-- панель: облако -->
+          <div class="panel hidden" id="panel-cloud">
+            <div class="providers" id="providers"></div>
+            <div class="form">
+              <label class="field">
+                <span>Адрес API</span>
+                <input id="cloudUrl" type="text" placeholder="https://…/v1" spellcheck="false">
+              </label>
+              <label class="field">
+                <span>API-ключ <a href="#" class="link small" id="keyLink">где взять ключ</a></span>
+                <div class="input-group">
+                  <input id="cloudKey" type="password" placeholder="sk-…" spellcheck="false" autocomplete="off">
+                  <button class="icon-btn" id="toggleKey" title="Показать ключ"><span class="i" data-icon="eye"></span></button>
+                </div>
+                <label class="check"><input type="checkbox" id="rememberKey" checked> Запомнить ключ на этом ПК (хранится зашифрованным)</label>
+              </label>
+              <label class="field">
+                <span>Модель</span>
+                <div class="input-group">
+                  <input id="cloudModel" type="text" list="modelList" placeholder="имя модели" spellcheck="false">
+                  <button class="icon-btn" id="refreshModels" title="Загрузить список моделей у провайдера"><span class="i" data-icon="refresh"></span></button>
+                </div>
+                <datalist id="modelList"></datalist>
+                <span class="muted small" id="modelHint"></span>
+              </label>
+            </div>
+            <div class="row gap">
+              <button class="btn" id="testCloud"><span class="i" data-icon="zap"></span>Проверить подключение</button>
+              <span class="test-result" id="testResult"></span>
+            </div>
+            <p class="hint" id="providerNote"></p>
+          </div>
+        </div>
+      </div>
+
+      <!-- шаг 3 -->
+      <div class="card step">
+        <div class="step-num">3</div>
+        <div class="step-body run-row">
+          <div class="grow">
+            <h2>Запуск</h2>
+            <p class="muted" id="runHint">Выберите игру и способ перевода.</p>
+          </div>
+          <div class="run-actions">
+            <button class="btn ghost" id="restoreBtn" disabled><span class="i" data-icon="undo"></span>Откатить русификацию</button>
+            <button class="btn primary big" id="startBtn" disabled><span class="i" data-icon="play"></span>Русифицировать</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ живой перевод (Unity) ============ -->
+    <div class="live-bar hidden" id="liveBar">
+      <span class="live-dot" id="liveDot"></span>
+      <div class="grow">
+        <b>Живой перевод</b>
+        <div class="muted small" id="liveText">Текст, который игра собирает на лету, переводится прямо в игре.</div>
+      </div>
+      <button class="btn ghost sm hidden" id="liveStop"><span class="i" data-icon="stop"></span>Выключить</button>
+      <button class="btn ghost sm" id="liveDesk" title="Ярлык запускает игру сразу с живым переводом — программу открывать не нужно"><span class="i" data-icon="link"></span>Ярлык на рабочий стол</button>
+      <button class="btn primary" id="livePlay"><span class="i" data-icon="play"></span>Играть с живым переводом</button>
+    </div>
+
+    <!-- ============ процесс ============ -->
+    <section class="page" id="page-run">
+      <header class="page-head">
+        <h1 id="runGame">Русификация</h1>
+        <p id="runSub"></p>
+      </header>
+
+      <ol class="stepper" id="stepper"></ol>
+
+      <div class="card progress-card" id="progressCard">
+        <div class="progress-top">
+          <div class="progress-title" id="progressTitle">Подготовка…</div>
+          <div class="progress-pct" id="progressPct"></div>
+        </div>
+        <div class="bar big"><div class="bar-fill" id="progressFill"></div></div>
+        <div class="progress-msg muted" id="progressMsg"></div>
+      </div>
+
+      <div class="card result hidden" id="resultCard">
+        <div class="result-head">
+          <div class="result-ico" id="resultIco"></div>
+          <div class="grow">
+            <h2 id="resultTitle"></h2>
+            <p class="muted" id="resultText"></p>
+          </div>
+        </div>
+        <div class="stats" id="resultStats"></div>
+        <div class="msgs" id="resultMsgs"></div>
+        <div class="row gap end">
+          <button class="btn ghost" id="resOpen"><span class="i" data-icon="folder-open"></span>Открыть папку игры</button>
+          <button class="btn ghost" id="resRestore"><span class="i" data-icon="undo"></span>Откатить</button>
+          <button class="btn primary" id="resBack">Готово</button>
+        </div>
+      </div>
+
+      <div class="card log-card">
+        <div class="log-head"><span>Журнал</span></div>
+        <div class="log" id="log"></div>
+      </div>
+
+      <div class="run-foot" id="runFoot">
+        <button class="btn danger" id="stopBtn"><span class="i" data-icon="stop"></span>Остановить</button>
+        <span class="muted small">Прогресс сохраняется — при следующем запуске перевод продолжится с того же места.</span>
+      </div>
+    </section>
+
+    <!-- ============ модели ============ -->
+    <section class="page" id="page-models">
+      <header class="page-head">
+        <h1>Модели</h1>
+        <p>Скачанные переводчики и нейросети. Всё хранится в папке данных программы — её можно перенести в настройках.</p>
+      </header>
+      <div class="card">
+        <div class="list" id="modelsList"></div>
+      </div>
+      <div class="card">
+        <div class="list-row">
+          <span class="i big" data-icon="database"></span>
+          <div class="grow"><b>Память переводов</b><div class="muted small" id="memInfo">Уже переведённые строки — повторный запуск и другие игры не тратят время и деньги на них.</div></div>
+          <button class="btn ghost" id="clearMem"><span class="i" data-icon="trash"></span>Очистить</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="list-row">
+          <span class="i big" data-icon="folder"></span>
+          <div class="grow"><b>Папка данных</b><div class="muted small mono" id="dataDir"></div></div>
+          <button class="btn ghost" id="openData"><span class="i" data-icon="folder-open"></span>Открыть</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ настройки ============ -->
+    <section class="page" id="page-settings">
+      <header class="page-head">
+        <h1>Настройки</h1>
+        <p>Всё уже настроено по умолчанию — менять ничего не обязательно.</p>
+      </header>
+      <div class="card">
+        <div class="setting">
+          <div class="grow"><b>Папка данных</b><div class="muted small">Модели (до 7 ГБ), кэш переводов и проекты. Удобно вынести на диск, где больше места.</div>
+            <div class="mono small path" id="setDataDir"></div></div>
+          <div class="row gap"><button class="btn ghost" id="setDataReset">По умолчанию</button><button class="btn" id="setDataPick">Изменить…</button></div>
+        </div>
+        <div class="setting">
+          <div class="grow"><b>Шрифт с кириллицей</b><div class="muted small">Подключается к игре, если в её шрифте нет русских букв. По умолчанию — встроенный PT Sans.</div>
+            <div class="mono small path" id="setFont"></div></div>
+          <div class="row gap"><button class="btn ghost" id="setFontReset">Встроенный</button><button class="btn" id="setFontPick">Выбрать .ttf…</button></div>
+        </div>
+        <div class="setting">
+          <div class="grow"><b>Потоки процессора</b><div class="muted small">Для машинного перевода и нейросети на ПК. 0 — автоматически.</div></div>
+          <input class="num" type="number" min="0" max="64" id="setThreads">
+        </div>
+        <div class="setting">
+          <div class="grow"><b>Одновременных запросов к облаку</b><div class="muted small">Больше — быстрее, но бесплатные тарифы могут ограничивать частоту запросов.</div></div>
+          <input class="num" type="number" min="1" max="16" id="setParallel">
+        </div>
+        <div class="setting">
+          <div class="grow"><b>Своя модель GGUF</b><div class="muted small">Для опытных: любая модель llama.cpp вместо Gemma 4 в режиме «Нейросеть на ПК».</div>
+            <div class="mono small path" id="setGguf"></div></div>
+          <div class="row gap"><button class="btn ghost" id="setGgufReset">Не использовать</button><button class="btn" id="setGgufPick">Выбрать…</button></div>
+        </div>
+      </div>
+      <div class="card about">
+        <b>Русификатор игр <span id="aboutVer"></span></b>
+        <p class="muted small">Открытый некоммерческий проект, лицензия MIT. Всё работает на вашем компьютере, без серверов и аккаунтов.
+          Машинный перевод — модель Argos Translate (MIT/CC), нейросеть — Gemma 4 (Apache 2.0) на llama.cpp (MIT),
+          шрифт — PT Sans (SIL OFL 1.1).</p>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ============ окно заказа ============ -->
+<div class="modal hidden" id="orderModal">
+  <div class="modal-card order">
+    <button class="modal-x" data-close><span class="i" data-icon="x"></span></button>
+    <div class="order-hero">
+      <div class="order-badge"><span class="i" data-icon="pen"></span></div>
+      <h2>Перевод «как от студии»</h2>
+      <p>Машинный перевод — это быстро. Но если хочется, чтобы игра звучала по-настоящему по-русски, — закажите перевод у автора программы.</p>
+    </div>
+    <ul class="perks">
+      <li><span class="i" data-icon="check"></span>Живой перевод и редактура — без машинных ошибок и «Игры в джойстик»</li>
+      <li><span class="i" data-icon="check"></span>Адаптация юмора, имён, отсылок и характеров персонажей</li>
+      <li><span class="i" data-icon="check"></span>Перевод надписей на текстурах, подбор и отрисовка шрифтов</li>
+      <li><span class="i" data-icon="check"></span>Проверка в самой игре: ничего не вылезает и не ломается</li>
+    </ul>
+    <div class="tg-box">
+      <div>
+        <div class="muted small">Telegram</div>
+        <div class="tg-handle" id="tgHandle">@TRAPYCHINO</div>
+      </div>
+      <button class="icon-btn" id="copyTg" title="Скопировать"><span class="i" data-icon="copy"></span></button>
+    </div>
+    <button class="btn tg big" id="openTg"><span class="i" data-icon="send"></span>Написать в Telegram</button>
+    <p class="muted small center">Напишите название игры — обсудим объём, сроки и цену.</p>
+  </div>
+</div>
+
+<!-- ============ подтверждение ============ -->
+<div class="modal hidden" id="confirmModal">
+  <div class="modal-card confirm">
+    <h2 id="confirmTitle"></h2>
+    <p class="muted" id="confirmText"></p>
+    <div class="row gap end">
+      <button class="btn ghost" data-close>Отмена</button>
+      <button class="btn primary" id="confirmOk">Да</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast hidden" id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

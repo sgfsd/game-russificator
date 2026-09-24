@@ -1,0 +1,13 @@
+# Проверенные версии зависимостей (на них собирается Russificator.exe).
+# Сборка: pip install -r requirements-lock.txt -e .  (см. .github/workflows/build.yml)
+pywebview==6.2.1
+pythonnet==3.1.0
+clr_loader==0.3.1
+ctranslate2==4.8.2
+sentencepiece==0.2.2
+UnityPy==1.25.3
+TypeTreeGeneratorAPI==0.0.10
+numpy==2.5.3
+Pillow==12.3.0
+pytest==9.1.1
+pyinstaller==6.22.3

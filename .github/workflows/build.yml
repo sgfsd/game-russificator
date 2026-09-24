@@ -1,0 +1,58 @@
+# Сборка Russificator.exe на серверах GitHub.
+# Тег вида v2.1.0 -> тесты, сборка, самопроверка exe и релиз с архивом Russificator-win64.zip.
+# Запуск вручную (Actions -> build -> Run workflow) — то же самое, архив остаётся в артефактах.
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-lock.txt
+          pip install -e .
+
+      - name: Тесты
+        run: python -m pytest -q
+
+      - name: Сборка exe
+        run: pyinstaller russificator.spec --noconfirm
+
+      - name: Самопроверка exe
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\Russificator\Russificator.exe -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content dist\Russificator\RussificatorData\logs\selftest.txt
+          if ($p.ExitCode -ne 0) { throw "selftest failed: $($p.ExitCode)" }
+          Remove-Item -Recurse -Force dist\Russificator\RussificatorData
+
+      - name: Архив
+        shell: pwsh
+        run: Compress-Archive -Path dist\Russificator -DestinationPath Russificator-win64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Russificator-win64
+          path: Russificator-win64.zip
+
+      - name: Релиз
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Russificator-win64.zip
+          generate_release_notes: true

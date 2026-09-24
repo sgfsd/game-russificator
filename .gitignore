@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.cache/
+build/
+dist/
+userdata/
+RussificatorData/
+*.egg-info/
+russificator_crash.log
+.claude/

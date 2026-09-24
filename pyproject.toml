@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "game-russificator"
+version = "2.0.0"
+description = "Универсальный авторусификатор PC-игр: Unity, Ren'Py, RPG Maker"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "TRAPYCHINO" }]
+keywords = ["translation", "localization", "unity", "renpy", "rpgmaker", "russian", "russificator"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Natural Language :: Russian",
+    "Topic :: Games/Entertainment",
+]
+
+dependencies = [
+    "pywebview>=6.0",          # окно программы (WebView2)
+    "ctranslate2>=4.5",        # машинный перевод офлайн
+    "sentencepiece>=0.2",
+    "UnityPy>=1.25",           # чтение ассетов Unity, дорисовка кириллицы в шрифты
+    "TypeTreeGeneratorAPI>=0.0.10",
+    "numpy>=1.26",
+    "Pillow>=10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pyinstaller>=6.10"]
+
+[project.scripts]
+russificator = "russificator.cli:main"
+
+[project.gui-scripts]
+russificator-gui = "russificator.ui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["russificator*"]
+
+[tool.setuptools.package-data]
+russificator = ["resources/**/*", "ui/web/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
