@@ -225,9 +225,12 @@ function bindUi() {
     setTimeout(refreshLive, 900);
   });
   $$("[data-live]").forEach((b) => b.addEventListener("click", async () => {
-    const r = await api().overlay_cmd(b.dataset.live);
+    const cmd = b.dataset.live;
+    const r = await api().overlay_cmd(cmd);
     if (!r.ok) toast(r.error || "Живой перевод не запущен", true);
-    else if (b.dataset.live.startsWith("mark")) toast("Игра больше не будет переводиться");
+    else if (cmd.startsWith("mark?list=never")) toast("Эта игра больше не будет переводиться");
+    else if (cmd.startsWith("mark")) toast("Окно будет переводиться — вернитесь в игру");
+    else if (cmd === "now") toast("Переведу, как только вернётесь в игру");
     refreshLive();
   }));
   $$("#liveMode button").forEach((b) => b.addEventListener("click", async () => {
@@ -316,7 +319,9 @@ async function detectGame(path, quiet = false) {
     $("#gameInfo").classList.add("hidden");
     return updateRunState();
   }
-  S.game = { path, ...r };
+  if (r.moved_from && !quiet) toast(`Взял корень игры — папку, где лежит её .exe: ${r.path}`);
+  path = r.path || path;
+  S.game = { ...r, path };
   $("#gameEmpty").classList.add("hidden");
   $("#gameInfo").classList.remove("hidden");
   $("#gameName").textContent = r.name;
@@ -1007,14 +1012,21 @@ async function refreshLive() {
   $("#liveCount").classList.toggle("hidden", !(on && st.count));
   $("#liveCount").textContent = `переведено фраз: ${st.count || 0}`;
 
-  const g = on ? st.game : null;
+  // пока открыто это окно, игра не на переднем плане — показываем последнюю
+  const g = on ? (st.game || st.last_game) : null;
   $("#liveNow").classList.toggle("hidden", !g);
   if (g) {
-    $("#liveGame").textContent = "Сейчас: " + g.title;
-    $("#liveReason").textContent = g.reason + (g.region ? " · выбрана область текста" : "");
+    $("#liveGame").textContent = (st.game ? "Сейчас: " : "Последняя игра: ") + g.title;
+    $("#liveNow .live-dot").classList.toggle("on", !!st.game);
+    $("#liveReason").textContent = (g.reason || "") + (g.region ? " · выбрана область текста (Alt+R — выбрать заново)" : "");
     $("#livePauseTxt").textContent = st.paused ? "Показать перевод" : "Скрыть перевод";
     $("#liveRegionClear").classList.toggle("hidden", !g.region);
   }
+  $("#liveHint").classList.toggle("hidden", !(on && st.hint));
+  if (on && st.hint) $("#liveHintText").textContent = st.hint;
+  const cand = on ? st.candidate : null;
+  $("#liveCand").classList.toggle("hidden", !cand);
+  if (cand) $("#liveCandTitle").textContent = `Окно «${cand.title}»`;
   const ocr = st.ocr || {};
   const needOcr = on && !ocr.ok && !ocr.starting && ocr.code;
   $("#liveOcr").classList.toggle("hidden", !needOcr);

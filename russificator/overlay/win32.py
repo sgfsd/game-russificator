@@ -293,6 +293,66 @@ def foreground() -> Optional[WindowInfo]:
     return window_info(GetForegroundWindow())
 
 
+def find_program_window(title_prefix: str) -> Optional[int]:
+    """Видимое окно нашей же программы (тот же exe) с заголовком, начинающимся с ``title_prefix``.
+
+    Проверка exe нужна, чтобы не спутать с папкой «Русификатор игр», открытой в Проводнике."""
+    if not IS_WINDOWS:
+        return None
+    own = os.path.normcase(os.path.abspath(sys.executable))
+    found: List[int] = []
+    proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _):
+        try:
+            buf = ctypes.create_unicode_buffer(256)
+            GetWindowTextW(hwnd, buf, 256)
+            if buf.value.startswith(title_prefix) and IsWindowVisible(hwnd):
+                pid = wintypes.DWORD()
+                GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                exe = process_exe(pid.value)
+                if exe and os.path.normcase(os.path.abspath(exe)) == own:
+                    found.append(int(hwnd))
+                    return False
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+    user32.EnumWindows(proto(cb), 0)
+    return found[0] if found else None
+
+
+def activate(hwnd: int) -> None:
+    """Развернуть (если свёрнуто) и вывести окно на передний план."""
+    if not IS_WINDOWS or not hwnd:
+        return
+    if IsIconic(hwnd):
+        ShowWindow(hwnd, 9)          # SW_RESTORE
+    else:
+        ShowWindow(hwnd, 5)          # SW_SHOW
+    SetForegroundWindow(hwnd)
+
+
+_instance_mutex = None
+
+
+def single_instance(name: str) -> bool:
+    """True — мы первая копия (именованный мьютекс Windows держится до выхода из процесса)."""
+    global _instance_mutex
+    if not IS_WINDOWS:
+        return True
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    k32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    h = k32.CreateMutexW(None, False, name)
+    if not h:
+        return True
+    if ctypes.get_last_error() == 183:   # ERROR_ALREADY_EXISTS
+        CloseHandle(h)
+        return False
+    _instance_mutex = h
+    return True
+
+
 # ------------------------------------------------------------------ захват экрана
 
 def capture(x: int, y: int, w: int, h: int) -> Optional[bytes]:
@@ -706,7 +766,7 @@ class Gui:
                 event = lparam & 0xFFFF
                 if event in (WM_RBUTTONUP, WM_CONTEXTMENU):
                     self._menu()
-                elif event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+                elif event == WM_LBUTTONUP:         # двойной щелчок = два «вверх» — второй отсечёт open_main_window
                     self.on_menu("open")
                 return 0
             if msg == self._taskbar_created and self._taskbar_created and hwnd == self.host:

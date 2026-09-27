@@ -197,6 +197,22 @@ def test_live_service_pipeline(tmp_path, monkeypatch):
         monkeypatch.setattr(win32, "foreground", lambda: fg2)
         svc._tick()
         assert svc.target is None and svc.gui.hidden >= 1 and svc.last_game.title == "Hollow Knight"
+        assert svc.gui.keys == []                           # вне игры Alt+… не перехватываются
+        assert svc.candidate is None                         # браузер «Переводить окно» не предлагается
+        # игра в окне, которую ничего не выдало — её можно включить из трея или окна программы
+        fg3 = win32.WindowInfo(hwnd=9, pid=99, exe="D:/Indie/tiny.exe", title="Tiny Quest",
+                               client=(100, 100, 800, 600), window=(90, 70, 910, 710), monitor=(0, 0, 1920, 1080),
+                               minimized=False)
+        monkeypatch.setattr(win32, "foreground", lambda: fg3)
+        svc._tick()
+        assert svc.target is None and svc.status()["candidate"]["title"] == "Tiny Quest"
+        assert any(cmd == "mark" and "Tiny Quest" in title for cmd, title, _ in svc._menu_items())
+        assert svc.mark_current("always", "candidate") == "D:/Indie/tiny.exe"
+        svc._tick()
+        assert svc.target is not None and svc.target.title == "Tiny Quest" and svc.candidate is None
+        # «Не переводить эту игру» из окна программы
+        assert svc.mark_current("never") == "D:/Indie/tiny.exe"
+        assert svc.target is None and svc.last_game is None
     finally:
         svc.stop_event.set()
         with svc._cond:
@@ -219,3 +235,48 @@ def test_live_region_profile(tmp_path, monkeypatch):
     assert settings.load()["live_profiles"][detect._norm("/g/game.exe")]["region"] == [0.1, 0.5, 0.8, 0.4]
     svc._on_region(None)                                     # Esc — область сброшена
     assert svc._region(fg) == (100, 50, 1000, 500)
+
+
+def test_live_black_frame_hint(tmp_path, monkeypatch):
+    """Эксклюзивный полноэкранный режим: кадр всегда чёрный — подсказка переключить режим экрана."""
+    monkeypatch.setenv("RUSSIFICATOR_HOME", str(tmp_path / "home"))
+    from russificator import paths
+    paths.set_home(None)
+    from russificator.overlay import service, win32
+    fg = win32.WindowInfo(hwnd=100, pid=4242, exe="C:/Games/X/x.exe", title="X", client=(0, 0, 640, 360),
+                          window=(0, 0, 640, 360), monitor=(0, 0, 640, 360), minimized=False)
+    frame = [bytes(640 * 360 * 4)]
+    monkeypatch.setattr(win32, "foreground", lambda: fg)
+    monkeypatch.setattr(win32, "capture", lambda x, y, w, h: frame[0])
+    svc = service.LiveService(quiet=True)
+    svc.gui = _FakeGui()
+    svc.ocr = _FakeOcr([])
+    for _ in range(service.BLACK_FRAMES):
+        svc._tick()
+    assert "Окно без рамки" in svc.status()["hint"]
+    pic = bytearray(frame[0])
+    pic[640 * 4 * 180 + 64 * 5] = 200                       # появилась картинка
+    frame[0] = bytes(pic)
+    svc._tick()
+    assert svc.status()["hint"] == ""
+
+
+def test_live_ocr_downscale_for_huge_frames(tmp_path, monkeypatch):
+    pytest.importorskip("PIL")
+    monkeypatch.setenv("RUSSIFICATOR_HOME", str(tmp_path / "home"))
+    from russificator import paths
+    paths.set_home(None)
+    from russificator.overlay import service
+    seen = []
+
+    class Small(_FakeOcr):
+        max_dim = 1000
+
+        def recognize(self, w, h, bgra):
+            seen.append((w, h, len(bgra)))
+            return [text.Line("Hello", 100, 50, 200, 20)]
+    svc = service.LiveService(quiet=True)
+    svc.ocr = Small([])
+    lines = svc._recognize(2000, 1000, bytes(2000 * 1000 * 4))
+    assert seen == [(1000, 500, 1000 * 500 * 4)]
+    assert (lines[0].x, lines[0].y, lines[0].w, lines[0].h) == (200, 100, 400, 40)

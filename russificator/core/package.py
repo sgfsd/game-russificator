@@ -450,8 +450,15 @@ def open_package(path: Path) -> Package:
         if temp is not None:
             shutil.rmtree(temp, ignore_errors=True)
         raise PackageError(f"package.json не читается: {exc}") from exc
-    if int(info.get("format", 0)) > FORMAT:
-        raise PackageError("Архив создан более новой версией программы — обновите установщик/программу.")
+    try:
+        newer = int(info.get("format", 0)) > FORMAT
+    except (TypeError, ValueError):
+        newer = True
+    if newer or not isinstance(info.get("game"), dict):
+        if temp is not None:
+            shutil.rmtree(temp, ignore_errors=True)
+        raise PackageError("Архив создан более новой версией программы — обновите установщик/программу."
+                           if newer else "package.json повреждён — пересоздайте архив.")
     return Package(data=data, info=info, _temp=temp)
 
 

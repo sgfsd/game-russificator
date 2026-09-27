@@ -225,52 +225,85 @@ def _ruby_str(s: str) -> str:
 
 
 def credit_script(version: str, credit: str) -> str:
-    """Ruby-скрипт: полупрозрачная надпись в правом нижнем углу титульного экрана."""
+    """Ruby-скрипт: полупрозрачная надпись в правом нижнем углу титульного экрана.
+
+    Всё обёрнуто в ``rescue``: если в игре свой титульный экран (класса Scene_Title нет или
+    он устроен иначе), надписи просто не будет — игра не должна упасть из-за неё."""
     text = _ruby_str(credit)
     if version == "xp":
         return f"""# Game Russificator: надпись о программе на титульном экране
-class Scene_Title
-  alias_method :rus_credit_main, :main unless method_defined?(:rus_credit_main)
-  def main
-    @rus_credit = Sprite.new
-    @rus_credit.bitmap = Bitmap.new(640, 22)
-    @rus_credit.bitmap.font.size = 15
-    @rus_credit.bitmap.font.color = Color.new(255, 255, 255, 200)
-    @rus_credit.bitmap.draw_text(0, 0, 634, 22, {text}, 2)
-    @rus_credit.y = 458
-    @rus_credit.z = 9999
-    rus_credit_main
-  ensure
-    if @rus_credit
-      @rus_credit.bitmap.dispose
-      @rus_credit.dispose
-      @rus_credit = nil
+begin
+  if defined?(Scene_Title) && Scene_Title.method_defined?(:main)
+    class Scene_Title
+      alias_method :rus_credit_main, :main unless method_defined?(:rus_credit_main)
+      def rus_credit_show
+        @rus_credit = Sprite.new
+        @rus_credit.bitmap = Bitmap.new(640, 22)
+        @rus_credit.bitmap.font.size = 15
+        @rus_credit.bitmap.font.color = Color.new(255, 255, 255, 200)
+        @rus_credit.bitmap.draw_text(0, 0, 634, 22, {text}, 2)
+        @rus_credit.y = 458
+        @rus_credit.z = 9999
+      rescue Exception
+        @rus_credit = nil
+      end
+      def rus_credit_hide
+        if @rus_credit
+          @rus_credit.bitmap.dispose
+          @rus_credit.dispose
+        end
+      rescue Exception
+      ensure
+        @rus_credit = nil
+      end
+      def main
+        rus_credit_show
+        rus_credit_main
+      ensure
+        rus_credit_hide
+      end
     end
   end
+rescue Exception
 end
 """
     return f"""# Game Russificator: надпись о программе на титульном экране
-class Scene_Title
-  alias_method :rus_credit_start, :start unless method_defined?(:rus_credit_start)
-  def start
-    rus_credit_start
-    @rus_credit = Sprite.new
-    @rus_credit.bitmap = Bitmap.new(Graphics.width, 22)
-    @rus_credit.bitmap.font.size = 15
-    @rus_credit.bitmap.font.color = Color.new(255, 255, 255, 200)
-    @rus_credit.bitmap.draw_text(0, 0, Graphics.width - 6, 22, {text}, 2)
-    @rus_credit.y = Graphics.height - 22
-    @rus_credit.z = 9999
-  end
-  alias_method :rus_credit_terminate, :terminate unless method_defined?(:rus_credit_terminate)
-  def terminate
-    rus_credit_terminate
-    if @rus_credit
-      @rus_credit.bitmap.dispose
-      @rus_credit.dispose
-      @rus_credit = nil
+begin
+  if defined?(Scene_Title) && Scene_Title.method_defined?(:start) && Scene_Title.method_defined?(:terminate)
+    class Scene_Title
+      alias_method :rus_credit_start, :start unless method_defined?(:rus_credit_start)
+      alias_method :rus_credit_terminate, :terminate unless method_defined?(:rus_credit_terminate)
+      def rus_credit_show
+        w = Graphics.width
+        @rus_credit = Sprite.new
+        @rus_credit.bitmap = Bitmap.new(w, 22)
+        @rus_credit.bitmap.font.size = 15
+        @rus_credit.bitmap.font.color = Color.new(255, 255, 255, 200)
+        @rus_credit.bitmap.draw_text(0, 0, w - 6, 22, {text}, 2)
+        @rus_credit.y = Graphics.height - 22
+        @rus_credit.z = 9999
+      rescue Exception
+        @rus_credit = nil
+      end
+      def start
+        rus_credit_start
+        rus_credit_show
+      end
+      def terminate
+        rus_credit_terminate
+      ensure
+        begin
+          if @rus_credit
+            @rus_credit.bitmap.dispose
+            @rus_credit.dispose
+          end
+        rescue Exception
+        end
+        @rus_credit = nil
+      end
     end
   end
+rescue Exception
 end
 """
 

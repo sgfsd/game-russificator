@@ -42,8 +42,11 @@ DENY = {
     "unity.exe", "unityhub.exe", "blender.exe", "photoshop.exe", "keepass.exe", "keepassxc.exe",
     "1password.exe", "bitwarden.exe", "anydesk.exe", "teamviewer.exe", "mstsc.exe", "rustdesk.exe",
     # сама программа
-    "russificator.exe", "russificatorsetup.exe", "python.exe", "pythonw.exe",
+    "russificator.exe", "russificatorsetup.exe",
 }
+
+#: причина «не игра», при которой окно можно добавить в «Всегда» (обычное окно, не из запретного списка)
+REASON_WINDOW = "обычное окно"
 
 
 def gamebar_exes() -> Set[str]:
@@ -77,6 +80,9 @@ def _norm(p: str) -> str:
     return os.path.normcase(os.path.normpath(str(p))) if p else ""
 
 
+_OWN = _norm(sys.executable)      # сама программа (в том числе запущенная из исходников через pythonw)
+
+
 class Decider:
     def __init__(self, game_dirs: Iterable[str] = (), always: Iterable[str] = (), never: Iterable[str] = (),
                  gamebar: Optional[Set[str]] = None):
@@ -95,7 +101,7 @@ class Decider:
             return False, "в списке «Никогда»"
         if n in self.always:
             return True, "в списке «Всегда»"
-        if name in DENY:
+        if name in DENY or n == _OWN:
             return False, "не игра (браузер, мессенджер, система)"
         for d in self.game_dirs:
             if n.startswith(d + os.sep) or n.startswith(d + "/"):
@@ -104,7 +110,7 @@ class Decider:
             return True, "Windows считает это игрой"
         if fullscreen:
             return True, "полноэкранное окно"
-        return False, "обычное окно"
+        return False, REASON_WINDOW
 
     def game_dir(self, exe: str) -> Optional[str]:
         n = _norm(exe)

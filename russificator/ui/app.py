@@ -222,11 +222,28 @@ class Api:
         from ..core.backup import GameBackup
         from ..core.pipeline import project_dir
         from ..core.universal import TranslationProject
+        from ..core.plugin_api import EngineNotDetectedError
+        from ..library import find_root
         p = Path(path or "")
         if not p.is_dir():
             return {"ok": False, "error": "Папка не найдена."}
+        moved = ""
+        root = find_root(p)
+        if root is not None and root in p.parents:  # выбрали папку внутри игры (www, Game_Data…) — берём корень
+            moved, p = str(p), root
         try:
             plugin, det = russificator.detect_engine(p)
+        except EngineNotDetectedError:
+            root = find_root(p)                 # выбрали папку над игрой (с одной игрой внутри)
+            if root is None or root == p:
+                return {"ok": False, "error": "В этой папке не найдена игра на Unity, Ren'Py или RPG Maker. "
+                                              "Выберите корень игры — папку, где лежит её .exe. Для других "
+                                              "движков есть «Живой перевод»."}
+            try:
+                plugin, det = russificator.detect_engine(root)
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": str(exc)}
+            moved, p = moved or str(p), root
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
         progress = None
@@ -242,7 +259,8 @@ class Api:
         exportable, why = can_export(p)
         backup = GameBackup(p)
         intact = backup.check()[0] if backup.exists else True
-        return {"ok": True, "engine": det.engine_name or plugin.title, "confidence": det.confidence,
+        return {"ok": True, "path": str(p), "moved_from": moved,
+                "engine": det.engine_name or plugin.title, "confidence": det.confidence,
                 "details": det.details, "notes": det.notes, "name": p.name,
                 "russified": backup.exists, "intact": intact, "progress": progress,
                 "engine_id": plugin.engine_id, "live": bool(plugin.supports_live),
@@ -380,7 +398,7 @@ class Api:
     def overlay_status(self) -> Dict[str, Any]:
         from ..overlay import win32
         st = self._live_call("/status") or {"running": False}
-        cfg = settings.load()
+        cfg = settings.read()
         st["settings"] = {k: cfg.get(k) for k in ("live_enabled", "live_autostart", "live_mode", "live_font_scale",
                                                   "live_opacity", "live_always", "live_never")}
         st["autostart"] = win32.autostart_command() is not None
@@ -419,10 +437,8 @@ class Api:
     def overlay_settings(self, partial: Dict[str, Any]) -> Dict[str, Any]:
         keys = ("live_mode", "live_font_scale", "live_opacity", "live_always", "live_never")
         partial = {k: v for k, v in (partial or {}).items() if k in keys}
-        cur = settings.load()
-        cur.update(partial)
-        settings.save(cur)
         self._cfg.update(partial)
+        settings.save(self._cfg)
         self._live_call("/reload")
         return {"ok": True}
 
@@ -839,6 +855,13 @@ def run(argv=None) -> int:
                     if not pid:
                         return 2
                 return play.run(argv[i + 1], pid)
+    if sys.platform == "win32":
+        from ..overlay import win32
+        if not win32.single_instance("Local\\RussificatorGamesMainWindow"):
+            hwnd = win32.find_program_window("Русификатор игр")   # окно уже открыто — показываем его
+            if hwnd:
+                win32.activate(hwnd)
+            return 0
     _setup_logging()
     import webview
     api = Api()

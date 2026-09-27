@@ -171,3 +171,43 @@ def test_games_status_and_live_count(tmp_path, monkeypatch):
     (proj / "project.json").write_text(json.dumps({"version": 1, "game_dir": str(root), "entries": []}),
                                        encoding="utf-8")
     assert games.russified_dirs() == [str(root)]
+
+
+def test_folder_scan_finds_games_with_exe(tmp_path):
+    """Своя папка с играми: игра без узнаваемого движка, но с exe — тоже игра; служебные папки — нет."""
+    from russificator import library
+    (tmp_path / "GodotThing").mkdir()
+    (tmp_path / "GodotThing" / "thing.exe").write_bytes(b"MZ")
+    (tmp_path / "_CommonRedist").mkdir()
+    (tmp_path / "_CommonRedist" / "run.exe").write_bytes(b"MZ")
+    (tmp_path / "Collection" / "Part1").mkdir(parents=True)
+    (tmp_path / "Collection" / "Part1" / "p1.exe").write_bytes(b"MZ")
+    (tmp_path / "Empty").mkdir()
+    (tmp_path / "Game").mkdir()
+    _unity(tmp_path / "Game")
+    got = sorted(Path(e.path).relative_to(tmp_path).as_posix() for e in library.folder_games([str(tmp_path)]))
+    assert got == ["Collection/Part1", "Game", "GodotThing"]
+    # добавили саму папку игры
+    assert [Path(e.path).name for e in library.folder_games([str(tmp_path / "GodotThing")])] == ["GodotThing"]
+
+
+def test_find_root_from_inner_or_outer_folder(tmp_path):
+    """Вручную выбрали не корень игры: папку внутри (Game_Data, www, game) или папку над игрой."""
+    from russificator import library
+    u = tmp_path / "Unity Game"
+    u.mkdir()
+    _unity(u)
+    assert library.find_root(u / "Game_Data" / "Managed") == u
+    r = tmp_path / "VN"
+    r.mkdir()
+    _renpy(r)
+    assert library.find_root(r / "game") == r
+    m = tmp_path / "MV"
+    m.mkdir()
+    _mv(m)
+    assert library.find_root(m / "www" / "data") == m
+    lone = tmp_path / "Downloads"
+    (lone / "Some Game").mkdir(parents=True)
+    _unity(lone / "Some Game")
+    assert library.find_root(lone) == lone / "Some Game"      # одна игра внутри — берём её
+    assert library.find_root(tmp_path) is None                 # игр несколько — пусть выберет сам

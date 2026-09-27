@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import sys
+import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from . import paths
 
@@ -50,22 +52,64 @@ DEFAULTS: Dict[str, Any] = {
 }
 
 
-def load() -> Dict[str, Any]:
-    data = dict(DEFAULTS)
+# Файл настроек пишут два процесса: окно программы и живой перевод (трей).
+# Чтобы один не затирал изменения другого, save() сливает: ключи, которые этот
+# словарь не менял с момента чтения, берутся из файла (их мог поменять другой).
+# Снимок «как было при чтении» хранится для каждого словаря, полученного из load().
+_base: Dict[int, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+
+
+def _read(f: Path) -> Dict[str, Any]:
     try:
-        raw = json.loads(paths.settings_file().read_text(encoding="utf-8"))
-        if isinstance(raw, dict):
-            data.update(raw)
+        raw = json.loads(f.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
     except (OSError, ValueError):
-        pass
+        return {}
+
+
+def _remember(data: Dict[str, Any], snapshot: Dict[str, Any]) -> None:
+    _base[id(data)] = (data, snapshot)
+    while len(_base) > 16:                      # временные словари не копятся
+        _base.pop(next(iter(_base)))
+
+
+def read() -> Dict[str, Any]:
+    """Свежие настройки только для чтения (сохранять их через save() не нужно)."""
+    data = dict(DEFAULTS)
+    data.update(_read(paths.settings_file()))
+    return data
+
+
+def load() -> Dict[str, Any]:
+    data = read()
+    _remember(data, json.loads(json.dumps(data)))
     return data
 
 
 def save(data: Dict[str, Any]) -> None:
+    """Сохранить настройки; ``data`` обновляется свежими значениями, изменёнными другим процессом."""
     f = paths.settings_file()
-    tmp = f.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(f)
+    entry = _base.get(id(data))
+    base = entry[1] if entry is not None and entry[0] is data else None
+    if base is not None:
+        disk = _read(f)
+        for k, v in disk.items():
+            if k in base and data.get(k) == base[k] and v != base[k]:
+                data[k] = v                     # изменено другим процессом, а здесь — нет
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp = f.with_name(f"{f.stem}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    for attempt in range(8):
+        try:
+            tmp.replace(f)
+            break
+        except PermissionError:                 # Windows: файл как раз читает другой процесс
+            if attempt == 7:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.05 * (attempt + 1))
+    _base.pop(id(data), None)
+    _remember(data, json.loads(text))
 
 
 def apply_data_dir(data: Dict[str, Any]) -> None:

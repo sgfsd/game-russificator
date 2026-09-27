@@ -396,23 +396,57 @@ def folder_games(folders: Iterable[str], depth: int = 2) -> Iterator[GameEntry]:
         yield from _scan_folder(root, depth)
 
 
+_NOT_GAME_DIRS = re.compile(r"^(_?commonredist|redist|directx|dotnet|vcredist|support|tools?|mods?|saves?|"
+                           r"screenshots|soundtrack|ost|artbook|extras?|__macosx)$", re.I)
+
+
 def _scan_folder(root: Path, depth: int) -> Iterator[GameEntry]:
+    """Папка — игра (движок узнаётся или есть exe), иначе ищем игры в подпапках (до ``depth`` уровней)."""
     engine = quick_engine(root)
     if engine:
         yield GameEntry(path=str(root), title=root.name, source="folder", engine=engine)
         return
-    if depth <= 0:
-        return
+    found = False
+    if depth > 0:
+        try:
+            children = sorted(c for c in root.iterdir()
+                              if c.is_dir() and not c.name.startswith((".", "$")) and not _NOT_GAME_DIRS.match(c.name))
+        except OSError:
+            children = []
+        for c in children:
+            e = quick_engine(c)
+            if e or main_exe(c) is not None:
+                found = True
+                yield GameEntry(path=str(c), title=c.name, source="folder", engine=e)
+            elif depth > 1:
+                for g in _scan_folder(c, depth - 1):
+                    found = True
+                    yield g
+    if not found and main_exe(root) is not None:
+        # добавили саму папку игры (движок не узнан, но exe есть)
+        yield GameEntry(path=str(root), title=root.name, source="folder", engine="")
+
+
+SUPPORTED = ("unity", "renpy", "rpgmaker")
+
+
+def find_root(path: Path) -> Optional[Path]:
+    """Корень игры рядом с выбранной папкой: если выбрали внутреннюю папку (``Game_Data``, ``www``,
+    ``game``, ``Binaries/Win64``…) — поднимаемся; если папку с одной игрой внутри — спускаемся."""
+    p = Path(path)
+    found: Optional[Path] = None
+    for cand in [p, *list(p.parents)[:3]]:
+        if quick_engine(cand) in SUPPORTED:
+            found = cand                    # поднимаемся, пока выше тоже игра (MV: www → папка с Game.exe)
+        elif found is not None:
+            break
+    if found is not None:
+        return found
     try:
-        children = sorted(c for c in root.iterdir() if c.is_dir() and not c.name.startswith((".", "$")))
+        kids = [c for c in p.iterdir() if c.is_dir() and quick_engine(c) in SUPPORTED]
     except OSError:
-        return
-    for c in children:
-        e = quick_engine(c)
-        if e or (depth == 1 and has_exe(c, 1)):
-            yield GameEntry(path=str(c), title=c.name, source="folder", engine=e)
-        elif depth > 1:
-            yield from _scan_folder(c, depth - 1)
+        kids = []
+    return kids[0] if len(kids) == 1 else None
 
 
 # ---------------------------------------------------------------- сборка списка

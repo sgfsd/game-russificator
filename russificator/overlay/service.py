@@ -37,13 +37,17 @@ from .text import Block, Line, Tracker, TranslationCache
 
 log = logging.getLogger("russificator.overlay")
 
-VK = {"T": 0x54, "Y": 0x59, "R": 0x52, "G": 0x47}
+MAIN_TITLE = "Русификатор игр"          # начало заголовка окна программы (ui/app.py)
+
+VK = {"T": 0x54, "Y": 0x59, "R": 0x52}
+# Клавиши регистрируются только пока на экране игра: в остальных программах Alt+… не перехватываются.
 HOTKEYS = {
     "toggle": win32.Hotkey(1, win32.MOD_ALT, VK["T"], "toggle"),
     "now": win32.Hotkey(2, win32.MOD_ALT, VK["Y"], "now"),
     "region": win32.Hotkey(3, win32.MOD_ALT, VK["R"], "region"),
-    "mark": win32.Hotkey(4, win32.MOD_ALT, VK["G"], "mark"),
 }
+# Сколько кадров подряд чёрный экран у полноэкранной игры, чтобы подсказать про режим «окно без рамки».
+BLACK_FRAMES = 25
 
 DEFAULTS = {
     "live_mode": "auto",          # auto — как на вкладке «Русификация» (запасной — машинный), или machine|cloud|local
@@ -75,6 +79,11 @@ class LiveService:
     def __init__(self, quiet: bool = False) -> None:
         self.quiet = quiet
         self.last_game: Optional[win32.WindowInfo] = None   # последняя игра (для кнопок в окне программы)
+        self.candidate: Optional[win32.WindowInfo] = None   # последнее окно, не похожее на игру («Переводить его»)
+        self.hint = ""                                        # подсказка игроку (чёрный кадр и т.п.)
+        self._black = 0
+        self._picture = False
+        self._hinted: set = set()
         self._region_target: Optional[win32.WindowInfo] = None
         self.cfg = settings.load()
         settings.apply_data_dir(self.cfg)
@@ -119,7 +128,6 @@ class LiveService:
         icon = Path(__file__).resolve().parents[1] / "resources" / "icon.ico"
         self.gui = win32.Gui(str(icon), self._on_hotkey, self._on_menu, self._on_region, self._menu_items)
         self.gui.start()
-        self.gui.set_hotkeys([HOTKEYS["mark"]])
         if not self.quiet:
             self.gui.balloon("Живой перевод включён", "Запустите игру — перевод появится поверх неё. "
                                                        "Alt+T — показать/скрыть, Alt+R — выбрать область.")
@@ -193,8 +201,12 @@ class LiveService:
             return
         is_game, reason = self._decider.decide(fg.exe, fg.fullscreen)
         if not is_game:
+            if reason == detect.REASON_WINDOW:
+                self.candidate = fg             # обычное окно — можно предложить «Переводить это окно»
             self._drop_target()
             return
+        if self.candidate is not None and self.candidate.hwnd == fg.hwnd:
+            self.candidate = None
         if self.target is None or self.target.hwnd != fg.hwnd:
             self._set_target(fg, reason)
         self.target = self.last_game = fg
@@ -208,6 +220,8 @@ class LiveService:
         if frame is None:
             return
         sig = self._sample(frame, w, h)
+        if (x, y, w, h) == tuple(fg.client):
+            self._check_black(fg, frame, w, h)     # в выбранной области чёрный фон — это нормально
         if sig == self._frame_sig and not self.force_now and self.region == (x, y, w, h):
             self._show(x, y, w, h)
             return
@@ -231,7 +245,11 @@ class LiveService:
 
     def _recognize(self, w: int, h: int, frame: bytes) -> Optional[List[Line]]:
         try:
-            lines = self.ocr.recognize(w, h, frame)
+            limit = int(getattr(self.ocr, "max_dim", 0) or 0)
+            if limit and max(w, h) > limit:
+                lines = self._recognize_scaled(w, h, frame, limit)
+            else:
+                lines = self.ocr.recognize(w, h, frame)
             self._ocr_failures = 0
             return lines
         except Exception as exc:  # noqa: BLE001
@@ -249,6 +267,40 @@ class LiveService:
                     self.ocr_error = OcrUnavailable("failed", str(exc2))
                     self.ocr = None
             return None
+
+    def _check_black(self, fg: win32.WindowInfo, frame: bytes, w: int, h: int) -> None:
+        """Эксклюзивный полноэкранный режим: вместо игры Windows отдаёт чёрный кадр — подсказываем, что делать.
+
+        Подсказка — только если у этой игры ещё ни разу не было видно картинки (не чёрный экран загрузки)."""
+        if self._picture:
+            return
+        stride = w * 4
+        step = max(1, h // 24)
+        rows = [frame[r * stride:(r + 1) * stride] for r in range(0, h, step)]
+        if any(max(row[c::64], default=0) > 8 for row in rows for c in (0, 1, 2)):
+            self._picture = True
+            self._black = 0
+            self.hint = ""
+            return
+        self._black += 1
+        if self._black < BLACK_FRAMES or not fg.fullscreen:
+            return
+        self.hint = ("Игра не даёт снять изображение (эксклюзивный полноэкранный режим). Переключите в её "
+                     "настройках экран на «Окно без рамки» (Borderless) или «В окне».")
+        if fg.exe not in self._hinted:
+            self._hinted.add(fg.exe)
+            log.info("чёрный кадр у %s — вероятно, эксклюзивный полноэкранный режим", fg.exe)
+            self.gui.balloon("Живой перевод не видит игру", "Переключите в игре экран на «Окно без рамки» "
+                                                          "(Borderless) — тогда перевод появится.")
+
+    def _recognize_scaled(self, w: int, h: int, frame: bytes, limit: int) -> List[Line]:
+        """Кадр больше, чем берёт распознавание Windows (очень большие мониторы), — уменьшаем и пересчитываем рамки."""
+        from PIL import Image
+        f = limit / float(max(w, h))
+        sw, sh = max(1, int(w * f)), max(1, int(h * f))
+        img = Image.frombuffer("RGBA", (w, h), frame, "raw", "BGRA", 0, 1).resize((sw, sh), Image.BILINEAR)
+        lines = self.ocr.recognize(sw, sh, img.tobytes("raw", "BGRA"))
+        return [Line(ln.text, int(ln.x / f), int(ln.y / f), int(ln.w / f), int(ln.h / f)) for ln in lines]
 
     @staticmethod
     def _sample(frame: bytes, w: int, h: int) -> str:
@@ -273,7 +325,10 @@ class LiveService:
         # в играх с XUnity (русифицированы файлами) Alt+T уже занят — там он переключает перевод игры
         game_dir = self._decider.game_dir(fg.exe) or str(Path(fg.exe).parent)
         xunity = (Path(game_dir) / "BepInEx" / "plugins" / "XUnity.AutoTranslator").is_dir()
-        keys = [HOTKEYS["now"], HOTKEYS["region"], HOTKEYS["mark"]] + ([] if xunity else [HOTKEYS["toggle"]])
+        keys = [HOTKEYS["now"], HOTKEYS["region"]] + ([] if xunity else [HOTKEYS["toggle"]])
+        self._black = 0
+        self._picture = False
+        self.hint = ""
         self.gui.set_hotkeys(keys)
         name = fg.title or Path(fg.exe).stem
         self.gui.set_tip(f"Живой перевод: {name}")
@@ -284,7 +339,7 @@ class LiveService:
     def _drop_target(self) -> None:
         if self.target is not None:
             self.target = None
-            self.gui.set_hotkeys([HOTKEYS["mark"]])
+            self.gui.set_hotkeys([])
             self.gui.set_tip("Русификатор — живой перевод (ждёт игру)")
         self._hide()
 
@@ -428,8 +483,6 @@ class LiveService:
             self._frame_sig = ""
         elif name == "region":
             self.select_region()
-        elif name == "mark":
-            self.mark_current("always")
 
     def toggle(self) -> None:
         self.paused = not self.paused
@@ -437,8 +490,18 @@ class LiveService:
             self._hide()
         self._shown_sig = ""
 
+    def _alive(self, w: Optional[win32.WindowInfo]) -> Optional[win32.WindowInfo]:
+        """Свежие координаты окна, если оно ещё открыто и не свёрнуто."""
+        if w is None:
+            return None
+        cur = win32.window_info(w.hwnd)
+        if cur is None or cur.pid != w.pid or cur.minimized or cur.client[2] < 120 or cur.client[3] < 90:
+            return None
+        return cur
+
     def select_region(self) -> None:
-        fg = self.target or win32.foreground()
+        # с горячей клавиши — игра на экране; из меню трея — последняя игра (фокус тогда у трея)
+        fg = self.target or self._alive(self.last_game)
         if fg is None or fg.pid == os.getpid():
             return
         self._hide()
@@ -473,10 +536,10 @@ class LiveService:
         self._save({"live_profiles": profiles})
         self._frame_sig = self._shown_sig = ""
 
-    def mark_current(self, which: str, from_ui: bool = False) -> Optional[str]:
-        """Добавить окно в «Всегда»/«Никогда». С горячей клавиши — окно переднего плана (игра),
-        из окна программы — последняя игра (на переднем плане тогда сама программа)."""
-        fg = (self.target or self.last_game) if from_ui else win32.foreground()
+    def mark_current(self, which: str, what: str = "game") -> Optional[str]:
+        """Добавить окно в «Всегда»/«Никогда»: ``game`` — текущая или последняя игра,
+        ``candidate`` — последнее обычное окно, которое не распозналось как игра."""
+        fg = self.candidate if what == "candidate" else (self.target or self.last_game)
         if fg is None or fg.pid == os.getpid() or not fg.exe:
             return None
         key = "live_always" if which == "always" else "live_never"
@@ -486,23 +549,33 @@ class LiveService:
         self._save({key: lst, other: rest})
         self._decider_at = 0
         if which == "always":
+            if self.candidate is not None and detect._norm(self.candidate.exe) == detect._norm(fg.exe):
+                self.candidate = None
             self.gui.balloon("Живой перевод", f"Окно «{fg.title or Path(fg.exe).stem}» будет переводиться.")
+        else:
+            if self.target is not None and detect._norm(self.target.exe) == detect._norm(fg.exe):
+                self._drop_target()
+            if self.last_game is not None and detect._norm(self.last_game.exe) == detect._norm(fg.exe):
+                self.last_game = None
         return fg.exe
 
     def _save(self, partial: Dict[str, Any]) -> None:
-        cur = settings.load()
-        cur.update(partial)
-        settings.save(cur)
         self.cfg.update(partial)
+        settings.save(self.cfg)             # подхватит и то, что поменяли в окне программы
 
     def _menu_items(self) -> List[Tuple[str, str, bool]]:
-        return [("toggle", "Показывать перевод  (Alt+T)", not self.paused),
-                ("now", "Перевести сейчас  (Alt+Y)", False),
-                ("region", "Выбрать область текста  (Alt+R)", False),
-                ("mark", "Переводить это окно  (Alt+G)", False),
-                ("-", "", False),
-                ("open", "Открыть «Русификатор игр»", False),
-                ("quit", "Выключить живой перевод", False)]
+        items = [("toggle", "Показывать перевод  (Alt+T)", not self.paused),
+                 ("now", "Перевести сейчас  (Alt+Y)", False)]
+        if self.target or self.last_game:
+            items.append(("region", "Выбрать область текста  (Alt+R)", False))
+        c = self.candidate
+        if c is not None:
+            name = (c.title or Path(c.exe).stem).strip()
+            name = name if len(name) <= 36 else name[:35] + "…"
+            items.append(("mark", f"Переводить окно «{name}»", False))
+        return items + [("-", "", False),
+                        ("open", "Открыть «Русификатор игр»", False),
+                        ("quit", "Выключить живой перевод", False)]
 
     def _on_menu(self, cmd: str) -> None:
         if cmd == "toggle":
@@ -512,7 +585,7 @@ class LiveService:
         elif cmd == "region":
             self.select_region()
         elif cmd == "mark":
-            self.mark_current("always")
+            self.mark_current("always", "candidate")
         elif cmd == "open":
             open_main_window()
         elif cmd == "quit":
@@ -524,18 +597,25 @@ class LiveService:
     def status(self) -> Dict[str, Any]:
         t = self.target
         last = self.last_game
-        prof = (_cfg(self.cfg, "live_profiles") or {}).get(detect._norm(t.exe)) if t else None
+        profiles = _cfg(self.cfg, "live_profiles") or {}
+
+        def has_region(w: win32.WindowInfo) -> bool:
+            return bool((profiles.get(detect._norm(w.exe)) or {}).get("region"))
         err = self.ocr_error
+        c = self.candidate
         return {
             "running": True, "paused": self.paused, "pid": os.getpid(),
             "game": {"title": t.title or Path(t.exe).stem, "exe": t.exe, "reason": self.target_reason,
-                     "region": bool(prof and prof.get("region"))} if t else None,
+                     "region": has_region(t)} if t else None,
+            "candidate": {"title": c.title or Path(c.exe).stem, "exe": c.exe} if c else None,
+            "hint": self.hint,
             "ocr": {"ok": self.ocr is not None, "name": getattr(self.ocr, "name", ""),
                     "lang": getattr(self.ocr, "lang", ""), "code": err.code if err else "",
                     "error": str(err) if err else "", "starting": self.ocr is None and err is None},
             "translator": {"mode": self.translator_mode, "ready": self.translator is not None,
                            "error": self.translator_error},
-            "last_game": {"title": last.title or Path(last.exe).stem, "exe": last.exe} if last else None,
+            "last_game": {"title": last.title or Path(last.exe).stem, "exe": last.exe, "reason": self.target_reason,
+                          "region": has_region(last)} if last else None,
             "count": self.count, "recent": list(self.recent)[:12],
             "capture_excluded": bool(self.gui and self.gui.excluded_from_capture),
         }
@@ -569,7 +649,8 @@ class LiveService:
                 elif path == "/region_clear":
                     svc.clear_region()
                 elif path == "/mark":
-                    body = {"ok": True, "exe": svc.mark_current(q.get("list", "always"), from_ui=True)}
+                    exe = svc.mark_current(q.get("list", "always"), q.get("what", "game"))
+                    body = {"ok": bool(exe), "exe": exe, "error": "" if exe else "Нет окна, которое можно отметить."}
                 elif path == "/reload":
                     old = (svc.cfg.get("live_mode"), svc.cfg.get("mode"), svc.cfg.get("cloud_model"),
                            svc.cfg.get("local_model"))
@@ -603,26 +684,19 @@ class LiveService:
         threading.Thread(target=self._http.serve_forever, name="live-status", daemon=True).start()
 
 
+_last_open = 0.0
+
+
 def open_main_window() -> None:
     """Показать окно программы (если уже открыто) или запустить её."""
-    if win32.IS_WINDOWS:
-        import ctypes
-        from ctypes import wintypes
-        found = []
-        proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-        def cb(hwnd, _):
-            buf = ctypes.create_unicode_buffer(256)
-            win32.GetWindowTextW(hwnd, buf, 256)
-            if buf.value.startswith("Русификатор игр") and win32.IsWindowVisible(hwnd):
-                found.append(hwnd)
-                return False
-            return True
-        ctypes.windll.user32.EnumWindows(proto(cb), 0)
-        if found:
-            ctypes.windll.user32.ShowWindow(found[0], 9)   # SW_RESTORE
-            win32.SetForegroundWindow(found[0])
-            return
+    global _last_open
+    hwnd = win32.find_program_window(MAIN_TITLE)
+    if hwnd:
+        win32.activate(hwnd)
+        return
+    if time.monotonic() - _last_open < 8:     # только что запускали — окно ещё открывается
+        return
+    _last_open = time.monotonic()
     from ..core import launcher
     exe, args, workdir = launcher._program()
     try:

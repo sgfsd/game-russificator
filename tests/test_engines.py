@@ -563,3 +563,36 @@ def test_rgssad_xor_without_numpy_matches_reference():
     for n in (0, 1, 5, 4096, (1 << 18) + 3, 700_001):
         data = os.urandom(n)
         assert _xor_bigint(data, 0xDEADCAFE ^ n) == _decrypt_data(data, 0xDEADCAFE ^ n)
+
+
+def test_rgss_credit_script_never_breaks_game():
+    """Надпись на титульном экране XP/VX/Ace: свой титульный экран в игре — надписи нет, но и ошибки нет."""
+    import shutil
+    import subprocess
+    if shutil.which("ruby") is None:
+        pytest.skip("нет ruby")
+    from russificator import branding
+    from russificator.engines.rpgmaker.plugin import credit_script
+    stubs = """
+class Color; def initialize(*a); end; end
+class Font; attr_accessor :size, :color; end
+class Bitmap; attr_reader :font; def initialize(w, h); @font = Font.new; end
+  def draw_text(*a); $drawn = a[4]; end; def dispose; $disposed = true; end; end
+class Sprite; attr_accessor :bitmap, :y, :z; def dispose; end; end
+module Graphics; def self.width; 544; end; def self.height; 416; end; end
+"""
+    cases = [
+        ("ace", "class Scene_Base; def start; end; def terminate; end; end\n"
+                "class Scene_Title < Scene_Base; def start; end; end\n", "t.start; t.terminate", True),
+        ("xp", "class Scene_Title; def main; end; end\n", "t.main", True),
+        ("ace", "", "", False),                       # Scene_Title нет вовсе
+        ("xp", "", "", False),
+        ("ace", "class Scene_Title; end\n", "", False),  # свой титульный экран без start/terminate
+    ]
+    for version, pre, run, drawn in cases:
+        code = (stubs + pre + credit_script(version, branding.CREDIT)
+                + (f"\nt = Scene_Title.new\n{run}\n" if run else "\n")
+                + "puts($drawn ? 'drawn' : 'none')\n")
+        r = subprocess.run(["ruby", "-e", code], capture_output=True, text=True, encoding="utf-8")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == ("drawn" if drawn else "none")
