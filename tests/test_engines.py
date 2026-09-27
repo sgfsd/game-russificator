@@ -565,7 +565,7 @@ def test_rgssad_xor_without_numpy_matches_reference():
         assert _xor_bigint(data, 0xDEADCAFE ^ n) == _decrypt_data(data, 0xDEADCAFE ^ n)
 
 
-def test_rgss_credit_script_never_breaks_game():
+def test_rgss_credit_script_never_breaks_game(tmp_path):
     """Надпись на титульном экране XP/VX/Ace: свой титульный экран в игре — надписи нет, но и ошибки нет."""
     import shutil
     import subprocess
@@ -593,6 +593,8 @@ module Graphics; def self.width; 544; end; def self.height; 416; end; end
         code = (stubs + pre + credit_script(version, branding.CREDIT)
                 + (f"\nt = Scene_Title.new\n{run}\n" if run else "\n")
                 + "puts($drawn ? 'drawn' : 'none')\n")
-        r = subprocess.run(["ruby", "-e", code], capture_output=True, text=True, encoding="utf-8")
+        script = tmp_path / "credit.rb"                   # файлом, а не -e: кириллица цела и в Windows
+        script.write_text(code, encoding="utf-8")
+        r = subprocess.run(["ruby", str(script)], capture_output=True, text=True, encoding="utf-8")
         assert r.returncode == 0, r.stderr
         assert r.stdout.strip() == ("drawn" if drawn else "none")
