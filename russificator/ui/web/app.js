@@ -1023,7 +1023,10 @@ async function refreshLive() {
     $("#liveRegionClear").classList.toggle("hidden", !g.region);
   }
   $("#liveHint").classList.toggle("hidden", !(on && st.hint));
-  if (on && st.hint) $("#liveHintText").textContent = st.hint;
+  if (on && st.hint) {
+    $("#liveHintTitle").textContent = st.hint_title || "Подсказка";
+    $("#liveHintText").textContent = st.hint;
+  }
   const cand = on ? st.candidate : null;
   $("#liveCand").classList.toggle("hidden", !cand);
   if (cand) $("#liveCandTitle").textContent = `Окно «${cand.title}»`;

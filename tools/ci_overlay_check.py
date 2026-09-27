@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import time
@@ -95,6 +96,58 @@ def check_windows() -> bool:
     return ok
 
 
+def check_live() -> bool:
+    """Сквозная проверка службы: полноэкранное окно «игры» с английским текстом → служба сама
+    решает, что это игра, снимает кадр, распознаёт, переводит и показывает плашку."""
+    import subprocess
+    import threading
+    from russificator.overlay import ocr, service, win32
+    pyw = Path(sys.executable).with_name("pythonw.exe")
+    code = ("import tkinter as tk\n"
+            "r = tk.Tk(); r.configure(bg='black'); r.attributes('-fullscreen', True)\n"
+            "tk.Label(r, text='Press any key to continue', fg='white', bg='black', font=('Arial', 30))"
+            ".place(relx=0.5, rely=0.8, anchor='center')\n"
+            "r.after(300, lambda: (r.lift(), r.focus_force())); r.after(40000, r.destroy); r.mainloop()\n")
+    game = subprocess.Popen([str(pyw if pyw.is_file() else sys.executable), "-c", code])
+    try:
+        time.sleep(4)
+        fg = win32.foreground()
+        print(f"[live] окно переднего плана: {fg.exe if fg else None} на весь экран: {fg.fullscreen if fg else None}")
+        svc = service.LiveService(quiet=True)
+        icon = Path(__file__).resolve().parents[1] / "russificator" / "resources" / "icon.ico"
+        svc.gui = win32.Gui(str(icon), svc._on_hotkey, svc._on_menu, svc._on_region, svc._menu_items)
+        svc.gui.start()
+        svc.ocr = ocr.create("en", Path(tempfile.gettempdir()))
+
+        class Tr:
+            cache_id = "ci:live"
+
+            def translate(self, entries, glossary):
+                return {e.id: "Нажмите любую клавишу" for e in entries}
+
+            def close(self):
+                pass
+        svc.translator, svc._reload_translator = Tr(), False
+        threading.Thread(target=svc._translate_loop, daemon=True).start()
+        started = time.monotonic()
+        while time.monotonic() - started < 20:
+            svc._tick()
+            if svc.count and svc.gui.visible:
+                break
+            time.sleep(0.4)
+        st = svc.status()
+        print(f"[live] игра: {st['game']}, распознавание: {st['ocr']['name']}, переведено: {st['count']}, "
+              f"плашка на экране: {svc.gui.visible}, за {time.monotonic() - started:.1f} с, "
+              f"последние: {st['recent'][:2]}")
+        ok = bool(st["game"]) and st["count"] > 0 and svc.gui.visible
+        svc.stop_event.set()
+        svc.gui.stop()
+        svc.ocr.close()
+        return ok
+    finally:
+        game.kill()
+
+
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):     # консоль CI в cp1252 — русские сообщения не должны ронять проверку
         try:
@@ -105,7 +158,8 @@ def main() -> int:
         print("только для Windows")
         return 0
     results = {}
-    for name, fn in (("ocr", check_ocr), ("windows", check_windows)):
+    os.environ.setdefault("RUSSIFICATOR_HOME", tempfile.mkdtemp(prefix="ci-live-"))
+    for name, fn in (("ocr", check_ocr), ("windows", check_windows), ("live", check_live)):
         try:
             results[name] = fn()
         except Exception:  # noqa: BLE001

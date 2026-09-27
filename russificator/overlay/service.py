@@ -223,6 +223,9 @@ class LiveService:
         if (x, y, w, h) == tuple(fg.client):
             self._check_black(fg, frame, w, h)     # в выбранной области чёрный фон — это нормально
         if sig == self._frame_sig and not self.force_now and self.region == (x, y, w, h):
+            # картинка та же — значит, и текст тот же: это ещё одно подтверждение, что он допечатан
+            # (иначе статичный экран — диалог ждёт клика, меню — так и не дождался бы перевода)
+            self._same_frame()
             self._show(x, y, w, h)
             return
         self._frame_sig = sig
@@ -235,13 +238,25 @@ class LiveService:
         self.tracker.need = 1 if self.force_now else 2
         self.force_now = False
         self.tracker.update(blocks)
+        self._dispatch_ready()
+        self._show(x, y, w, h)
+
+    def _same_frame(self) -> None:
+        now = time.monotonic()
+        for b in self.tracker.blocks:
+            b.last_seen = now
+            if not b.translation and b.key:
+                b.stable_hits += 1
+        self._dispatch_ready()
+
+    def _dispatch_ready(self) -> None:
+        """Устойчивые блоки без перевода: из кэша сессии сразу, остальные — в очередь переводчику."""
         for b in self.tracker.ready():
             hit = self.cache.get(b.key)
             if hit:
                 b.translation = hit
             else:
                 self._enqueue(b)
-        self._show(x, y, w, h)
 
     def _recognize(self, w: int, h: int, frame: bytes) -> Optional[List[Line]]:
         try:
@@ -620,7 +635,10 @@ class LiveService:
             "game": {"title": t.title or Path(t.exe).stem, "exe": t.exe, "reason": self.target_reason,
                      "region": has_region(t)} if t else None,
             "candidate": {"title": c.title or Path(c.exe).stem, "exe": c.exe} if c else None,
-            "hint": self.hint,
+            "hint": self.hint or ("" if not self.gui or self.gui.excluded_from_capture else
+                                  "Эта версия Windows не умеет прятать перевод от снимков экрана — плашки могут "
+                                  "мигать. Обновите Windows 10 до версии 2004 или новее (или Windows 11)."),
+            "hint_title": "Живой перевод не видит игру" if self.hint else "Перевод может мигать",
             "ocr": {"ok": self.ocr is not None, "name": getattr(self.ocr, "name", ""),
                     "lang": getattr(self.ocr, "lang", ""), "code": err.code if err else "",
                     "error": str(err) if err else "", "starting": self.ocr is None and err is None},

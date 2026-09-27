@@ -178,8 +178,7 @@ def test_live_service_pipeline(tmp_path, monkeypatch):
         svc._tick()                                          # кадр 1: блок появился
         assert svc.target is not None and svc.target_reason == "полноэкранное окно"
         assert "toggle" in svc.gui.keys                      # в игре без XUnity Alt+T — наш
-        frame[0] = bytes([1]) * (1280 * 720 * 4)             # кадр изменился (анимация), текст тот же
-        svc._tick()                                          # кадр 2: текст устойчив — на перевод
+        svc._tick()                                          # кадр 2 тот же (экран ждёт клика) — на перевод
         import time
         for _ in range(50):
             if svc.count:
@@ -217,6 +216,31 @@ def test_live_service_pipeline(tmp_path, monkeypatch):
         svc.stop_event.set()
         with svc._cond:
             svc._cond.notify_all()
+
+
+def test_live_animated_frame_also_translates(tmp_path, monkeypatch):
+    """Кадр меняется (анимация фона), текст тот же — тоже переводится со второго кадра."""
+    pytest.importorskip("PIL")
+    monkeypatch.setenv("RUSSIFICATOR_HOME", str(tmp_path / "home"))
+    from russificator import paths
+    paths.set_home(None)
+    from russificator.overlay import service, win32
+    fg = win32.WindowInfo(hwnd=1, pid=4242, exe="C:/G/g.exe", title="G", client=(0, 0, 640, 360),
+                          window=(0, 0, 640, 360), monitor=(0, 0, 640, 360), minimized=False)
+    n = [0]
+
+    def cap(x, y, w, h):
+        n[0] += 1
+        return bytes([n[0] % 250]) * (w * h * 4)
+    monkeypatch.setattr(win32, "foreground", lambda: fg)
+    monkeypatch.setattr(win32, "capture", cap)
+    svc = service.LiveService(quiet=True)
+    svc.gui = _FakeGui()
+    svc.ocr = _FakeOcr([text.Line("Welcome back, traveler!", 100, 300, 280, 24)])
+    svc._tick()
+    assert not svc._queue
+    svc._tick()
+    assert [b.text for b in svc._queue] == ["Welcome back, traveler!"]
 
 
 def test_live_region_profile(tmp_path, monkeypatch):
