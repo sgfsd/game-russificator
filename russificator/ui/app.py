@@ -435,7 +435,9 @@ class Api:
                 return {"ok": True}
             except Exception:  # noqa: BLE001
                 pass
-        if xunity.is_installed(game) and not (game / "BepInEx" / "plugins" / xunity.PLUGIN).is_file():
+        plugins = game / "BepInEx" / "plugins"
+        has_plugin = (plugins / xunity.PLUGIN).is_file() or (plugins / xunity.PLUGIN_IL2CPP).is_file()
+        if xunity.is_installed(game) and not has_plugin:   # доводку без плагина запускает режим --play
             from ..core import launcher
             exe, args, workdir = launcher.play_command()
             try:

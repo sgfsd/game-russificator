@@ -19,7 +19,10 @@ namespace UnityEngine
 
     public struct Color
     {
-        public Color(float r, float g, float b, float a) { }
+        public float r;
+        public float g;
+        public float b;
+        public float a;
     }
 
     public enum TextAnchor

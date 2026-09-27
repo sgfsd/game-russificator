@@ -10,6 +10,10 @@
 
 Russificator.Unity.dll — BepInEx 5 (Mono), ссылается на mscorlib 2.0, поэтому
 работает и в старых играх на .NET 3.5 (Unity 5), и в новых.
+
+Russificator.Unity.IL2CPP.dll — тот же исходник с символом IL2CPP, BepInEx 6 (.NET 6):
+ссылки — эталонные сборки .NET 6 (NuGet Microsoft.NETCore.App.Ref), BepInEx 6 и
+Il2CppInterop из официального архива, обёртки Unity — заглушки tools/unity_stubs/il2cpp.
 """
 
 from __future__ import annotations
@@ -26,6 +30,11 @@ ROOT = Path(__file__).resolve().parents[1]
 RES = ROOT / "russificator" / "resources" / "unity"
 CACHE = ROOT / ".cache" / "unity-refs"
 BEPINEX5 = "https://github.com/BepInEx/BepInEx/releases/download/v5.4.23.5/BepInEx_win_x64_5.4.23.5.zip"
+BEPINEX6 = ("https://github.com/BepInEx/BepInEx/releases/download/v6.0.0-pre.2/"
+            "BepInEx-Unity.IL2CPP-win-x64-6.0.0-pre.2.zip")
+NET6_REF = "https://api.nuget.org/v3-flatcontainer/microsoft.netcore.app.ref/6.0.36/microsoft.netcore.app.ref.6.0.36.nupkg"
+BEPINEX6_CORE = ["BepInEx.Core.dll", "BepInEx.Unity.IL2CPP.dll", "BepInEx.Unity.Common.dll",
+                 "Il2CppInterop.Runtime.dll", "Il2CppInterop.Common.dll", "0Harmony.dll"]
 
 
 def _download(url: str, dest: Path) -> Path:
@@ -84,5 +93,49 @@ def build_mono() -> Path:
     return out
 
 
+def _net6_refs() -> list:
+    d = CACHE / "net6"
+    if not (d / "System.Runtime.dll").is_file():
+        pkg = _download(NET6_REF, CACHE / "net6ref.nupkg")
+        d.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(pkg) as z:
+            for n in z.namelist():
+                if n.startswith("ref/net6.0/") and n.endswith(".dll"):
+                    (d / Path(n).name).write_bytes(z.read(n))
+    return [f"-r:{p}" for p in sorted(d.glob("*.dll"))]
+
+
+def build_il2cpp() -> Path:
+    refs = CACHE / "bepinex6"
+    if not all((refs / n).is_file() for n in BEPINEX6_CORE):
+        _extract(_download(BEPINEX6, CACHE / "BepInEx6-IL2CPP.zip"),
+                 {f"BepInEx/core/{n}": n for n in BEPINEX6_CORE}, refs)
+    cc = _compiler()
+    base = ["-nologo", "-nostdlib", "-noconfig", *_net6_refs()]
+    interop = [f"-r:{refs / 'Il2CppInterop.Runtime.dll'}", f"-r:{refs / 'Il2CppInterop.Common.dll'}"]
+    stubs = CACHE / "stub-il2cpp"
+    stubs.mkdir(parents=True, exist_ok=True)
+    src = ROOT / "tools" / "unity_stubs" / "il2cpp"
+
+    def stub(name: str, extra: list) -> Path:
+        out = stubs / f"{name}.dll"
+        subprocess.run(cc + base + ["-target:library", f"-out:{out}", *interop, *extra, str(src / f"{name}.cs")],
+                       check=True)
+        return out
+
+    mscorlib = stub("Il2Cppmscorlib", [])
+    core = stub("UnityEngine.CoreModule", [f"-r:{mscorlib}"])
+    text = stub("UnityEngine.TextRenderingModule", [])
+    imgui = stub("UnityEngine.IMGUIModule", [f"-r:{mscorlib}", f"-r:{core}", f"-r:{text}"])
+    out = RES / "Russificator.Unity.IL2CPP.dll"
+    subprocess.run(cc + base + ["-target:library", "-optimize", "-define:IL2CPP", f"-out:{out}", *interop,
+                                *[f"-r:{refs / n}" for n in BEPINEX6_CORE if not n.startswith("Il2CppInterop")],
+                                f"-r:{mscorlib}", f"-r:{core}", f"-r:{text}", f"-r:{imgui}",
+                                str(RES / "RussificatorUnity.cs")], check=True)
+    print("built", out, out.stat().st_size)
+    return out
+
+
 if __name__ == "__main__":
     build_mono()
+    build_il2cpp()

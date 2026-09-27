@@ -99,22 +99,34 @@ def install(game: UnityGame, backup, status: StatusFn = _noop, cancel=None) -> L
     return notes
 
 
-PLUGIN = "Russificator.Unity.dll"
+PLUGIN = "Russificator.Unity.dll"                  # Mono, BepInEx 5
+PLUGIN_IL2CPP = "Russificator.Unity.IL2CPP.dll"    # IL2CPP, BepInEx 6
 PLUGIN_CONFIG = "BepInEx/config/Russificator.cfg"
+
+
+def plugin_name(game: UnityGame) -> Optional[str]:
+    """Какая сборка плагина подходит игре (по установленному BepInEx) или None."""
+    core = game.root / "BepInEx" / "core"
+    if game.backend == "mono" and (core / "BepInEx.dll").is_file():
+        return PLUGIN
+    if game.backend == "il2cpp" and (core / "BepInEx.Unity.IL2CPP.dll").is_file():
+        return PLUGIN_IL2CPP
+    return None
 
 
 def install_plugin(game: UnityGame, backup) -> bool:
     """Плагин русификатора в игре (исходник — resources/unity/RussificatorUnity.cs).
 
     Запускает живой перевод при старте игры, уменьшает шрифт у русского текста,
-    который не помещается, и направляет TMP ``SetText(string)`` через свойство
-    ``text``. Только Mono + BepInEx 5 (собран под его API).
+    который не помещается, направляет TMP ``SetText(string)`` через свойство
+    ``text`` и показывает надпись о программе в русификаторах «для друзей».
+    Mono — сборка под BepInEx 5, IL2CPP — под BepInEx 6.
     """
-    src = Path(__file__).resolve().parents[2] / "resources" / "unity" / PLUGIN
-    bepinex5 = (game.root / "BepInEx" / "core" / "BepInEx.dll").is_file()
-    if game.backend != "mono" or not bepinex5 or not src.is_file():
+    name = plugin_name(game)
+    src = Path(__file__).resolve().parents[2] / "resources" / "unity" / (name or PLUGIN)
+    if name is None or not src.is_file():
         return False
-    dest = game.root / "BepInEx" / "plugins" / PLUGIN
+    dest = game.root / "BepInEx" / "plugins" / name
     if dest.exists():
         backup.save_original(dest)
     else:
@@ -125,7 +137,8 @@ def install_plugin(game: UnityGame, backup) -> bool:
 
 
 def plugin_installed(game: UnityGame) -> bool:
-    return (game.root / "BepInEx" / "plugins" / PLUGIN).is_file()
+    plugins = game.root / "BepInEx" / "plugins"
+    return (plugins / PLUGIN).is_file() or (plugins / PLUGIN_IL2CPP).is_file()
 
 
 def plugin_config_text(server: Optional[tuple], fit: bool = True, credit: str = "") -> str:

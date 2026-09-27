@@ -444,3 +444,39 @@ def test_text_assets_decode_rejects_binary():
     assert text_assets.decode(b"\x00\x01\x02" * 100) is None
     assert text_assets.decode("\ufeffHello".encode("utf-8")) == "Hello"
     assert text_assets.decode("Hi there".encode("utf-16")) == "Hi there"
+
+
+def test_plugin_matches_bepinex(tmp_path):
+    """Mono + BepInEx 5 — Russificator.Unity.dll, IL2CPP + BepInEx 6 — Russificator.Unity.IL2CPP.dll."""
+    from russificator.core.backup import GameBackup
+    from russificator.engines.unity import xunity
+    from russificator.engines.unity.detect import UnityGame
+    for backend, core_dll, expected in (("mono", "BepInEx.dll", xunity.PLUGIN),
+                                        ("il2cpp", "BepInEx.Unity.IL2CPP.dll", xunity.PLUGIN_IL2CPP)):
+        root = tmp_path / backend
+        (root / "BepInEx" / "core").mkdir(parents=True)
+        game = UnityGame(root=root, data=root / "G_Data", exe=None, backend=backend, arch="x64", version="", uses_tmp=True)
+        assert xunity.plugin_name(game) is None or (root / "BepInEx" / "core" / core_dll).exists()
+        (root / "BepInEx" / "core" / core_dll).write_bytes(b"x")
+        assert xunity.plugin_name(game) == expected
+        assert xunity.install_plugin(game, GameBackup(root))
+        assert (root / "BepInEx" / "plugins" / expected).is_file() and xunity.plugin_installed(game)
+    other = UnityGame(root=tmp_path / "none", data=tmp_path, exe=None, backend="il2cpp", arch="x64", version="",
+                      uses_tmp=False)
+    assert xunity.plugin_name(other) is None
+
+
+def test_plugin_dlls_reference_expected_runtimes():
+    """Собранные плагины: Mono — mscorlib 2.0 + BepInEx 5; IL2CPP — .NET 6 + BepInEx 6 + Il2CppInterop."""
+    dnfile = pytest.importorskip("dnfile")
+    res = Path(__file__).resolve().parents[1] / "russificator" / "resources" / "unity"
+
+    def refs(name):
+        md = dnfile.dnPE(str(res / name)).net.mdtables
+        return {str(r.Name): r.MajorVersion for r in md.AssemblyRef}
+
+    mono = refs("Russificator.Unity.dll")
+    assert mono["mscorlib"] == 2 and mono["BepInEx"] == 5 and "UnityEngine" in mono
+    il2cpp = refs("Russificator.Unity.IL2CPP.dll")
+    assert il2cpp["System.Runtime"] == 6 and il2cpp["BepInEx.Core"] == 6 and "Il2CppInterop.Runtime" in il2cpp
+    assert "UnityEngine.IMGUIModule" in il2cpp and "mscorlib" not in il2cpp

@@ -1,4 +1,6 @@
-// Russificator.Unity — плагин BepInEx 5 (Mono), дополнение к XUnity.AutoTranslator.
+// Russificator.Unity — дополнение к XUnity.AutoTranslator. Один исходник, две сборки:
+//   * Russificator.Unity.dll         — BepInEx 5, Mono-игры (Unity 5–6);
+//   * Russificator.Unity.IL2CPP.dll  — BepInEx 6, IL2CPP-игры (символ IL2CPP).
 //
 // 1. Живой перевод без «сначала открой программу». При старте игры плагин читает
 //    BepInEx/config/Russificator.cfg (его пишет русификатор) и, если сервер перевода
@@ -18,12 +20,13 @@
 // 4. Надпись о программе (только в русификаторах «для друзей», параметр credit в
 //    Russificator.cfg): полупрозрачная строка в правом нижнем углу первые секунды игры.
 //
-// Типы TextMeshPro и UGUI берутся через отражение; из UnityEngine напрямую — только то, что
-// есть во всех версиях 5–6 (IMGUI для надписи). Плагин ссылается на mscorlib 2.0, System,
-// BepInEx, 0Harmony и UnityEngine (в новых Unity — фасад, перенаправляющий в модули).
+// Типы TextMeshPro и UGUI берутся через отражение (в IL2CPP — обёртки Il2CppInterop,
+// поля там видны как свойства, а объект узнаётся по указателю); из UnityEngine напрямую —
+// только IMGUI для надписи. Любой сбой внутри плагина выключает только его часть, игру
+// он не ломает.
 //
-// Сборка: python tools/build_unity_plugins.py  (mcs из Mono или csc из .NET Framework 4;
-// UnityEngine для компиляции — заглушка tools/unity_stubs/UnityEngine.cs).
+// Сборка: python tools/build_unity_plugins.py (mcs из Mono или csc; UnityEngine для
+// компиляции — заглушки tools/unity_stubs, в игре — настоящие сборки игры).
 
 using System;
 using System.Collections.Generic;
@@ -34,22 +37,34 @@ using System.Reflection;
 using System.Text;
 using System.Threading;
 using BepInEx;
+using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
+#if IL2CPP
+using BepInEx.Unity.IL2CPP;
+using Il2CppInterop.Runtime.Injection;
+using Il2CppInterop.Runtime.InteropTypes;
+#endif
 
+#if IL2CPP
+[BepInPlugin("russificator.unity.il2cpp", "Russificator", "2.1.0")]
+public class RussificatorUnity : BasePlugin
+#else
 [BepInPlugin("russificator.unity", "Russificator", "2.1.0")]
 public class RussificatorUnity : BaseUnityPlugin
+#endif
 {
     const BindingFlags Inst = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
     const float MinScale = 0.6f;
 
+    static ManualLogSource _log;
     static bool _fitEnabled = true;
 
     // надпись о программе (русификатор «для друзей»)
     const float CreditSeconds = 14f;
     static string _credit;
-    float _creditStart = -1f;
-    GUIStyle _creditStyle, _creditShadow;
+    static float _creditStart = -1f;
+    static GUIStyle _creditStyle, _creditShadow;
 
     // ---------- состояние элементов текста ----------
 
@@ -79,32 +94,69 @@ public class RussificatorUnity : BaseUnityPlugin
 
     static Type _ugui;
     static FieldInfo _uguiText;
-    static PropertyInfo _uguiRect, _uguiBestFit, _uguiSize, _uguiMin, _uguiMax, _uguiHOverflow, _uguiGen, _uguiPpu;
+    static PropertyInfo _uguiTextProp, _uguiRect, _uguiBestFit, _uguiSize, _uguiMin, _uguiMax, _uguiHOverflow;
+    static PropertyInfo _uguiGen, _uguiPpu;
     static MethodInfo _uguiSettings, _genPrefW, _genPrefH;
     static Type _vector2;
 
     // ---------- общее ----------
 
     static PropertyInfo _rectProp, _rectW, _rectH;
-    static FieldInfo _v2x, _v2y;
 
     [ThreadStatic]
     static bool _inside;
 
+    // ======================= запуск =======================
+
+#if IL2CPP
+    public override void Load()
+    {
+        _log = Log;
+        Start();
+        try
+        {
+            ClassInjector.RegisterTypeInIl2Cpp<RussificatorBehaviour>();
+            AddComponent<RussificatorBehaviour>();
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning("Per-frame component failed (autosize and credit are off): " + ex.Message);
+        }
+    }
+#else
     void Awake()
+    {
+        _log = Logger;
+        Start();
+    }
+
+    void Update()
+    {
+        Tick();
+    }
+
+    void OnGUI()
+    {
+        if (_credit == null) return;
+        try { DrawCredit(); }
+        catch (Exception ex) { _credit = null; _log.LogDebug("credit: " + ex.Message); }
+    }
+#endif
+
+    static void Start()
     {
         Dictionary<string, string> cfg = ReadConfig();
         string v;
         if (cfg.TryGetValue("fit", out v) && v.Trim().ToLowerInvariant() == "false") _fitEnabled = false;
         if (cfg.TryGetValue("credit", out v) && v.Trim().Length > 0) _credit = v.Trim();
         try { StartLiveServer(cfg); }
-        catch (Exception ex) { Logger.LogWarning("Live translation autostart failed: " + ex.Message); }
+        catch (Exception ex) { _log.LogWarning("Live translation autostart failed: " + ex.Message); }
 
         Hook();
         AppDomain.CurrentDomain.AssemblyLoad += OnAssemblyLoad;
     }
 
-    void OnAssemblyLoad(object sender, AssemblyLoadEventArgs e)
+    static void OnAssemblyLoad(object sender, AssemblyLoadEventArgs e)
     {
         if (_tmp != null && _ugui != null) return;
         try { Hook(); } catch { }
@@ -131,7 +183,7 @@ public class RussificatorUnity : BaseUnityPlugin
         return cfg;
     }
 
-    void StartLiveServer(Dictionary<string, string> cfg)
+    static void StartLiveServer(Dictionary<string, string> cfg)
     {
         string exe, args, workdir, value;
         if (!cfg.TryGetValue("server", out exe) || exe.Length == 0) return;
@@ -140,12 +192,12 @@ public class RussificatorUnity : BaseUnityPlugin
         if (cfg.TryGetValue("port", out value)) int.TryParse(value, out port);
         if (PortOpen(port, 300))
         {
-            Logger.LogInfo("Live translation is already running");
+            _log.LogInfo("Live translation is already running");
             return;
         }
         if (!File.Exists(exe))
         {
-            Logger.LogWarning("Russificator not found (moved or deleted?): " + exe);
+            _log.LogWarning("Russificator not found (moved or deleted?): " + exe);
             return;
         }
         cfg.TryGetValue("args", out args);
@@ -162,12 +214,12 @@ public class RussificatorUnity : BaseUnityPlugin
         {
             if (PortOpen(port, 250))
             {
-                Logger.LogInfo("Live translation started");
+                _log.LogInfo("Live translation started");
                 return;
             }
             Thread.Sleep(150);
         }
-        Logger.LogWarning("Live translation server did not start in 20 s");
+        _log.LogWarning("Live translation server did not start in 20 s");
     }
 
     static bool PortOpen(int port, int timeoutMs)
@@ -190,64 +242,79 @@ public class RussificatorUnity : BaseUnityPlugin
 
     // ======================= 4. надпись о программе =======================
 
-    void OnGUI()
+    public static void DrawCredit()
     {
-        if (_credit == null) return;
-        try
-        {
-            float now = Time.realtimeSinceStartup;
-            if (_creditStart < 0f) _creditStart = now;
-            float t = now - _creditStart;
-            if (t > CreditSeconds)
-            {
-                _credit = null;
-                return;
-            }
-            float alpha = t > CreditSeconds - 2f ? (CreditSeconds - t) / 2f : 1f;
-            if (_creditStyle == null)
-            {
-                int size = Math.Max(12, Screen.height / 46);
-                _creditStyle = new GUIStyle();
-                _creditShadow = new GUIStyle();
-                foreach (GUIStyle st in new GUIStyle[] { _creditStyle, _creditShadow })
-                {
-                    st.fontSize = size;
-                    st.alignment = TextAnchor.LowerRight;
-                    st.wordWrap = false;
-                }
-            }
-            _creditStyle.normal.textColor = new Color(1f, 1f, 1f, 0.85f * alpha);
-            _creditShadow.normal.textColor = new Color(0f, 0f, 0f, 0.65f * alpha);
-            float w = Screen.width, h = Screen.height, pad = Math.Max(10f, h / 70f);
-            GUI.Label(new Rect(0f, 0f, w - pad + 1.5f, h - pad + 1.5f), _credit, _creditShadow);
-            GUI.Label(new Rect(0f, 0f, w - pad, h - pad), _credit, _creditStyle);
-        }
-        catch (Exception ex)
+        float now = Time.realtimeSinceStartup;
+        if (_creditStart < 0f) _creditStart = now;
+        float t = now - _creditStart;
+        if (t > CreditSeconds)
         {
             _credit = null;
-            Logger.LogDebug("credit: " + ex.Message);
+            return;
         }
+        float alpha = t > CreditSeconds - 2f ? (CreditSeconds - t) / 2f : 1f;
+        if (_creditStyle == null)
+        {
+            int size = Math.Max(12, Screen.height / 46);
+            _creditStyle = new GUIStyle();
+            _creditShadow = new GUIStyle();
+            foreach (GUIStyle st in new GUIStyle[] { _creditStyle, _creditShadow })
+            {
+                st.fontSize = size;
+                st.alignment = TextAnchor.LowerRight;
+                st.wordWrap = false;
+            }
+        }
+        _creditStyle.normal.textColor = Rgba(1f, 1f, 1f, 0.85f * alpha);
+        _creditShadow.normal.textColor = Rgba(0f, 0f, 0f, 0.65f * alpha);
+        float w = Screen.width, h = Screen.height, pad = Math.Max(10f, h / 70f);
+        GUI.Label(new Rect(0f, 0f, w - pad + 1.5f, h - pad + 1.5f), _credit, _creditShadow);
+        GUI.Label(new Rect(0f, 0f, w - pad, h - pad), _credit, _creditStyle);
+    }
+
+    static Color Rgba(float r, float g, float b, float a)
+    {
+        Color c = new Color();
+        c.r = r;
+        c.g = g;
+        c.b = b;
+        c.a = a;
+        return c;
+    }
+
+    public static bool CreditActive
+    {
+        get { return _credit != null; }
+    }
+
+    public static void StopCredit(Exception ex)
+    {
+        _credit = null;
+        if (ex != null) _log.LogDebug("credit: " + ex.Message);
     }
 
     // ======================= перехваты =======================
 
-    static Type FindType(string name)
+    static Type FindType(params string[] names)
     {
         foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
         {
-            Type t = null;
-            try { t = a.GetType(name, false); } catch { }
-            if (t != null) return t;
+            foreach (string name in names)
+            {
+                Type t = null;
+                try { t = a.GetType(name, false); } catch { }
+                if (t != null) return t;
+            }
         }
         return null;
     }
 
-    void Hook()
+    static void Hook()
     {
         Harmony harmony = new Harmony("russificator.unity");
         if (_tmp == null)
         {
-            Type t = FindType("TMPro.TMP_Text");
+            Type t = FindType("TMPro.TMP_Text", "Il2CppTMPro.TMP_Text");
             if (t != null)
             {
                 _tmp = t;
@@ -270,7 +337,7 @@ public class RussificatorUnity : BaseUnityPlugin
         return typeof(RussificatorUnity).GetMethod(name, BindingFlags.Static | BindingFlags.NonPublic);
     }
 
-    void HookTmp(Harmony harmony)
+    static void HookTmp(Harmony harmony)
     {
         try
         {
@@ -308,7 +375,8 @@ public class RussificatorUnity : BaseUnityPlugin
                 _tiLineCount = ti.GetField("lineCount");
                 _tiLineInfo = ti.GetField("lineInfo");
                 _tiCharInfo = ti.GetField("characterInfo");
-                if (_tiLineInfo != null && _tiCharInfo != null)
+                if (_tiLineInfo != null && _tiCharInfo != null && _tiLineInfo.FieldType.IsArray
+                    && _tiCharInfo.FieldType.IsArray)
                 {
                     _liFirst = _tiLineInfo.FieldType.GetElementType().GetField("firstCharacterIndex");
                     _liLast = _tiLineInfo.FieldType.GetElementType().GetField("lastCharacterIndex");
@@ -321,25 +389,26 @@ public class RussificatorUnity : BaseUnityPlugin
                 harmony.Patch(setText, new HarmonyMethod(Own("SetTextPrefix")));
 
             MethodInfo setter = _tmpTextProp != null ? _tmpTextProp.GetSetMethod() : null;
-            if (setter != null && _fitEnabled && _tmpText != null && _tmpRect != null && _tmpAuto != null
+            if (setter != null && _fitEnabled && _tmpRect != null && _tmpAuto != null
                 && _tmpPrefW != null && _tmpPrefH != null && _tmpSize != null && _tmpSizeMin != null && _tmpSizeMax != null)
             {
                 harmony.Patch(setter, new HarmonyMethod(Own("TextPrefix")), new HarmonyMethod(Own("TextPostfix")));
             }
-            Logger.LogInfo("TextMeshPro hooks installed");
+            _log.LogInfo("TextMeshPro hooks installed");
         }
         catch (Exception ex)
         {
-            Logger.LogWarning("TextMeshPro hooks failed: " + ex.Message);
+            _log.LogWarning("TextMeshPro hooks failed: " + ex.Message);
         }
     }
 
-    void HookUgui(Harmony harmony)
+    static void HookUgui(Harmony harmony)
     {
         try
         {
             if (!_fitEnabled) return;
             _uguiText = FindField(_ugui, "m_Text");
+            _uguiTextProp = _ugui.GetProperty("text");
             _uguiRect = _ugui.GetProperty("rectTransform");
             _uguiBestFit = _ugui.GetProperty("resizeTextForBestFit");
             _uguiSize = _ugui.GetProperty("fontSize");
@@ -356,20 +425,19 @@ public class RussificatorUnity : BaseUnityPlugin
                 Type settings = _uguiSettings.ReturnType;
                 _genPrefW = gen.GetMethod("GetPreferredWidth", new Type[] { typeof(string), settings });
                 _genPrefH = gen.GetMethod("GetPreferredHeight", new Type[] { typeof(string), settings });
-                Remember(_uguiSettings.GetParameters()[0].ParameterType);
+                _vector2 = _uguiSettings.GetParameters()[0].ParameterType;
             }
-            PropertyInfo text = _ugui.GetProperty("text");
-            MethodInfo setter = text != null ? text.GetSetMethod() : null;
-            if (setter != null && _uguiText != null && _uguiRect != null && _uguiBestFit != null
-                && _genPrefW != null && _genPrefH != null)
+            MethodInfo setter = _uguiTextProp != null ? _uguiTextProp.GetSetMethod() : null;
+            if (setter != null && (_uguiText != null || _uguiTextProp.GetGetMethod() != null) && _uguiRect != null
+                && _uguiBestFit != null && _genPrefW != null && _genPrefH != null)
             {
                 harmony.Patch(setter, new HarmonyMethod(Own("TextPrefix")), new HarmonyMethod(Own("TextPostfix")));
-                Logger.LogInfo("UGUI hooks installed");
+                _log.LogInfo("UGUI hooks installed");
             }
         }
         catch (Exception ex)
         {
-            Logger.LogWarning("UGUI hooks failed: " + ex.Message);
+            _log.LogWarning("UGUI hooks failed: " + ex.Message);
         }
     }
 
@@ -383,12 +451,43 @@ public class RussificatorUnity : BaseUnityPlugin
         return null;
     }
 
-    static void Remember(Type vector2)
+    // ---------- объекты Unity: ключ, текст, «жив ли» ----------
+
+    // В IL2CPP каждый вызов может прийти с новой обёрткой одного и того же объекта —
+    // состояние элемента храним по указателю на объект игры.
+    static object KeyOf(object inst)
     {
-        if (_vector2 != null || vector2 == null) return;
-        _vector2 = vector2;
-        _v2x = vector2.GetField("x");
-        _v2y = vector2.GetField("y");
+#if IL2CPP
+        Il2CppObjectBase o = inst as Il2CppObjectBase;
+        if (o != null) return o.Pointer;
+#endif
+        return inst;
+    }
+
+    static bool Alive(object inst)
+    {
+        try
+        {
+            if (inst == null) return false;
+#if IL2CPP
+            Il2CppObjectBase o = inst as Il2CppObjectBase;
+            if (o != null && o.WasCollected) return false;
+#endif
+            return !inst.Equals(null);        // уничтоженные объекты Unity равны null
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // Текст элемента: поле (Mono — мимо перехватов XUnity) или свойство (IL2CPP — полей у обёрток нет).
+    static string ReadText(object inst, bool tmp)
+    {
+        FieldInfo f = tmp ? _tmpText : _uguiText;
+        if (f != null) return f.GetValue(inst) as string;
+        PropertyInfo p = tmp ? _tmpTextProp : _uguiTextProp;
+        return p != null ? p.GetValue(inst, null) as string : null;
     }
 
     // ---------- 2. SetText(string) -> text ----------
@@ -411,7 +510,7 @@ public class RussificatorUnity : BaseUnityPlugin
         for (int i = 0; i < s.Length; i++)
         {
             char c = s[i];
-            if (c >= '\u0400' && c <= '\u04FF') return true;
+            if (c >= 'Ѐ' && c <= 'ӿ') return true;
         }
         return false;
     }
@@ -419,22 +518,14 @@ public class RussificatorUnity : BaseUnityPlugin
     static State StateOf(object inst)
     {
         State st;
-        if (!_states.TryGetValue(inst, out st))
+        object key = KeyOf(inst);
+        if (!_states.TryGetValue(key, out st))
         {
-            if (_states.Count > 4000) Prune();
+            if (_states.Count > 4000) _states.Clear();
             st = new State();
-            _states[inst] = st;
+            _states[key] = st;
         }
         return st;
-    }
-
-    static void Prune()
-    {
-        List<object> dead = new List<object>();
-        foreach (object k in _states.Keys)
-            if (k == null || k.Equals(null)) dead.Add(k);    // уничтоженные объекты Unity равны null
-        foreach (object k in dead) _states.Remove(k);
-        if (_states.Count > 4000) _states.Clear();
     }
 
     static void TextPrefix(object __instance, string value)
@@ -450,42 +541,44 @@ public class RussificatorUnity : BaseUnityPlugin
     {
         try
         {
-            FieldInfo f = _tmp != null && _tmp.IsInstanceOfType(__instance) ? _tmpText : _uguiText;
-            if (f == null) return;
-            string s = f.GetValue(__instance) as string;
+            bool tmp = _tmp != null && _tmp.IsInstanceOfType(__instance);
+            string s = ReadText(__instance, tmp);
             if (!HasCyrillic(s)) return;
             State st = StateOf(__instance);
             if (st.Fitted || s.Length <= st.CheckedLength) return;
-            if (!_queued.ContainsKey(__instance))
+            object key = KeyOf(__instance);
+            if (!_queued.ContainsKey(key))
             {
-                _queued[__instance] = true;
+                _queued[key] = true;
                 _queue.Add(__instance);
             }
         }
         catch { }
     }
 
-    void Update()
+    // Раз в кадр: проверяем в следующем кадре — к этому времени Unity уже расставит размеры рамок.
+    public static void Tick()
     {
         if (_queue.Count == 0) return;
-        // проверяем в следующем кадре: к этому времени Unity уже расставит размеры рамок
         int n = Math.Min(_queue.Count, 40);
         object[] batch = _queue.GetRange(0, n).ToArray();
         _queue.RemoveRange(0, n);
         foreach (object inst in batch)
         {
-            _queued.Remove(inst);
-            try { Check(inst); }
-            catch (Exception ex) { Logger.LogDebug("fit check failed: " + ex.Message); }
+            try
+            {
+                _queued.Remove(KeyOf(inst));
+                Check(inst);
+            }
+            catch (Exception ex) { _log.LogDebug("fit check failed: " + ex.Message); }
         }
     }
 
-    void Check(object inst)
+    static void Check(object inst)
     {
-        if (inst == null || inst.Equals(null)) return;
+        if (!Alive(inst)) return;
         bool tmp = _tmp != null && _tmp.IsInstanceOfType(inst);
-        FieldInfo f = tmp ? _tmpText : _uguiText;
-        string s = f.GetValue(inst) as string;
+        string s = ReadText(inst, tmp);
         if (!HasCyrillic(s)) return;
         State st = StateOf(inst);
         if (st.Fitted || s.Length <= st.CheckedLength) return;
@@ -503,9 +596,10 @@ public class RussificatorUnity : BaseUnityPlugin
         float h = (float)_rectH.GetValue(rect, null);
         if (w < 1f || h < 1f)
         {
-            if (++st.Retries < 30 && !_queued.ContainsKey(inst))
+            object key = KeyOf(inst);
+            if (++st.Retries < 30 && !_queued.ContainsKey(key))
             {
-                _queued[inst] = true;
+                _queued[key] = true;
                 _queue.Add(inst);      // рамка ещё не рассчитана — проверим позже
             }
             return;
@@ -528,7 +622,7 @@ public class RussificatorUnity : BaseUnityPlugin
             FitUgui(inst);
         }
         st.Fitted = true;
-        if (_fitLogged++ < 100) Logger.LogInfo("Autosize: " + NameOf(inst) + " — " + Shorten(s));
+        if (_fitLogged++ < 100) _log.LogInfo("Autosize: " + NameOf(inst) + " — " + Shorten(s));
     }
 
     static int _fitLogged;
@@ -588,6 +682,7 @@ public class RussificatorUnity : BaseUnityPlugin
     }
 
     // Перенос строки посреди слова: слово длиннее строки TextMeshPro режет по буквам.
+    // (В IL2CPP массивы textInfo — не System.Array: там эта проверка просто пропускается.)
     static bool TmpBrokenWord(object inst)
     {
         if (_tmpTextInfo == null || _tiLineCount == null || _liFirst == null || _liLast == null || _ciChar == null)
@@ -654,3 +749,23 @@ public class RussificatorUnity : BaseUnityPlugin
         _uguiBestFit.SetValue(inst, true, null);
     }
 }
+
+#if IL2CPP
+// Компонент в игре: у плагина BepInEx 6 нет своих Update/OnGUI — их даёт этот объект.
+public class RussificatorBehaviour : MonoBehaviour
+{
+    public RussificatorBehaviour(IntPtr ptr) : base(ptr) { }
+
+    public void Update()
+    {
+        RussificatorUnity.Tick();
+    }
+
+    public void OnGUI()
+    {
+        if (!RussificatorUnity.CreditActive) return;
+        try { RussificatorUnity.DrawCredit(); }
+        catch (Exception ex) { RussificatorUnity.StopCredit(ex); }
+    }
+}
+#endif

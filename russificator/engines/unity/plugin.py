@@ -114,7 +114,9 @@ class UnityPlugin(EnginePlugin):
         if pages:
             self.status("Перевод страниц встроенного браузера…", None)
             project.meta["unity_pages"] = inject_pages(game, backup, pages)
-        self._shortcut = self._make_shortcut(game, backup)
+        # плагин сам запускает доводку при любом запуске игры; без плагина — ярлык «Играть на русском»
+        self._plugin = xunity.plugin_installed(game)
+        self._shortcut = None if self._plugin else self._make_shortcut(game, backup)
 
     @staticmethod
     def _code_usage(game):
@@ -147,7 +149,7 @@ class UnityPlugin(EnginePlugin):
         return _export_plan(self, game_dir, project, credit)
 
     def post_inject_instructions(self) -> List[str]:
-        if not getattr(self, "_il2cpp", False):
+        if getattr(self, "_plugin", False) or not getattr(self, "_il2cpp", False):
             first = ("Запускайте игру как обычно (Steam, ярлык, exe): живой перевод текста, который игра "
                      "собирает на лету, включится сам. Не перемещайте и не удаляйте папку русификатора — "
                      "игра запускает его оттуда. Переведённое запоминается.")
