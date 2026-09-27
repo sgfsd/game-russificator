@@ -25,6 +25,7 @@
     <nav class="nav">
       <button class="nav-item active" data-page="main"><span class="i" data-icon="globe"></span>Русификация</button>
       <button class="nav-item" data-page="games"><span class="i" data-icon="gamepad"></span>Мои игры</button>
+      <button class="nav-item" data-page="live"><span class="i" data-icon="live"></span>Живой перевод<span class="nav-dot hidden" id="navLiveDot"></span></button>
       <button class="nav-item" data-page="models"><span class="i" data-icon="layers"></span>Модели</button>
       <button class="nav-item" data-page="settings"><span class="i" data-icon="gear"></span>Настройки</button>
     </nav>
@@ -263,6 +264,112 @@
         <span class="i big" data-icon="gamepad"></span>
         <b id="gamesEmptyTitle">Игры не найдены</b>
         <p class="muted" id="gamesEmptyText">Добавьте папку игры вручную или укажите папки для поиска в настройках.</p>
+      </div>
+    </section>
+
+    <!-- ============ живой перевод ============ -->
+    <section class="page" id="page-live">
+      <header class="page-head">
+        <h1>Живой перевод</h1>
+        <p>Перевод поверх любой игры: программа распознаёт текст на экране и показывает перевод прямо поверх
+          оригинала. Файлы игры не меняются — подходит для Game Pass, лицензий, Unreal, Godot и любых других игр.</p>
+      </header>
+
+      <div class="card live-hero" id="liveHero">
+        <button class="power" id="livePower" title="Включить или выключить"><span class="i" data-icon="power"></span></button>
+        <div class="grow">
+          <h2 id="liveTitle">Выключен</h2>
+          <p class="muted" id="liveSub">Включите один раз — дальше перевод сам появляется в играх, пока работает значок в трее.</p>
+        </div>
+        <span class="live-count hidden" id="liveCount"></span>
+      </div>
+
+      <div class="card live-now hidden" id="liveNow">
+        <div class="live-now-head">
+          <span class="live-dot on"></span>
+          <div class="grow"><b id="liveGame"></b><div class="muted small" id="liveReason"></div></div>
+        </div>
+        <div class="row gap wrap">
+          <button class="btn sm" data-live="toggle"><span class="i" data-icon="eye-off"></span><span id="livePauseTxt">Скрыть перевод</span></button>
+          <button class="btn sm" data-live="now"><span class="i" data-icon="zap"></span>Перевести сейчас</button>
+          <button class="btn ghost sm hidden" id="liveRegionClear" data-live="region_clear"><span class="i" data-icon="x"></span>Сбросить область</button>
+          <button class="btn ghost sm" data-live="mark?list=never"><span class="i" data-icon="stop"></span>Не переводить эту игру</button>
+        </div>
+      </div>
+
+      <div class="card state-card warn hidden" id="liveOcr">
+        <span class="i big" data-icon="alert"></span>
+        <div class="grow"><b id="liveOcrTitle">Нужно распознавание английского текста</b>
+          <div class="muted small" id="liveOcrText">Это бесплатный компонент Windows. Установка займёт минуту
+            (нужны права администратора), потом нажмите «Проверить снова».</div></div>
+        <div class="col gap-s">
+          <button class="btn primary sm" id="liveOcrInstall"><span class="i" data-icon="download"></span>Установить</button>
+          <button class="btn ghost sm" id="liveOcrRetry"><span class="i" data-icon="refresh"></span>Проверить снова</button>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div class="card">
+          <h2>Способ перевода</h2>
+          <div class="seg" id="liveMode">
+            <button data-mode="auto">Как в «Русификации»</button>
+            <button data-mode="machine">Машинный</button>
+            <button data-mode="cloud">Облачная нейросеть</button>
+            <button data-mode="local">Нейросеть на ПК</button>
+          </div>
+          <p class="hint" id="liveModeHint"></p>
+        </div>
+        <div class="card">
+          <h2>Вид перевода</h2>
+          <label class="range"><span>Размер текста <b id="liveScaleVal"></b></span>
+            <input type="range" id="liveScale" min="70" max="160" step="5"></label>
+          <label class="range"><span>Непрозрачность плашки <b id="liveOpacityVal"></b></span>
+            <input type="range" id="liveOpacity" min="50" max="100" step="2"></label>
+          <div class="live-preview"><div class="live-plate" id="livePlate">Добро пожаловать, путник! Деревня давно ждёт тебя.</div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="setting">
+          <div class="grow"><b>Запускать вместе с Windows</b>
+            <div class="muted small">Живой перевод будет ждать игры в трее (значок у часов) сразу после входа в Windows.</div></div>
+          <label class="switch"><input type="checkbox" id="liveAutostart"><span></span></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Горячие клавиши</h2>
+        <div class="keys">
+          <div><kbd>Alt</kbd>+<kbd>T</kbd><span>показать или скрыть перевод</span></div>
+          <div><kbd>Alt</kbd>+<kbd>Y</kbd><span>перевести сейчас, не дожидаясь, пока текст допечатается</span></div>
+          <div><kbd>Alt</kbd>+<kbd>R</kbd><span>обвести мышью область с текстом (например, только окно диалогов) — запомнится для этой игры</span></div>
+          <div><kbd>Alt</kbd>+<kbd>G</kbd><span>переводить текущее окно, если игра не распозналась сама</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Какие окна переводятся</h2>
+        <p class="muted small">Сами: игры из «Моих игр», игры, которые Windows знает по игровой панели Xbox, и любые
+          окна на весь экран. Браузеры, мессенджеры, плееры и банковские программы — никогда: их экран даже не
+          распознаётся.</p>
+        <div class="lists">
+          <div><b>Всегда переводить</b><div class="folder-list" id="liveAlways"></div></div>
+          <div><b>Никогда не переводить</b><div class="folder-list" id="liveNever"></div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Последние переводы</h2>
+        <div class="feed" id="liveFeed"><span class="muted small">Здесь появятся переведённые фразы.</span></div>
+      </div>
+
+      <div class="card tips">
+        <h2>Чтобы всё работало</h2>
+        <ul>
+          <li>Игра — в оконном режиме или «Окно без рамки» (Borderless): поверх эксклюзивного полноэкранного режима Windows ничего не рисует.</li>
+          <li>Для игр на Unity, Ren'Py и RPG Maker лучше «Русификация» файлами: перевод встанет прямо в игру, с её шрифтами и без задержки.</li>
+          <li>Машинный перевод — самый быстрый и не нагружает видеокарту. Нейросеть переводит лучше, но с задержкой в 1–3 секунды.</li>
+        </ul>
       </div>
     </section>
 

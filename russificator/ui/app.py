@@ -355,6 +355,100 @@ class Api:
             })
         return self._run_task("run", work)
 
+    # ---------- живой перевод (оверлей поверх любой игры) ----------
+
+    def _live_call(self, path: str, timeout: float = 0.6) -> Optional[Dict[str, Any]]:
+        import urllib.request
+        from ..overlay import STATUS_PORT
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{STATUS_PORT}{path}", method="POST"
+                                         if path != "/status" else "GET")
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # локально — мимо прокси
+            with opener.open(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def overlay_status(self) -> Dict[str, Any]:
+        from ..overlay import win32
+        st = self._live_call("/status") or {"running": False}
+        cfg = settings.load()
+        st["settings"] = {k: cfg.get(k) for k in ("live_enabled", "live_autostart", "live_mode", "live_font_scale",
+                                                  "live_opacity", "live_always", "live_never")}
+        st["autostart"] = win32.autostart_command() is not None
+        st["windows"] = sys.platform == "win32"
+        return st
+
+    def overlay_start(self) -> Dict[str, Any]:
+        """Включить живой перевод: запустить процесс оверлея (он живёт в трее)."""
+        from ..core import launcher
+        self._cfg["live_enabled"] = True
+        settings.save(self._cfg)
+        if self._live_call("/status"):
+            return {"ok": True}
+        if sys.platform != "win32":
+            return {"ok": False, "error": "Живой перевод работает только в Windows."}
+        exe, args, workdir = launcher._program()
+        try:
+            subprocess.Popen([exe, *args, "--overlay"], cwd=workdir,
+                             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0) | 0x08000000)
+        except OSError as exc:
+            return {"ok": False, "error": f"Не удалось запустить живой перевод: {exc}"}
+        return {"ok": True}
+
+    def overlay_stop(self) -> Dict[str, Any]:
+        self._cfg["live_enabled"] = False
+        settings.save(self._cfg)
+        self._live_call("/quit")
+        return {"ok": True}
+
+    def overlay_cmd(self, cmd: str) -> Dict[str, Any]:
+        """Команда запущенному оверлею: toggle | now | region_clear | mark?list=… | pause?on=…"""
+        if cmd.split("?")[0] not in ("toggle", "now", "region_clear", "mark", "pause"):
+            return {"ok": False}
+        return self._live_call("/" + cmd) or {"ok": False, "error": "Живой перевод не запущен."}
+
+    def overlay_settings(self, partial: Dict[str, Any]) -> Dict[str, Any]:
+        keys = ("live_mode", "live_font_scale", "live_opacity", "live_always", "live_never")
+        partial = {k: v for k, v in (partial or {}).items() if k in keys}
+        cur = settings.load()
+        cur.update(partial)
+        settings.save(cur)
+        self._cfg.update(partial)
+        self._live_call("/reload")
+        return {"ok": True}
+
+    def overlay_autostart(self, on: bool) -> Dict[str, Any]:
+        from ..core import launcher
+        from ..overlay import win32
+        exe, args, _ = launcher._program()
+        cmd = subprocess.list2cmdline([exe, *args, "--overlay", "--quiet"]) if on else None
+        ok = win32.set_autostart(cmd)
+        self._cfg["live_autostart"] = bool(on) and ok
+        settings.save(self._cfg)
+        return {"ok": ok, "error": "" if ok else "Не удалось изменить автозапуск Windows."}
+
+    def overlay_install_ocr(self) -> Dict[str, Any]:
+        """Поставить распознавание английского (компонент Windows, нужны права администратора)."""
+        if sys.platform != "win32":
+            return {"ok": False, "error": "Только для Windows."}
+        import ctypes
+        from ..overlay.ocr import install_language_command
+        params = f'-NoProfile -ExecutionPolicy Bypass -Command "{install_language_command()}"'
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", params, None, 1)
+        if rc <= 32:
+            return {"ok": False, "error": "Установка отменена."}
+        return {"ok": True}
+
+    def overlay_restart(self) -> Dict[str, Any]:
+        """Перезапустить оверлей (например, после установки распознавания)."""
+        self._live_call("/quit")
+        for _ in range(20):
+            if not self._live_call("/status", timeout=0.2):
+                break
+            time.sleep(0.15)
+        return self.overlay_start()
+
     # ---------- мои игры ----------
 
     def library(self, refresh: bool = False) -> Dict[str, Any]:
@@ -682,7 +776,9 @@ def _selftest() -> int:
     ok = True
     for mod in ("webview", "ctranslate2", "sentencepiece", "UnityPy", "numpy", "PIL",
                 "UnityPy.helpers.TypeTreeGenerator", "russificator.engines.unity.plugin",
-                "russificator.engines.renpy.plugin", "russificator.engines.rpgmaker.plugin"):
+                "russificator.engines.renpy.plugin", "russificator.engines.rpgmaker.plugin",
+                "russificator.core.package", "russificator.library", "russificator.overlay.service",
+                "russificator.overlay.ocr", "clr"):
         try:
             __import__(mod)
             lines.append(f"ok   {mod}")
@@ -695,7 +791,11 @@ def _selftest() -> int:
     for name, good in (("web/index.html", (WEB / "index.html").is_file()), ("font", ensure_font() is not None),
                        ("glossary", len(ui_phrases()) > 100),
                        ("unity plugin", (resources / "unity" / "Russificator.Unity.dll").is_file()),
-                       ("rpgmaker plugin", (resources / "rpgmaker" / "Russificator.js").is_file())):
+                       ("unity plugin il2cpp", (resources / "unity" / "Russificator.Unity.IL2CPP.dll").is_file()),
+                       ("rpgmaker plugin", (resources / "rpgmaker" / "Russificator.js").is_file()),
+                       ("ocr script", (resources / "overlay" / "ocr.ps1").is_file()),
+                       ("installer", (resources / "installer" / "RussificatorSetup.exe").is_file()
+                        or not paths.is_frozen())):
         ok &= good
         lines.append(("ok   " if good else "FAIL ") + name)
     lines.append("RESULT " + ("OK" if ok else "FAIL"))
@@ -716,6 +816,9 @@ def run(argv=None) -> int:
     argv = list(argv or [])
     if "--selftest" in argv:
         return _selftest()
+    if "--overlay" in argv:
+        from ..overlay.service import run as run_overlay
+        return run_overlay(argv)
     for flag in ("--play", "--serve"):
         if flag in argv:
             i = argv.index(flag)
@@ -741,6 +844,8 @@ def run(argv=None) -> int:
         api.stop_live()
 
     window.events.closing += on_closing
+    if api._cfg.get("live_enabled"):            # живой перевод был включён — поднимаем его вместе с программой
+        threading.Thread(target=api.overlay_start, daemon=True).start()
     webview.start(debug=bool(os.environ.get("RUSSIFICATOR_DEBUG")), http_server=True,
                   storage_path=str(paths.sub("webview")), private_mode=False)
     return 0

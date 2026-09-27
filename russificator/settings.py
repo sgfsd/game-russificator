@@ -35,6 +35,15 @@ DEFAULTS: Dict[str, Any] = {
     "library_folders": [],           # «Мои игры»: свои папки для поиска (например, D:\\Games)
     "library_manual": [],            # «Мои игры»: игры, добавленные вручную
     "library_hidden": [],            # «Мои игры»: скрытые из списка
+    "live_enabled": False,           # живой перевод (оверлей) включён — запускать вместе с программой
+    "live_autostart": False,         # запускать живой перевод вместе с Windows
+    "live_mode": "auto",             # способ перевода в оверлее: auto | machine | cloud | local
+    "live_font_scale": 1.0,
+    "live_opacity": 0.86,
+    "live_interval": 0.6,
+    "live_always": [],               # exe, которые переводить всегда
+    "live_never": [],                # exe, которые не переводить никогда
+    "live_profiles": {},             # exe -> {"region": [x, y, w, h] доли окна}
 }
 
 

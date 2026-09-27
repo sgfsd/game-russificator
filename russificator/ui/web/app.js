@@ -40,6 +40,7 @@ const ICONS = {
   search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   live: '<circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2"/>',
+  power: '<path d="M12 3v9"/><path d="M6.3 7.3a8 8 0 1 0 11.4 0"/>',
   "eye-off": '<path d="M3 3l18 18"/><path d="M10.6 5.1A10 10 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-3.2 4.1M6.6 6.6A17 17 0 0 0 2 12s3.5 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
 };
 
@@ -67,6 +68,7 @@ const S = {
   running: false, busy: false, hw: null, stage: null, downloads: {},
   lib: { games: [], filter: "all", search: "", loaded: false, scanning: false, scannedAt: 0, current: null },
   imp: null,
+  liveTimer: null, liveSt: null,
 };
 
 /* ---------------- запуск ---------------- */
@@ -95,6 +97,7 @@ async function boot() {
   loadHardware();
   if (st.game_dir) detectGame(st.game_dir, true);
   updateRunState();
+  api().overlay_status().then((x) => { S.liveSt = x; $("#navLiveDot").classList.toggle("hidden", !x.running); });
 }
 
 /* ---------------- навигация ---------------- */
@@ -106,6 +109,7 @@ function showPage(name) {
   if (name === "models") renderModels();
   if (name === "games") loadLibrary(false);
   if (name === "settings") renderLibFolders();
+  if (name === "live") startLivePolling(); else stopLivePolling();
   $(".content").scrollTop = 0;
 }
 
@@ -194,6 +198,48 @@ function bindUi() {
     setImportCheck(r.ok, r.exact, r.message || r.error);
   });
   $("#imGo").addEventListener("click", runImport);
+
+  // живой перевод
+  $("#livePower").addEventListener("click", async () => {
+    const on = S.liveSt && S.liveSt.running;
+    const r = on ? await api().overlay_stop() : await api().overlay_start();
+    if (!r.ok) return toast(r.error, true);
+    $("#liveSub").textContent = on ? "Выключаю…" : "Запускаю…";
+    setTimeout(refreshLive, 900);
+  });
+  $$("[data-live]").forEach((b) => b.addEventListener("click", async () => {
+    const r = await api().overlay_cmd(b.dataset.live);
+    if (!r.ok) toast(r.error || "Живой перевод не запущен", true);
+    else if (b.dataset.live.startsWith("mark")) toast("Игра больше не будет переводиться");
+    refreshLive();
+  }));
+  $$("#liveMode button").forEach((b) => b.addEventListener("click", async () => {
+    await api().overlay_settings({ live_mode: b.dataset.mode });
+    S.liveSt.settings.live_mode = b.dataset.mode;
+    renderLiveSettings();
+  }));
+  const liveRange = (id, key) => $(id).addEventListener("input", (e) => {
+    const v = +e.target.value / 100;
+    S.liveSt.settings[key] = v;
+    renderLiveSettings();
+    clearTimeout(S["t_" + key]);
+    S["t_" + key] = setTimeout(() => api().overlay_settings({ [key]: v }), 250);
+  });
+  liveRange("#liveScale", "live_font_scale");
+  liveRange("#liveOpacity", "live_opacity");
+  $("#liveAutostart").addEventListener("change", async (e) => {
+    const r = await api().overlay_autostart(e.target.checked);
+    if (!r.ok) { toast(r.error, true); e.target.checked = !e.target.checked; }
+  });
+  $("#liveOcrInstall").addEventListener("click", async () => {
+    const r = await api().overlay_install_ocr();
+    toast(r.ok ? "Идёт установка в окне PowerShell — дождитесь «Готово» и нажмите «Проверить снова»" : r.error, !r.ok);
+  });
+  $("#liveOcrRetry").addEventListener("click", async () => {
+    $("#liveOcrText").textContent = "Перезапускаю живой перевод…";
+    await api().overlay_restart();
+    setTimeout(refreshLive, 2500);
+  });
 
   // архив-русификатор
   $("#exportBtn").addEventListener("click", () => openExport());
@@ -906,6 +952,100 @@ async function renderLibFolders() {
     <button class="icon-btn sm" data-rmf="${esc(f)}" title="Убрать">${icon("x")}</button></div>`).join("")
     : '<span class="muted small">Не добавлены.</span>';
   $$("[data-rmf]").forEach((b) => b.addEventListener("click", async () => { await api().library_remove_folder(b.dataset.rmf); renderLibFolders(); }));
+}
+
+/* ---------------- живой перевод ---------------- */
+
+function startLivePolling() {
+  refreshLive();
+  clearInterval(S.liveTimer);
+  S.liveTimer = setInterval(refreshLive, 1500);
+}
+
+function stopLivePolling() {
+  clearInterval(S.liveTimer);
+  S.liveTimer = null;
+}
+
+async function refreshLive() {
+  const st = await api().overlay_status();
+  S.liveSt = st;
+  $("#navLiveDot").classList.toggle("hidden", !st.running);
+  if (!$("#page-live").classList.contains("active")) return;
+  const on = !!st.running;
+  $("#liveHero").classList.toggle("on", on);
+  let title = "Выключен", sub = "Включите один раз — дальше перевод сам появляется в играх, пока работает значок в трее.";
+  if (!st.windows) { title = "Только для Windows"; sub = "Живой перевод использует распознавание текста Windows."; }
+  else if (on && st.paused) { title = "Перевод скрыт"; sub = "Нажмите Alt+T в игре или «Показать перевод»."; }
+  else if (on && st.ocr && st.ocr.starting) { title = "Запускается…"; sub = "Готовлю распознавание текста."; }
+  else if (on && st.ocr && !st.ocr.ok && st.ocr.code) { title = "Не хватает распознавания текста"; sub = "Без него перевод не появится — см. ниже."; }
+  else if (on && st.game) { title = "Переводит"; sub = "Перевод появляется поверх игры, как только текст перестаёт печататься."; }
+  else if (on) { title = "Включён — ждёт игру"; sub = "Запустите игру: как только она на экране, перевод появится поверх неё."; }
+  $("#liveTitle").textContent = title;
+  $("#liveSub").textContent = sub;
+  $("#liveCount").classList.toggle("hidden", !(on && st.count));
+  $("#liveCount").textContent = `переведено фраз: ${st.count || 0}`;
+
+  const g = on ? st.game : null;
+  $("#liveNow").classList.toggle("hidden", !g);
+  if (g) {
+    $("#liveGame").textContent = "Сейчас: " + g.title;
+    $("#liveReason").textContent = g.reason + (g.region ? " · выбрана область текста" : "");
+    $("#livePauseTxt").textContent = st.paused ? "Показать перевод" : "Скрыть перевод";
+    $("#liveRegionClear").classList.toggle("hidden", !g.region);
+  }
+  const ocr = st.ocr || {};
+  const needOcr = on && !ocr.ok && !ocr.starting && ocr.code;
+  $("#liveOcr").classList.toggle("hidden", !needOcr);
+  if (needOcr) {
+    const noLang = ocr.code === "no_language";
+    $("#liveOcrTitle").textContent = noLang ? "Нужно распознавание английского текста" : "Распознавание текста не запустилось";
+    $("#liveOcrText").textContent = noLang
+      ? "Это бесплатный компонент Windows. Установка займёт минуту (нужны права администратора), потом нажмите «Проверить снова»."
+      : (ocr.error || "Подробности — в журнале live.log в папке данных программы.");
+    $("#liveOcrInstall").classList.toggle("hidden", !noLang);
+  }
+  if (on && st.translator && st.translator.error) {
+    $("#liveSub").textContent = "Переводчик: " + st.translator.error;
+  }
+  renderLiveSettings();
+  const feed = (st.recent || []);
+  $("#liveFeed").innerHTML = feed.length ? feed.map((r) => `<div class="feed-item"><div class="src">${esc(r.src)}</div>${esc(r.tr)}</div>`).join("")
+    : '<span class="muted small">Здесь появятся переведённые фразы.</span>';
+}
+
+function renderLiveSettings() {
+  const st = S.liveSt;
+  if (!st || !st.settings) return;
+  const cfg = st.settings;
+  const mode = cfg.live_mode || "auto";
+  $$("#liveMode button").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
+  $("#liveModeHint").textContent = {
+    auto: "Тот же способ, что выбран на вкладке «Русификация». Если он недоступен — машинный.",
+    machine: "Самый быстрый, офлайн и не занимает видеокарту — лучший выбор для живого перевода.",
+    cloud: "Переводит лучше, но каждая новая фраза появляется через 1–3 секунды. Нужен ключ на вкладке «Русификация».",
+    local: "Качественно и офлайн, но нейросеть делит видеокарту с игрой — на картах до 8 ГБ возможны подтормаживания.",
+  }[mode] || "";
+  const scale = cfg.live_font_scale || 1, op = cfg.live_opacity || 0.86;
+  $("#liveScale").value = Math.round(scale * 100);
+  $("#liveOpacity").value = Math.round(op * 100);
+  $("#liveScaleVal").textContent = Math.round(scale * 100) + "%";
+  $("#liveOpacityVal").textContent = Math.round(op * 100) + "%";
+  $("#livePlate").style.fontSize = (15 * scale).toFixed(1) + "px";
+  $("#livePlate").style.background = `rgba(14,16,24,${op})`;
+  $("#liveAutostart").checked = !!st.autostart;
+  const list = (items, key) => items.length ? items.map((p) => `<div class="folder-item"><span class="mono small">${esc(p)}</span>
+    <button class="icon-btn sm" data-rm-live="${key}" data-path="${esc(p)}" title="Убрать">${icon("x")}</button></div>`).join("")
+    : '<span class="muted small">Пусто.</span>';
+  $("#liveAlways").innerHTML = list(cfg.live_always || [], "live_always");
+  $("#liveNever").innerHTML = list(cfg.live_never || [], "live_never");
+  $$("[data-rm-live]").forEach((b) => b.addEventListener("click", async () => {
+    const key = b.dataset.rmLive;
+    const next = (cfg[key] || []).filter((p) => p !== b.dataset.path);
+    await api().overlay_settings({ [key]: next });
+    cfg[key] = next;
+    renderLiveSettings();
+  }));
 }
 
 /* ---------------- установка архива ---------------- */

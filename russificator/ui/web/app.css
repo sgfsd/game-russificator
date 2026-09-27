@@ -448,3 +448,47 @@ input.num { width: 90px; text-align: center; }
 .state-box b { display: block; margin-bottom: 2px; }
 .icon-btn.sm { width: 30px; height: 28px; border-radius: 8px; }
 .icon-btn.sm .i { width: 14px; height: 14px; }
+
+/* ---------- живой перевод ---------- */
+.nav-dot { width: 8px; height: 8px; border-radius: 50%; background: #5eead4; margin-left: auto; box-shadow: 0 0 0 3px rgba(94, 234, 212, .18); }
+.live-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--faint); flex: none; }
+.live-dot.on { background: #5eead4; box-shadow: 0 0 0 4px rgba(94, 234, 212, .18); animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(94, 234, 212, .05); } }
+.live-hero { display: flex; align-items: center; gap: 20px; padding: 22px 24px; }
+.live-hero.on { border-color: rgba(94, 234, 212, .4); background: linear-gradient(135deg, rgba(94, 234, 212, .10), rgba(139, 123, 255, .08)), var(--panel); }
+.power { width: 64px; height: 64px; border-radius: 50%; flex: none; border: 2px solid var(--border-2); background: var(--bg-2); color: var(--muted); cursor: pointer; display: grid; place-items: center; transition: .2s; }
+.power .i { width: 28px; height: 28px; }
+.power:hover { border-color: var(--accent); color: var(--text); }
+.live-hero.on .power { background: linear-gradient(135deg, #5eead4, var(--accent)); border-color: transparent; color: #0d0f14; box-shadow: 0 8px 26px rgba(94, 234, 212, .3); }
+.live-hero h2 { font-size: 20px; margin-bottom: 4px; }
+.live-count { font-size: 13px; color: #5eead4; background: rgba(94, 234, 212, .1); padding: 6px 12px; border-radius: 99px; white-space: nowrap; }
+.live-now { display: flex; flex-direction: column; gap: 14px; border-color: rgba(94, 234, 212, .3); }
+.live-now-head { display: flex; align-items: center; gap: 12px; }
+.row.wrap { flex-wrap: wrap; }
+.state-card { display: flex; align-items: center; gap: 16px; }
+.state-card.warn { border-color: rgba(255, 181, 71, .4); }
+.state-card.warn > .i { color: var(--warn); }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.grid2 > .card { margin-bottom: 16px; }
+@media (max-width: 1100px) { .grid2 { grid-template-columns: 1fr; } .grid2 > .card { margin-bottom: 0; } .grid2 { gap: 16px; margin-bottom: 16px; } }
+.card > h2 { margin-bottom: 12px; }
+.seg { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.seg button { padding: 10px 12px; border-radius: var(--radius-sm); border: 1.5px solid var(--border); background: var(--bg-2); cursor: pointer; font-size: 13px; transition: .15s; text-align: left; }
+.seg button:hover { border-color: var(--border-2); }
+.seg button.active { border-color: var(--accent); background: var(--accent-soft); }
+.range { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; font-size: 13px; color: var(--muted); }
+.range span { display: flex; justify-content: space-between; }
+.range b { color: var(--text); font-weight: 600; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+.live-preview { border-radius: var(--radius-sm); padding: 18px; background: linear-gradient(135deg, #2a3350, #4b2a4a 60%, #1d2a3a); min-height: 86px; display: grid; place-items: center; }
+.live-plate { background: rgba(14, 16, 24, .86); border: 1px solid rgba(139, 123, 255, .5); border-radius: 8px; padding: 8px 12px; color: #f5f6fa; font-weight: 600; max-width: 90%; text-shadow: 1px 1px 0 #000; }
+.keys { display: flex; flex-direction: column; gap: 10px; }
+.keys > div { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.keys span { color: var(--muted); margin-left: 10px; }
+kbd { display: inline-block; min-width: 26px; text-align: center; padding: 3px 7px; border-radius: 6px; border: 1px solid var(--border-2); border-bottom-width: 2px; background: var(--panel-2); font: 600 12px "Segoe UI", sans-serif; color: var(--text); }
+.lists { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px; }
+@media (max-width: 1100px) { .lists { grid-template-columns: 1fr; } }
+.feed { display: flex; flex-direction: column; gap: 8px; max-height: 280px; overflow-y: auto; }
+.feed-item { padding: 9px 12px; border-radius: var(--radius-sm); background: var(--bg-2); border: 1px solid var(--border); font-size: 13px; }
+.feed-item .src { color: var(--faint); font-size: 12px; margin-bottom: 2px; }
+.tips ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; display: flex; flex-direction: column; gap: 6px; }
