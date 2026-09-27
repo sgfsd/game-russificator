@@ -30,6 +30,12 @@ jobs:
       - name: Тесты
         run: python -m pytest -q
 
+      # Живой перевод вживую: распознавание текста Windows (оба способа) и окна оверлея.
+      # Только диагностика в журнале — сборку не останавливает.
+      - name: Живой перевод на Windows (диагностика)
+        continue-on-error: true
+        run: python tools/ci_overlay_check.py
+
       - name: Сборка установщика (Установить.exe для архивов «для друзей»)
         shell: pwsh
         run: |

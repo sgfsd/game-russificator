@@ -645,12 +645,88 @@ def selftest() -> int:
     for name, good in (("font", ensure_font() is not None), ("logo", _resource("installer/logo48.png") is not None)):
         ok &= good
         lines.append(("ok   " if good else "FAIL ") + name)
+    for name, fn in (("install rpgmaker mv (reinject)", _selftest_reinject), ("delta patch", _selftest_delta)):
+        try:
+            fn()
+            lines.append(f"ok   {name}")
+        except Exception:  # noqa: BLE001
+            ok = False
+            lines.append(f"FAIL {name}: {traceback.format_exc()}")
     lines.append("RESULT " + ("OK" if ok else "FAIL"))
     out = Path(os.environ.get("RUSSIFICATOR_HOME", tempfile.gettempdir())) / "selftest.txt"
     out.write_text("\n".join(lines), encoding="utf-8")
     if sys.stdout is not None:
         print("\n".join(lines))
     return 0 if ok else 1
+
+
+def _selftest_reinject() -> None:
+    """Установка «повторным внедрением» в маленькую игру RPG Maker MV и удаление — всё внутри сборки."""
+    import json
+    import shutil
+    from ..core.package import DATA_DIR, MANIFEST, TRANSLATIONS, check_game, install_package, open_package, uninstall
+    work = Path(tempfile.mkdtemp(prefix="selftest-"))
+    try:
+        game = work / "MVGame"
+        data = game / "www" / "data"
+        data.mkdir(parents=True)
+        js = game / "www" / "js"
+        (js / "plugins").mkdir(parents=True)
+        (js / "rpg_core.js").write_text("//", encoding="utf-8")
+        (js / "plugins.js").write_text("var $plugins =\n[\n];\n", encoding="utf-8")
+        (game / "www" / "index.html").write_text("<html><body></body></html>", encoding="utf-8")
+        (game / "Game.exe").write_bytes(b"MZ")
+        src = "Hello there, traveler! Welcome to the quiet village."
+        page = {"list": [{"code": 101, "indent": 0, "parameters": ["", 0, 0, 2]},
+                         {"code": 401, "indent": 0, "parameters": [src]},
+                         {"code": 0, "indent": 0, "parameters": []}]}
+        (data / "Map001.json").write_text(json.dumps({"events": [None, {"id": 1, "name": "Door", "pages": [page]}]}),
+                                          encoding="utf-8")
+        (data / "System.json").write_text(json.dumps({"gameTitle": "My Game", "terms": {
+            "basic": ["Level"], "commands": ["Fight"], "params": ["Max HP"], "messages": {}}}), encoding="utf-8")
+        before = {p.relative_to(game).as_posix(): p.read_bytes() for p in game.rglob("*") if p.is_file()}
+        pkg_dir = work / "pkg" / DATA_DIR
+        pkg_dir.mkdir(parents=True)
+        (pkg_dir / MANIFEST).write_text(json.dumps({
+            "format": 1, "method": "reinject", "credit": True, "files": [],
+            "game": {"title": "My Game", "folder": "MVGame", "exe": "Game.exe", "engine": "rpgmaker"},
+            "stats": {"total": 1, "translated": 1}}), encoding="utf-8")
+        ru = "Привет, путник! Добро пожаловать в тихую деревню."
+        (pkg_dir / TRANSLATIONS).write_text(json.dumps([{"k": "", "s": src, "t": ru, "st": "translated"}],
+                                                       ensure_ascii=False), encoding="utf-8")
+        pkg = open_package(pkg_dir.parent)
+        try:
+            chk = check_game(pkg, game)
+            assert chk.ok and chk.exact, chk.message
+            res = install_package(pkg, game)
+            assert res["translated"] >= 1, res
+        finally:
+            pkg.close()
+        assert ru in (data / "Map001.json").read_text(encoding="utf-8"), "перевод не внедрён"
+        assert "Russificator" in (js / "plugins.js").read_text(encoding="utf-8"), "плагин не подключён"
+        uninstall(game)
+        after = {p.relative_to(game).as_posix(): p.read_bytes() for p in game.rglob("*") if p.is_file()}
+        assert after == before, "после удаления игра не вернулась к оригиналу"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _selftest_delta() -> None:
+    import os as _os
+    import shutil
+    from ..core.delta import apply_patch, make_patch
+    work = Path(tempfile.mkdtemp(prefix="selftest-"))
+    try:
+        orig = _os.urandom(3 << 20)
+        new = orig[:1000000] + "Привет".encode("utf-8") * 100 + orig[1000000:]
+        (work / "a").write_bytes(orig)
+        (work / "b").write_bytes(new)
+        info = make_patch(work / "a", work / "b", work / "p")
+        assert info is not None, "патч не получился"
+        apply_patch(work / "a", work / "p", work / "c")
+        assert (work / "c").read_bytes() == new, "патч применился неверно"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def _cli(args, base: Path) -> int:

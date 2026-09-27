@@ -235,12 +235,12 @@ function bindUi() {
   }));
   $$("#liveMode button").forEach((b) => b.addEventListener("click", async () => {
     await api().overlay_settings({ live_mode: b.dataset.mode });
-    S.liveSt.settings.live_mode = b.dataset.mode;
+    if (S.liveSt && S.liveSt.settings) S.liveSt.settings.live_mode = b.dataset.mode;
     renderLiveSettings();
   }));
   const liveRange = (id, key) => $(id).addEventListener("input", (e) => {
     const v = +e.target.value / 100;
-    S.liveSt.settings[key] = v;
+    if (S.liveSt && S.liveSt.settings) S.liveSt.settings[key] = v;
     renderLiveSettings();
     clearTimeout(S["t_" + key]);
     S["t_" + key] = setTimeout(() => api().overlay_settings({ [key]: v }), 250);
@@ -1125,6 +1125,7 @@ function onImportProgress(ev) {
 
 async function onImportDone(ev) {
   S.busy = false;
+  $("#importModal").classList.remove("hidden");
   $("#imProgress").classList.add("hidden");
   updateRunState();
   if (!ev.ok) {
@@ -1188,6 +1189,7 @@ function onExportProgress(ev) {
 function onExportDone(ev) {
   S.busy = false;
   updateRunState();
+  $("#exportModal").classList.remove("hidden");     // окно могли закрыть, пока шла сборка — результат важен
   $("#exportProgress").classList.add("hidden");
   $("#exportGo").disabled = false;
   if (!ev.ok) {
