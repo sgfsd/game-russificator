@@ -96,6 +96,23 @@ def check_windows() -> bool:
     return ok
 
 
+def _find_window(title: str):
+    import ctypes
+    from ctypes import wintypes
+    found = []
+    proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _):
+        buf = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
+        if buf.value == title:
+            found.append(int(hwnd))
+            return False
+        return True
+    ctypes.windll.user32.EnumWindows(proto(cb), 0)
+    return found[0] if found else None
+
+
 def check_live() -> bool:
     """Сквозная проверка службы: полноэкранное окно «игры» с английским текстом → служба сама
     решает, что это игра, снимает кадр, распознаёт, переводит и показывает плашку."""
@@ -104,15 +121,26 @@ def check_live() -> bool:
     from russificator.overlay import ocr, service, win32
     pyw = Path(sys.executable).with_name("pythonw.exe")
     code = ("import tkinter as tk\n"
-            "r = tk.Tk(); r.configure(bg='black'); r.attributes('-fullscreen', True)\n"
+            "r = tk.Tk(); r.title('CI Game'); r.configure(bg='black'); r.attributes('-fullscreen', True)\n"
+            "r.attributes('-topmost', True)\n"
             "tk.Label(r, text='Press any key to continue', fg='white', bg='black', font=('Arial', 30))"
             ".place(relx=0.5, rely=0.8, anchor='center')\n"
             "r.after(300, lambda: (r.lift(), r.focus_force())); r.after(40000, r.destroy); r.mainloop()\n")
     game = subprocess.Popen([str(pyw if pyw.is_file() else sys.executable), "-c", code])
     try:
         time.sleep(4)
+        hwnd = _find_window("CI Game")
         fg = win32.foreground()
-        print(f"[live] окно переднего плана: {fg.exe if fg else None} на весь экран: {fg.fullscreen if fg else None}")
+        if hwnd and (fg is None or fg.hwnd != hwnd):
+            win32.activate(hwnd)
+            time.sleep(0.5)
+            fg = win32.foreground()
+        if hwnd and (fg is None or fg.hwnd != hwnd):
+            # сервер CI может не отдать фокус новому окну — подставляем его как окно переднего плана
+            print("[live] фокус окну не передан — окно переднего плана подставлено")
+            win32.foreground = lambda: win32.window_info(hwnd)
+            fg = win32.foreground()
+        print(f"[live] окно игры: {fg.exe if fg else None}, на весь экран: {fg.fullscreen if fg else None}")
         svc = service.LiveService(quiet=True)
         icon = Path(__file__).resolve().parents[1] / "russificator" / "resources" / "icon.ico"
         svc.gui = win32.Gui(str(icon), svc._on_hotkey, svc._on_menu, svc._on_region, svc._menu_items)
