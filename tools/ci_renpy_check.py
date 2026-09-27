@@ -30,14 +30,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 DRIVER = r'''
 ## Проверка CI: ведёт игру сама и пишет, что видела.
-init 3000 python:
+init 999 python:
     import io as _ci_io
     import os as _ci_os
+    import time as _ci_time
+    import traceback as _ci_tb
 
     def _ci_write(name, text):
         with _ci_io.open(_ci_os.path.join(config.basedir, name), "a", encoding="utf-8") as f:
             f.write(u"%s\n" % (text,))
 
+    _ci_write("ci_state.txt", u"init")
     _ci_prev = config.say_menu_text_filter
 
     def _ci_filter(s):
@@ -48,16 +51,39 @@ init 3000 python:
     config.say_menu_text_filter = _ci_filter
 
     def _ci_press_alt_t():
-        import pygame_sdl2 as pg
-        pg.event.post(pg.event.Event(pg.KEYDOWN, key=pg.K_t, scancode=0, mod=pg.KMOD_LALT, unicode=u"t",
-                                     repeat=False))
-        pg.event.post(pg.event.Event(pg.KEYUP, key=pg.K_t, scancode=0, mod=pg.KMOD_LALT))
+        try:
+            import pygame_sdl2 as pg
+            pg.event.post(pg.event.Event(pg.KEYDOWN, key=pg.K_t, scancode=0, mod=pg.KMOD_LALT, unicode=u"t",
+                                         repeat=False))
+            pg.event.post(pg.event.Event(pg.KEYUP, key=pg.K_t, scancode=0, mod=pg.KMOD_LALT, unicode=u"t",
+                                         repeat=False))
+            _ci_write("ci_state.txt", u"alt_t posted")
+        except Exception:
+            _ci_write("ci_state.txt", u"alt_t error " + _ci_tb.format_exc())
 
     def _ci_state(tag):
-        on = globals().get("_ru_on")
-        credit = renpy.get_screen("russificator_credit") is not None
-        _ci_write("ci_state.txt", u"%s ru_on=%s credit=%s" % (tag, on[0] if on else None, credit))
+        try:
+            on = globals().get("_ru_on")
+            credit = renpy.get_screen("russificator_credit") is not None
+            _ci_write("ci_state.txt", u"%s ru_on=%s credit=%s" % (tag, on[0] if on else None, credit))
+        except Exception:
+            _ci_write("ci_state.txt", u"state error " + _ci_tb.format_exc())
 
+    _ci_t0 = [None, False]
+
+    def _ci_tick():
+        # запасной выход: через 40 с после старта — выходим, что бы ни было
+        if _ci_t0[0] is None:
+            _ci_t0[0] = _ci_time.time()
+        if not _ci_t0[1] and main_menu:
+            _ci_t0[1] = True
+            _ci_write("ci_state.txt", u"main menu seen, credit=%s" %
+                      (renpy.get_screen("russificator_credit") is not None,))
+        if _ci_time.time() - _ci_t0[0] > 40:
+            _ci_write("ci_state.txt", u"fallback quit")
+            renpy.quit()
+
+    config.periodic_callbacks.append(_ci_tick)
     preferences.afm_enable = True
     preferences.afm_time = 1
     preferences.text_cps = 0
@@ -69,6 +95,7 @@ init 3000 python:
 
 screen ci_driver():
     zorder 2000
+    on "show" action Function(_ci_write, "ci_state.txt", u"driver shown")
     if main_menu:
         timer 2.5 action [Function(_ci_state, "menu"), Start()]
     else:
@@ -84,7 +111,10 @@ def fetch_sdk(version: str, dest: Path) -> Path:
     print(f"[{version}] скачиваю {url}", flush=True)
     data = urllib.request.urlopen(url, timeout=300).read()
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:bz2") as tf:
-        tf.extractall(dest)
+        try:
+            tf.extractall(dest, filter="fully_trusted")
+        except TypeError:
+            tf.extractall(dest)
     sdk = next(p for p in dest.iterdir() if p.is_dir() and p.name.startswith("renpy-"))
     return sdk
 
@@ -177,17 +207,18 @@ def check(version: str, work: Path) -> bool:
         ok = False
     if "Ру:" not in said:
         print(f"[{version}] ПРОВАЛ: реплики не переведены")
-        print((r.stdout or "")[-2000:], (r.stderr or "")[-2000:])
-        log = friend / "log.txt"
-        if log.is_file():
-            print(log.read_text(encoding="utf-8", errors="replace")[-3000:])
         ok = False
-    if "menu" in state and "credit=True" not in state.splitlines()[0]:
+    if "main menu seen, credit=True" not in state:
         print(f"[{version}] ПРОВАЛ: надписи о программе нет в главном меню")
         ok = False
     if "after_alt_t ru_on=False" not in state:
         print(f"[{version}] ПРОВАЛ: Alt+T не переключил перевод")
         ok = False
+    if not ok:
+        print((r.stdout or "")[-2000:], (r.stderr or "")[-2000:])
+        log = friend / "log.txt"
+        if log.is_file():
+            print("--- log.txt\n" + log.read_text(encoding="utf-8", errors="replace")[-4000:])
     print(f"[{version}] ИТОГ: {'OK' if ok else 'FAIL'}", flush=True)
     return ok
 

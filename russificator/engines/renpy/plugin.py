@@ -295,7 +295,7 @@ screen russificator_credit():
             xalign 0.99
             yalign 0.995
 
-init 1000 python:
+init 999 python:
     if hasattr(config, "always_shown_screens"):
         if "russificator_credit" not in config.always_shown_screens:
             config.always_shown_screens.append("russificator_credit")
