@@ -212,6 +212,14 @@ russificator games                                                   # уста�
 пройдут самопроверку, и программа появится в Releases архивом `Russificator-win64.zip`.
 Локально: `pyinstaller installer.spec`, затем `pyinstaller russificator.spec` → `dist/Russificator/`.
 
+Та же сборка запускается вручную (Actions → build → Run workflow) с любой ветки — архив
+остаётся в артефактах. Заодно проверяется вживую:
+- живой перевод на настоящей Windows (`tools/ci_overlay_check.py`): распознавание текста
+  обоими способами, окна оверлея, сквозной путь «полноэкранная игра → перевод → плашка»;
+- установщик ставит и удаляет русификатор в тестовую игру (`--selftest`);
+- Ren'Py 8 и 7 (`tools/ci_renpy_check.py`): демо-игра из SDK русифицируется, ставится
+  архивом «для друзей», проходит lint и запускается — надпись, реплики, Alt+T.
+
 Плагины Unity (`resources/unity/*.dll`) собираются из `RussificatorUnity.cs` скриптом
 `python tools/build_unity_plugins.py` (нужен `mcs` из Mono или `csc` из .NET Framework).
 

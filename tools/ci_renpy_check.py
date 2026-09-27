@@ -88,10 +88,14 @@ init 999 python:
     preferences.afm_time = 1
     preferences.text_cps = 0
 
+    def _ci_show_driver():
+        if renpy.get_screen("ci_driver") is None:
+            renpy.show_screen("ci_driver")
+
     if hasattr(config, "always_shown_screens"):
         config.always_shown_screens.append("ci_driver")
     else:
-        config.overlay_screens.append("ci_driver")
+        config.start_interact_callbacks.append(_ci_show_driver)
 
 screen ci_driver():
     zorder 2000

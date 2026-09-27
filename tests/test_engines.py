@@ -598,3 +598,31 @@ module Graphics; def self.width; 544; end; def self.height; 416; end; end
         r = subprocess.run(["ruby", str(script)], capture_output=True, text=True, encoding="utf-8")
         assert r.returncode == 0, r.stderr
         assert r.stdout.strip() == ("drawn" if drawn else "none")
+
+
+def test_renpy_credit_block_is_valid_and_works_on_old_renpy():
+    """Надпись о программе: экран с экранированным текстом и код init, который компилируется;
+    в Ren'Py без always_shown_screens экран показывается через start_interact_callbacks."""
+    from russificator.engines.renpy.plugin import credit_block
+    block = credit_block('Текст "в кавычках" [var] {tag}', "PT.ttf")
+    assert 'text "Текст \\"в кавычках\\" [[var] {{tag}"' in block
+    code = block.split("init 999 python:", 1)[1].replace("\n    ", "\n")
+    compile(code, "credit", "exec")
+    calls = []
+
+    class Cfg:
+        start_interact_callbacks: list = []
+
+    class RenPy:
+        @staticmethod
+        def get_screen(name):
+            return None
+
+        @staticmethod
+        def show_screen(name):
+            calls.append(name)
+    ns = {"config": Cfg, "renpy": RenPy, "main_menu": True}
+    exec(code, ns)
+    assert Cfg.start_interact_callbacks and not calls
+    Cfg.start_interact_callbacks[0]()
+    assert calls == ["russificator_credit"]

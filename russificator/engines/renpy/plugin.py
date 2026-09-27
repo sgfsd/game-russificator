@@ -296,11 +296,19 @@ screen russificator_credit():
             yalign 0.995
 
 init 999 python:
+    def _ru_credit_show():
+        try:
+            if main_menu and renpy.get_screen("russificator_credit") is None:
+                renpy.show_screen("russificator_credit")
+        except Exception:
+            pass
+
     if hasattr(config, "always_shown_screens"):
         if "russificator_credit" not in config.always_shown_screens:
             config.always_shown_screens.append("russificator_credit")
-    elif "russificator_credit" not in config.overlay_screens:
-        config.overlay_screens.append("russificator_credit")
+    else:
+        # Ren'Py до 8.1: экраны overlay в главном меню скрыты — показываем экран сами
+        config.start_interact_callbacks.append(_ru_credit_show)
 '''
 
 
