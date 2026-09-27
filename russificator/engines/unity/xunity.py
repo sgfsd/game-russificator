@@ -351,8 +351,76 @@ def prefix_rules(prefixes: List[str], pairs: Dict[str, str]) -> List[str]:
         if label.endswith(":") and not tr.endswith(":"):
             tr = tr.rstrip(".") + ":"
         value = (tr + tail).replace("$", "$$") + "$1"
-        rules.append(f'sr:"^{_net_regex_escape(p)}([\\S\\s]+)$"={encode(value)}')
+        rules.append(_rule("sr", f"^{_net_regex_escape(p)}([\\S\\s]+)$", value))
     return rules
+
+
+def _rule(kind: str, regex: str, value: str) -> str:
+    """Строка правила XUnity: ключ и значение экранируются целиком (``\\`` -> ``\\\\``, ``=`` -> ``\\=``,
+    ``//`` -> ``\\u002F``), XUnity раскрывает это обратно в точное регулярное выражение."""
+    return f'{encode(f"{kind}:" + chr(34) + regex + chr(34))}={encode(value)}'
+
+
+#: плейсхолдер .NET String.Format: {0}, {1,-8}, {2:N0}
+_FMT_RE = re.compile(r"\{(\d+)(,-?\d+)?(:[^{}]*)?\}")
+_NUMERIC_FMT = re.compile(r":[NnDdFfCcPpEeGgXxRr0#.,%]")
+#: сколько правил-шаблонов писать (каждое правило XUnity проверяет для нового текста)
+MAX_TEMPLATE_RULES = 400
+
+
+def template_rules(pairs: Dict[str, str]) -> List[str]:
+    """Правила XUnity для строк-шаблонов: ``You have {0} coins`` -> ``У вас {0} монет``.
+
+    Игра подставляет в шаблон число или имя (String.Format, склейка строк в коде), и
+    целиком такой строки нет ни в одном файле. Правило-регулярка ловит готовый текст
+    («You have 5 coins») и подставляет вставки в русский шаблон. Числа переносятся как
+    есть (``r:``), текстовые вставки XUnity переводит отдельно (``sr:`` — по словарю
+    или живым переводом).
+    """
+    scored = []
+    for src, tr in pairs.items():
+        if "{" not in src or not tr or len(src) > 300:
+            continue
+        items = list(_FMT_RE.finditer(src))
+        if not items or len(items) > 6:
+            continue
+        literal = _FMT_RE.sub("", src).replace("{{", "{").replace("}}", "}")
+        letters = sum(1 for c in literal if c.isalpha())
+        if letters < 4 or not re.search(r"[A-Za-z]{3}", literal):
+            continue                      # «{0}/{1}», «x{0}» — слишком общее правило
+        idx = [m.group(1) for m in items]
+        if len(set(idx)) != len(idx):
+            continue                      # одна вставка дважды — регулярка неоднозначна
+        if sorted(m.group(0) for m in _FMT_RE.finditer(tr)) != sorted(m.group(0) for m in items):
+            continue                      # перевод потерял или добавил вставку
+        if any(items[k].end() == items[k + 1].start() for k in range(len(items) - 1)):
+            continue                      # «{0}{1}» — не разделить
+        parts, group_of, numeric, pos = [], {}, True, 0
+        for n, m in enumerate(items, 1):
+            parts.append(_net_regex_escape(src[pos:m.start()].replace("{{", "{").replace("}}", "}")))
+            if m.group(3) and _NUMERIC_FMT.match(m.group(3)):
+                parts.append(r"([-+]?[\d\s.,\u00a0]*\d[%]?)")
+            else:
+                parts.append(r"([\S\s]+?)")
+                numeric = False
+            group_of[m.group(1)] = n
+            pos = m.end()
+        parts.append(_net_regex_escape(src[pos:].replace("{{", "{").replace("}}", "}")))
+        value = tr.replace("$", "$$").replace("{{", "{").replace("}}", "}")
+        ok = True
+
+        def sub(m: "re.Match") -> str:
+            nonlocal ok
+            after = value[m.end():m.end() + 1]
+            if after.isdigit():
+                ok = False                # «$1» перед цифрой прочитается как «$10»
+            return "$" + str(group_of.get(m.group(1), 0))
+        value = _FMT_RE.sub(sub, value)
+        if not ok or "$0" in value:
+            continue
+        scored.append((letters, _rule("r" if numeric else "sr", "^" + "".join(parts) + "$", value)))
+    scored.sort(key=lambda x: -x[0])
+    return [r for _, r in scored[:MAX_TEMPLATE_RULES]]
 
 
 def _net_regex_escape(s: str) -> str:

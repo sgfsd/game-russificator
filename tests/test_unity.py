@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from russificator.engines.unity import detect, extract, tmp_cyrillic, xunity
+from russificator.engines.unity import detect, extract, il_scan, tmp_cyrillic, xunity
 
 
 def _fake_exe(path: Path, machine: int = 0x8664) -> None:
@@ -395,8 +395,9 @@ def test_il_scan_survives_non_dotnet(tmp_path):
 
 def test_prefix_rules_split_label_and_text():
     rules = xunity.prefix_rules(["Pro Tip: ", "Level (x): "], {"Pro Tip: ": "Совет", "Level (x): ": "Уровень $ (x):"})
-    assert rules == [r'sr:"^Pro Tip: ([\S\s]+)$"=Совет: $1',
-                     r'sr:"^Level \(x\): ([\S\s]+)$"=Уровень $$ (x): $1']
+    # так правила увидит XUnity после чтения файла (обратные слэши в файле удвоены)
+    assert [_xua_decode_line(r) for r in rules] == [[r'sr:"^Pro Tip: ([\S\s]+)$"', "Совет: $1"],
+                                                    [r'sr:"^Level \(x\): ([\S\s]+)$"', "Уровень $$ (x): $1"]]
 
 
 def test_technical_text_is_not_translated():
@@ -480,3 +481,50 @@ def test_plugin_dlls_reference_expected_runtimes():
     il2cpp = refs("Russificator.Unity.IL2CPP.dll")
     assert il2cpp["System.Runtime"] == 6 and il2cpp["BepInEx.Core"] == 6 and "Il2CppInterop.Runtime" in il2cpp
     assert "UnityEngine.IMGUIModule" in il2cpp and "mscorlib" not in il2cpp
+
+
+def _apply_xua_rule(rule: str, text: str):
+    """Правило из файла XUnity -> (вид, результат для text) — как его прочитает плагин (регулярки .NET
+    в наших правилах совместимы с Python re)."""
+    import re as _re
+    key, value = _xua_decode_line(rule)
+    m = _re.fullmatch(r'(s?r):"(.*)"', key, _re.S)
+    kind, rx = m.group(1), m.group(2).replace("\\u00a0", "\u00a0")
+    hit = _re.match(rx, text)
+    if not hit:
+        return kind, None
+    out = _re.sub(r"\$(\d)", lambda g: hit.group(int(g.group(1))), value).replace("$$", "$")
+    return kind, out
+
+
+def test_template_rules_translate_formatted_text():
+    pairs = {"You have {0} coins": "У вас {0} монет", "Day {0} of {1}": "День {0} из {1}",
+             "Score: {0:N0}": "Счёт: {0:N0}", "{0}/{1}": "{0}/{1}", "Lost {0}{1}": "Потеряно {0}{1}",
+             "Hello {1}, meet {0}!": "{1}, познакомься с {0}!", "Price = {0} (x2)": "Цена = {0} (x2)",
+             "Broken {0}": "Сломано"}                          # перевод потерял вставку — правила нет
+    rules = xunity.template_rules(pairs)
+    got = {}
+    for r in rules:
+        for text in ("You have 5 coins", "Day 3 of 10", "Score: 12,500", "Hello Bob, meet Ann!", "Price = 9 (x2)"):
+            kind, out = _apply_xua_rule(r, text)
+            if out is not None:
+                got[text] = (kind, out)
+    assert got["You have 5 coins"] == ("sr", "У вас 5 монет")
+    assert got["Day 3 of 10"] == ("sr", "День 3 из 10")
+    assert got["Score: 12,500"] == ("r", "Счёт: 12,500")               # числа — без перевода
+    assert got["Hello Bob, meet Ann!"] == ("sr", "Bob, познакомься с Ann!")   # порядок вставок другой
+    assert got["Price = 9 (x2)"] == ("sr", "Цена = 9 (x2)")           # «=» и скобки экранированы
+    assert len(rules) == 5
+
+
+def test_prefix_rules_escape_regex_for_xunity_file():
+    rules = xunity.prefix_rules(["Path C:\\Games: "], {"Path C:\\Games: ": "Путь C:\\Games:"})
+    kind, out = _apply_xua_rule(rules[0], "Path C:\\Games: Save1")
+    assert kind == "sr" and out == "Путь C:\\Games: Save1"
+
+
+def test_concat_templates_from_compiled_code():
+    """Склейки строк в коде (исходник фикстуры: tests/data/il_concat.cs, собрано mcs)."""
+    meta = il_scan._Meta((Path(__file__).parent / "data" / "il_concat.dll").read_bytes())
+    assert il_scan.concat_templates(meta) == [
+        "Day {0} of {1}", "Gold: {0}", "Welcome back, {0}! Ready?", "Level {0} — {1} has {2} coins"]

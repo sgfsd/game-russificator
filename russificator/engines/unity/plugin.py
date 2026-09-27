@@ -105,7 +105,8 @@ class UnityPlugin(EnginePlugin):
         if xunity.plugin_installed(game):
             from ...core import launcher
             xunity.write_plugin_config(game, backup, launcher.serve_command(game.root))
-        rules = xunity.prefix_rules(project.meta.get("unity_prefixes") or [], pairs)
+        rules = xunity.prefix_rules(project.meta.get("unity_prefixes") or [], pairs) + xunity.template_rules(pairs)
+        project.meta["unity_template_rules"] = len(rules)
         n = xunity.write_translations(game, backup, pairs, rules)
         project.meta["unity_static_translations"] = n
         project.meta["unity_backend"] = game.backend

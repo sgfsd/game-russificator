@@ -476,12 +476,20 @@ def dotnet_user_strings(dll: Path) -> List[str]:
 
 def extract_code_strings(game: UnityGame, col: _Collector, warnings: List[str]) -> None:
     strings: Iterable[str] = []
+    templates: List[str] = []
     if game.backend == "mono":
+        from . import il_scan
         collected: List[str] = []
         for dll in game_assemblies(game):
             try:
                 collected += dotnet_user_strings(dll)
             except OSError:
+                continue
+            # склейки «литерал + значение + литерал» из кода: целиком такой фразы нет ни в одном
+            # файле — шаблон «Day {0} of {1}» переведётся заранее и станет правилом XUnity
+            try:
+                templates += il_scan.concat_templates(il_scan._Meta(dll.read_bytes()))
+            except (OSError, ValueError, struct.error, IndexError):
                 continue
         strings = collected
     else:
@@ -496,6 +504,9 @@ def extract_code_strings(game: UnityGame, col: _Collector, warnings: List[str]) 
             col.add(s, TextKind.OTHER, "code")
             if _PREFIX_RE.fullmatch(s) and s not in col.prefixes and len(col.prefixes) < 300:
                 col.prefixes.append(s)
+    for t in templates[:3000]:
+        if looks_translatable(t) and not looks_technical(t):
+            col.add(t, TextKind.UI, "code-template")
 
 
 #: «Pro Tip: », «Stock: », «Level - »: подпись, к которой код игры приклеивает текст или число

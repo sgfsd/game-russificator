@@ -158,23 +158,80 @@ class _Meta:
             return struct.unpack_from("<I" if size == 4 else "<H", d, at)[0]
 
         self.methods: List[Tuple[int, str]] = []   # (rva, имя) по порядку строк MethodDef
+        self.method_sigs: List[int] = []           # индекс сигнатуры в #Blob
         for r in range(rows[0x06]):
             at = starts[0x06] + r * sizes[0x06]
             rva = struct.unpack_from("<I", d, at)[0]
             self.methods.append((rva, self._string(rd(at + 8, S))))
+            self.method_sigs.append(rd(at + 8 + S, B))
         self.type_refs: List[str] = []
         for r in range(rows[0x01]):
             at = starts[0x01] + r * sizes[0x01]
             self.type_refs.append(self._string(rd(at + rs, S)))
         self.member_refs: List[str] = []
+        self.member_sigs: List[int] = []
         self.member_parents: List[Optional[str]] = []   # имя типа-владельца (для ссылок на TypeRef)
         for r in range(rows[0x0A]):
             at = starts[0x0A] + r * sizes[0x0A]
             self.member_refs.append(self._string(rd(at + mrp, S)))
+            self.member_sigs.append(rd(at + mrp + S, B))
             parent = rd(at, mrp)
             tag, row = parent & 7, parent >> 3        # MemberRefParent: 1 — TypeRef
             self.member_parents.append(self.type_refs[row - 1] if tag == 1 and 0 < row <= len(self.type_refs)
                                        else None)
+
+    def _blob(self, idx: int) -> bytes:
+        base, size = self.streams.get("#Blob", (0, 0))
+        p = base + idx
+        b = self.data[p]
+        if b & 0x80 == 0:
+            n, p = b, p + 1
+        elif b & 0xC0 == 0x80:
+            n, p = ((b & 0x3F) << 8) | self.data[p + 1], p + 2
+        else:
+            n, p = ((b & 0x1F) << 24) | (self.data[p + 1] << 16) | (self.data[p + 2] << 8) | self.data[p + 3], p + 4
+        return self.data[p:p + n]
+
+    def stack_effect(self, token: int, newobj: bool = False) -> Optional[Tuple[int, int]]:
+        """(сколько снимает со стека, сколько кладёт) для call/callvirt/newobj по сигнатуре метода."""
+        table, row = token >> 24, token & 0xFFFFFF
+        if table == 0x0A and 0 < row <= len(self.member_sigs):
+            sig = self._blob(self.member_sigs[row - 1])
+        elif table == 0x06 and 0 < row <= len(self.method_sigs):
+            sig = self._blob(self.method_sigs[row - 1])
+        else:
+            return None          # MethodSpec (обобщённые методы) и прочее — не разбираем
+        if len(sig) < 3:
+            return None
+        conv, i = sig[0], 1
+        if conv & 0x10:          # GENERIC: число параметров-типов
+            i += 1
+        count = sig[i]
+        if count & 0x80:
+            return None
+        ret_void = sig[i + 1] == 0x01
+        has_this = bool(conv & 0x20) and not (conv & 0x40)
+        if newobj:
+            return count, 1
+        return count + (1 if has_this else 0), 0 if ret_void else 1
+
+    def user_string(self, token: int) -> Optional[str]:
+        """Строка из кучи #US по токену ldstr."""
+        if token >> 24 != 0x70 or "#US" not in self.streams:
+            return None
+        base, size = self.streams["#US"]
+        off = token & 0xFFFFFF
+        if off >= size:
+            return None
+        p = base + off
+        b = self.data[p]
+        if b & 0x80 == 0:
+            n, p = b, p + 1
+        elif b & 0xC0 == 0x80:
+            n, p = ((b & 0x3F) << 8) | self.data[p + 1], p + 2
+        else:
+            n, p = ((b & 0x1F) << 24) | (self.data[p + 1] << 16) | (self.data[p + 2] << 8) | self.data[p + 3], p + 4
+        return self.data[p:p + max(0, n - 1)].decode("utf-16-le", "replace")
 
     def owner_of(self, token: int) -> Optional[str]:
         """Тип-владелец вызываемого метода из другой сборки (``GUI`` для ``GUI.Label``)."""
@@ -235,6 +292,207 @@ class _Meta:
                 break  # неизвестный опкод — дальше не разбираем
             i += n
         return out
+
+
+# ---------------------------------------------------------------- склейки строк
+
+class _Lit(str):
+    """Строковый литерал на стеке вычислений."""
+
+
+_VAL = object()        # неизвестное значение (переменная, результат вызова)
+
+
+class _Arr:
+    """Массив из newarr: элементы по индексам (для String.Concat(string[]))."""
+
+    def __init__(self, size: Optional[int]):
+        self.size = size
+        self.items: Dict[int, object] = {}
+
+
+# опкоды, которые кладут одно значение, ничего не снимая
+_PUSH1 = set(range(0x02, 0x0A)) | {0x0E, 0x0F, 0x11, 0x12, 0x14, 0x21, 0x22, 0x23, 0x7E, 0x7F, 0xD0}
+# снимают одно и кладут одно (конверсии, box, поля экземпляра, длина массива…)
+_POP1_PUSH1 = {0x7B, 0x7C, 0x8C, 0xA5, 0x74, 0x75, 0x8E, 0x79, 0x71, 0x65, 0x66, 0x76} | set(range(0x67, 0x6F)) | \
+    set(range(0x82, 0x8C)) | set(range(0xB3, 0xBB)) | {0xD1, 0xD2, 0xD3, 0xD4, 0xD5}
+# снимают два, кладут одно: арифметика, ldelema/ldelem*, *.ovf
+_POP2_PUSH1 = set(range(0x58, 0x65)) | {0x8F, 0xA3} | set(range(0x90, 0x9B)) | set(range(0xD6, 0xDC))
+_STELEM = set(range(0x9B, 0xA3)) | {0xA4}                       # stelem.* — снимают три
+_POP1 = set(range(0x0A, 0x0E)) | {0x10, 0x13, 0x26, 0x80}      # stloc*, starg.s, pop, stsfld
+_POP2 = {0x7D, 0x81}                                            # stfld, stobj
+_NOP = {0x00, 0x01}
+_BRANCH = set(range(0x2B, 0x45)) | {0x45, 0xDD, 0xDE, 0x2A, 0x7A, 0xDC}
+# двухбайтовые (0xFE xx): префиксы ничего не меняют, остальное — эффект на стек
+_FE_NOP = {0x12, 0x13, 0x14, 0x16, 0x19, 0x1E}
+_FE_EFFECT = {0x01: (2, 1), 0x02: (2, 1), 0x03: (2, 1), 0x04: (2, 1), 0x05: (2, 1), 0x06: (0, 1), 0x07: (1, 1),
+              0x09: (0, 1), 0x0A: (0, 1), 0x0B: (1, 0), 0x0C: (0, 1), 0x0D: (0, 1), 0x0E: (1, 0), 0x0F: (1, 1),
+              0x15: (1, 0), 0x1C: (0, 1), 0x1D: (1, 1)}
+
+
+def concat_templates(meta: "_Meta", limit: int = 5000) -> List[str]:
+    """Шаблоны склеек «литерал + значение + литерал…» из тел методов: ``"Day " + n + " of " + m``
+    даёт ``"Day {0} of {1}"``. Стек вычисляется упрощённо: на ветвлениях и незнакомых
+    инструкциях сбрасывается — лучше пропустить шаблон, чем придумать неверный."""
+    out: List[str] = []
+    seen = set()
+    for rva, _name in meta.methods:
+        if not rva or len(out) >= limit:
+            continue
+        try:
+            for t in _method_templates(meta, rva):
+                if t not in seen:
+                    seen.add(t)
+                    out.append(t)
+        except (struct.error, IndexError, ValueError):
+            continue
+    return out
+
+
+def _method_templates(meta: "_Meta", rva: int) -> List[str]:
+    d = meta.data
+    p = meta.off(rva)
+    head = d[p]
+    if head & 3 == 2:
+        size, code = head >> 2, p + 1
+    elif head & 3 == 3:
+        flags = struct.unpack_from("<H", d, p)[0]
+        size, code = struct.unpack_from("<I", d, p + 4)[0], p + 4 * (flags >> 12)
+    else:
+        return []
+    found: List[str] = []
+    stack: List[object] = []
+    i, end = code, min(code + size, len(d))
+
+    def pop(n: int) -> Optional[List[object]]:
+        if n > len(stack):
+            return None
+        if n == 0:
+            return []
+        items = stack[-n:]
+        del stack[-n:]
+        return items
+
+    while i < end:
+        op = d[i]
+        i += 1
+        if op == 0xFE:
+            op2 = d[i]
+            i += 1 + (_OP2.get(op2) or 0)
+            if op2 in _FE_NOP:
+                continue
+            eff2 = _FE_EFFECT.get(op2)
+            if eff2 is None or pop(eff2[0]) is None:
+                stack.clear()
+                continue
+            if eff2[1]:
+                stack.append(_VAL)
+            continue
+        if op == 0x45:
+            count = struct.unpack_from("<I", d, i)[0]
+            i += 4 + 4 * count
+            stack.clear()
+            continue
+        n = _OP1.get(op)
+        if n is None:
+            break
+        arg = d[i:i + n]
+        i += n
+        if op == 0x72:                                   # ldstr
+            s = meta.user_string(struct.unpack_from("<I", arg)[0])
+            stack.append(_Lit(s) if s is not None else _VAL)
+        elif 0x15 <= op <= 0x1E:                         # ldc.i4.m1 … ldc.i4.8
+            stack.append(op - 0x16)
+        elif op == 0x1F:                                 # ldc.i4.s
+            stack.append(struct.unpack_from("<b", arg)[0])
+        elif op == 0x20:                                 # ldc.i4
+            stack.append(struct.unpack_from("<i", arg)[0])
+        elif op in _PUSH1:
+            stack.append(_VAL)
+        elif op == 0x25:                                 # dup
+            if not stack:
+                stack.clear()
+                continue
+            stack.append(stack[-1])
+        elif op == 0x8D:                                 # newarr
+            got = pop(1)
+            if got is None:
+                stack.clear()
+                continue
+            stack.append(_Arr(got[0] if isinstance(got[0], int) else None))
+        elif op in _NOP:
+            continue
+        elif op in _STELEM:                              # stelem.*
+            got = pop(3)
+            if got is None:
+                stack.clear()
+                continue
+            arr, idx, val = got
+            if isinstance(arr, _Arr) and isinstance(idx, int):
+                arr.items[idx] = val
+        elif op in _POP1_PUSH1:
+            if pop(1) is None:
+                stack.clear()
+                continue
+            stack.append(_VAL)
+        elif op in _POP2_PUSH1:
+            if pop(2) is None:
+                stack.clear()
+                continue
+            stack.append(_VAL)
+        elif op in _POP1:
+            if pop(1) is None:
+                stack.clear()
+        elif op in _POP2:
+            if pop(2) is None:
+                stack.clear()
+        elif op in (0x28, 0x6F, 0x73):                   # call, callvirt, newobj
+            token = struct.unpack_from("<I", arg)[0]
+            eff = meta.stack_effect(token, newobj=op == 0x73)
+            name = meta.name_of(token)
+            owner = meta.owner_of(token)
+            if eff is None:
+                stack.clear()
+                continue
+            args = pop(eff[0])
+            if args is None:
+                stack.clear()
+                continue
+            if name == "Concat" and owner == "String" and op == 0x28:
+                parts = args
+                if len(args) == 1 and isinstance(args[0], _Arr):
+                    arr = args[0]
+                    size = arr.size if arr.size is not None else (max(arr.items) + 1 if arr.items else 0)
+                    parts = [arr.items.get(k, _VAL) for k in range(size)]
+                t = _template(parts)
+                if t:
+                    found.append(t)
+            if eff[1]:
+                stack.append(_VAL)
+        elif op in _BRANCH:
+            stack.clear()
+        else:
+            stack.clear()
+    return found
+
+
+def _template(parts: List[object]) -> Optional[str]:
+    """Склейка -> шаблон с {0}, {1}…: нужны и литералы со словами, и хотя бы одно значение."""
+    out, n, letters = [], 0, 0
+    for x in parts:
+        if isinstance(x, _Lit):
+            out.append(str(x).replace("{", "{{").replace("}", "}}"))
+            letters += sum(1 for c in x if c.isalpha())
+        elif isinstance(x, (_Arr, int)) or x is _VAL:
+            if out and out[-1].startswith("{") and out[-1].endswith("}") and not out[-1].startswith("{{"):
+                return None                  # два значения подряд — шаблон неоднозначен
+            out.append("{%d}" % n)
+            n += 1
+        else:
+            return None
+    if not n or n > 4 or letters < 3:
+        return None
+    return "".join(out)
 
 
 def text_usage(dll: Path) -> TextUsage:
