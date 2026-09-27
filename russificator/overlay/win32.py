@@ -155,6 +155,7 @@ if IS_WINDOWS:
                                         wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
     GetModuleHandleW = _proto(kernel32, "GetModuleHandleW", wintypes.HMODULE, wintypes.LPCWSTR)
     RegisterClassExW = _proto(user32, "RegisterClassExW", wintypes.ATOM, ctypes.POINTER(WNDCLASSEXW))
+    UnregisterClassW = _proto(user32, "UnregisterClassW", wintypes.BOOL, wintypes.LPCWSTR, wintypes.HINSTANCE)
     CreateWindowExW = _proto(user32, "CreateWindowExW", wintypes.HWND, wintypes.DWORD, wintypes.LPCWSTR,
                              wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                              wintypes.HWND, HMENU, wintypes.HINSTANCE, ctypes.c_void_p)
@@ -531,21 +532,31 @@ class Gui:
             TranslateMessage(ctypes.byref(msg))
             DispatchMessageW(ctypes.byref(msg))
         self._cleanup()
+        self.host = self.overlay = None
+        try:
+            UnregisterClassW(self._class, self._hinst)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _create(self) -> None:
         hinst = GetModuleHandleW(None)
+        self._hinst = hinst
         self._proc = WNDPROC(self._wndproc)
+        # своё имя класса у каждого объекта: класс с тем же именем от прошлого объекта указывал бы
+        # на его (уже удалённую) оконную процедуру
+        self._class = f"{self.CLASS}.{os.getpid()}.{id(self):x}"
         wc = WNDCLASSEXW()
         wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
         wc.lpfnWndProc = ctypes.cast(self._proc, ctypes.c_void_p)
         wc.hInstance = hinst
         wc.hCursor = LoadCursorW(None, ctypes.c_void_p(IDC_ARROW))
-        wc.lpszClassName = self.CLASS
-        RegisterClassExW(ctypes.byref(wc))
-        self.host = CreateWindowExW(WS_EX_TOOLWINDOW, self.CLASS, "Russificator Live", WS_POPUP,
+        wc.lpszClassName = self._class
+        if not RegisterClassExW(ctypes.byref(wc)):
+            raise OSError(f"RegisterClassEx: {ctypes.get_last_error()}")
+        self.host = CreateWindowExW(WS_EX_TOOLWINDOW, self._class, "Russificator Live", WS_POPUP,
                                     0, 0, 0, 0, None, None, hinst, None)
         self.overlay = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
-                                       | WS_EX_NOACTIVATE, self.CLASS, "Russificator Overlay", WS_POPUP,
+                                       | WS_EX_NOACTIVATE, self._class, "Russificator Overlay", WS_POPUP,
                                        0, 0, 1, 1, None, None, hinst, None)
         if not self.host or not self.overlay:
             raise OSError(f"CreateWindowEx: {ctypes.get_last_error()}")

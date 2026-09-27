@@ -14,6 +14,7 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -34,6 +35,9 @@ jobs:
       # Только диагностика в журнале — сборку не останавливает.
       - name: Живой перевод на Windows (диагностика)
         continue-on-error: true
+        timeout-minutes: 5
+        env:
+          PYTHONUNBUFFERED: "1"
         run: python tools/ci_overlay_check.py
 
       - name: Сборка установщика (Установить.exe для архивов «для друзей»)
@@ -94,4 +98,6 @@ jobs:
           pip install -e .
 
       - name: Ren'Py 8 и 7
+        env:
+          PYTHONUNBUFFERED: "1"
         run: python tools/ci_renpy_check.py 8.3.7 7.4.11
