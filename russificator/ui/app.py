@@ -493,6 +493,10 @@ class Api:
         p = Path(path)
         if not p.is_dir():
             return {"ok": False, "error": "Папка не найдена."}
+        from ..library import find_root
+        root = find_root(p)
+        if root is not None and (root in p.parents or root.parent == p):
+            p = root                            # выбрали папку внутри игры или над ней — берём корень игры
         manual = [m for m in self._cfg.get("library_manual") or [] if Path(m) != p] + [str(p)]
         hidden = [h for h in self._cfg.get("library_hidden") or [] if Path(h) != p]
         self._cfg.update(library_manual=manual, library_hidden=hidden)

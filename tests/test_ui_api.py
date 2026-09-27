@@ -36,3 +36,9 @@ def test_detect_takes_game_root(api, tmp_path):
     (tmp_path / "Nothing").mkdir()
     r = api.detect(str(tmp_path / "Nothing"))
     assert not r["ok"] and "корень игры" in r["error"]
+
+
+def test_library_add_takes_game_root(api, tmp_path):
+    vn = _renpy(tmp_path / "Games" / "VN")
+    r = api.library_add(str(vn / "game"))
+    assert r["ok"] and Path(r["game"]["path"]) == vn
