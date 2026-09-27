@@ -37,6 +37,10 @@ const ICONS = {
   star: '<path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9Z"/>',
   gamepad: '<rect x="2" y="7" width="20" height="11" rx="5"/><path d="M7 11v3M5.5 12.5h3M15.5 12h.01M18 13.5h.01"/>',
   package: '<path d="M21 8 12 3 3 8v8l9 5 9-5Z"/><path d="m3 8 9 5 9-5M12 13v8"/><path d="m7.5 5.5 9 5"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  live: '<circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2"/>',
+  "eye-off": '<path d="M3 3l18 18"/><path d="M10.6 5.1A10 10 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-3.2 4.1M6.6 6.6A17 17 0 0 0 2 12s3.5 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
 };
 
 const STAGES = [
@@ -61,7 +65,8 @@ function paintIcons(root = document) {
 const S = {
   init: null, game: null, mode: "machine", preset: null, provider: "deepseek",
   running: false, busy: false, hw: null, stage: null, downloads: {},
-  live: { running: false, starting: false, count: 0, last: "", launch: false },
+  lib: { games: [], filter: "all", search: "", loaded: false, scanning: false, scannedAt: 0, current: null },
+  imp: null,
 };
 
 /* ---------------- запуск ---------------- */
@@ -99,6 +104,8 @@ function showPage(name) {
   $$(".page").forEach((p) => p.classList.toggle("active", p.id === "page-" + name));
   $$(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.page === name || (name === "run" && b.dataset.page === "main")));
   if (name === "models") renderModels();
+  if (name === "games") loadLibrary(false);
+  if (name === "settings") renderLibFolders();
   $(".content").scrollTop = 0;
 }
 
@@ -158,23 +165,35 @@ function bindUi() {
   $("#resOpen").addEventListener("click", () => S.game && api().open_folder(S.game.path));
   $("#resRestore").addEventListener("click", () => restoreGame(S.game && S.game.path, true));
 
-  // живой перевод
-  $("#livePlay").addEventListener("click", async () => {
-    if (S.live.running) {
-      const r = await api().launch_game(S.game ? S.game.path : "");
-      if (!r.ok) toast(r.error, true);
-      return;
-    }
-    S.live.starting = true;
-    S.live.launch = true;
-    renderLiveBar("Запускаю переводчик…");
-    await api().start_live();
+  // мои игры
+  $("#pickFromLib").addEventListener("click", () => showPage("games"));
+  $("#changeFromLib").addEventListener("click", () => showPage("games"));
+  $("#gameSearch").addEventListener("input", (e) => { S.lib.search = e.target.value.trim().toLowerCase(); renderGames(); });
+  $$("#gameFilters .filter").forEach((b) => b.addEventListener("click", () => {
+    S.lib.filter = b.dataset.filter;
+    $$("#gameFilters .filter").forEach((x) => x.classList.toggle("active", x === b));
+    renderGames();
+  }));
+  $("#libRefresh").addEventListener("click", () => loadLibrary(true));
+  $("#libAdd").addEventListener("click", async () => {
+    const r = await api().library_add("");
+    if (r.ok) { upsertGame(r.game); renderGames(); openGame(r.game); }
+    else if (r.error) toast(r.error, true);
   });
-  $("#liveStop").addEventListener("click", () => api().stop_live());
-  $("#liveDesk").addEventListener("click", async () => {
-    const r = await api().desktop_shortcut(S.game ? S.game.path : "");
-    toast(r.ok ? "Ярлык «" + r.name + "» создан на рабочем столе" : r.error, !r.ok);
+  $("#libImport").addEventListener("click", () => openImport(""));
+  $("#setLibAdd").addEventListener("click", async () => {
+    const r = await api().library_add_folder();
+    if (r.ok) { renderLibFolders(); toast("Папка добавлена — ищу игры"); }
   });
+  $("#imPick").addEventListener("click", async () => {
+    const d = await api().pick_folder();
+    if (!d || !S.imp) return;
+    S.imp.game = d;
+    $("#imGame").textContent = d;
+    const r = await api().import_check(S.imp.path, d);
+    setImportCheck(r.ok, r.exact, r.message || r.error);
+  });
+  $("#imGo").addEventListener("click", runImport);
 
   // архив-русификатор
   $("#exportBtn").addEventListener("click", () => openExport());
@@ -229,7 +248,6 @@ async function detectGame(path, quiet = false) {
     S.game = null;
     $("#gameEmpty").classList.remove("hidden");
     $("#gameInfo").classList.add("hidden");
-    renderLiveBar();
     return updateRunState();
   }
   S.game = { path, ...r };
@@ -238,7 +256,8 @@ async function detectGame(path, quiet = false) {
   $("#gameName").textContent = r.name;
   $("#gamePath").textContent = path;
   const chips = [`<span class="chip accent">${icon("gamepad")}${esc(r.engine)}</span>`];
-  if (r.russified) chips.push(`<span class="chip ok">${icon("check")}Уже русифицирована</span>`);
+  if (r.russified && r.intact === false) chips.push(`<span class="chip warn">${icon("alert")}Перевод слетел после обновления игры</span>`);
+  else if (r.russified) chips.push(`<span class="chip ok">${icon("check")}Уже русифицирована</span>`);
   if (r.progress && r.progress.total && !r.russified) {
     const pct = Math.round((r.progress.done / r.progress.total) * 100);
     if (pct > 0 && pct < 100) chips.push(`<span class="chip warn">${icon("pause")}Переведено ${pct}% — можно продолжить</span>`);
@@ -246,7 +265,6 @@ async function detectGame(path, quiet = false) {
   $("#gameChips").innerHTML = chips.join("");
   $("#gameNotes").innerHTML = (r.notes || []).map((n) => `<div class="note">${icon("info")}<span>${esc(n)}</span></div>`).join("");
   updateRunState();
-  renderLiveBar();
 }
 
 /* ---------------- способы перевода ---------------- */
@@ -418,7 +436,8 @@ function updateRunState() {
     } else {
       hint = "Машинный перевод офлайн" + (S.init.machine.installed ? "." : ` — модель скачается автоматически (~${S.init.machine.download_mb} МБ).`);
     }
-    if (S.game.russified) hint += " Игра уже русифицирована — перевод будет обновлён.";
+    if (S.game.russified && S.game.intact === false) hint += " Игра обновилась — перевод поставится заново, готовые строки возьмутся из памяти.";
+    else if (S.game.russified) hint += " Игра уже русифицирована — перевод будет обновлён.";
   }
   $("#runHint").textContent = hint;
   $("#startBtn").disabled = !can;
@@ -435,8 +454,9 @@ async function start() {
   const opts = {
     game_dir: S.game.path, mode: S.mode, local_model: S.preset || "", local_gpu: $("#useGpu").checked,
     cloud_provider: S.provider, cloud_base_url: $("#cloudUrl").value.trim(), cloud_model: $("#cloudModel").value.trim(),
-    api_key: $("#cloudKey").value.trim(),
+    api_key: $("#cloudKey").value.trim(), reuse: !!(S.game.russified && S.game.intact === false) || !!S.reuseNext,
   };
+  S.reuseNext = false;
   const r = await api().start(opts);
   if (!r.ok) return toast(r.error, true);
   S.running = true;
@@ -515,13 +535,10 @@ window.onBackendEvent = (ev) => {
       break;
     }
     case "run_finished": finishRun(ev); break;
-    case "live_status": onLiveStatus(ev); break;
-    case "live": {
-      S.live.count = ev.count;
-      S.live.last = ev.translation;
-      renderLiveBar();
-      break;
-    }
+    case "library_progress": if (S.lib.scanning) setLibStatus(ev.message, true); break;
+    case "library": onLibrary(ev); break;
+    case "import": onImportProgress(ev); break;
+    case "import_done": onImportDone(ev); break;
     case "download": onDownload(ev); break;
     case "export": onExportProgress(ev); break;
     case "export_done": onExportDone(ev); break;
@@ -540,8 +557,9 @@ function finishRun(ev) {
   const errs = ev.errors || [];
   if (S.game && ev.injected) {
     S.game.russified = true;
+    S.game.intact = true;
     S.game.live = !!ev.live;
-    renderLiveBar();
+    if (S.lib.loaded) api().game_status(S.game.path).then((g) => { if (g && g.path) { upsertGame(g); renderGames(); } });
   }
   if (ok) markStage("__end__", "done"), $$("#stepper li").forEach((li) => li.classList.add("done"));
   else if (S.stage) markStage(S.stage, ev.cancelled ? "active" : "fail");
@@ -574,46 +592,6 @@ function finishRun(ev) {
   errs.forEach((e) => log(e, "e"));
   log(ok ? "Готово" : ev.cancelled ? "Остановлено" : "Завершено с ошибкой", ok ? "s" : "e");
   reloadInit();
-}
-
-/* ---------------- живой перевод ---------------- */
-
-function renderLiveBar(message) {
-  const L = S.live;
-  const show = (S.game && S.game.live && S.game.russified) || L.running || L.starting;
-  $("#liveBar").classList.toggle("hidden", !show);
-  if (!show) return;
-  $("#liveDot").className = "live-dot " + (L.running ? "on" : L.starting ? "wait" : "");
-  $("#liveStop").classList.toggle("hidden", !L.running && !L.starting);
-  $("#liveDesk").classList.toggle("hidden", L.running || L.starting || !(S.game && S.game.russified));
-  $("#livePlay").innerHTML = icon("play") + (L.running ? "Запустить игру" : "Играть с живым переводом");
-  $("#livePlay").disabled = L.starting;
-  let text;
-  if (message) text = message;
-  else if (L.running) text = L.count
-    ? `Включён · переведено на лету: ${L.count}` + (L.last ? ` · «${L.last.slice(0, 60)}»` : "")
-    : "Включён — запустите игру, новый текст будет переводиться на лету.";
-  else text = "Текст, который игра собирает на лету, переводится прямо в игре. Запускайте её отсюда " +
-    "или ярлыком «Играть на русском» в папке игры — программу держать открытой не нужно.";
-  $("#liveText").textContent = text;
-}
-
-async function onLiveStatus(ev) {
-  const L = S.live;
-  if (ev.error) {
-    L.starting = false; L.running = false; L.launch = false;
-    toast(ev.error, true);
-  } else if (ev.running === true) {
-    L.starting = false; L.running = true;
-    if (L.launch) {
-      L.launch = false;
-      const r = await api().launch_game(S.game ? S.game.path : "");
-      if (!r.ok) toast(r.error, true);
-    }
-  } else if (ev.running === false) {
-    L.starting = false; L.running = false;
-  }
-  renderLiveBar(L.starting ? ev.message : undefined);
 }
 
 /* ---------------- загрузки ---------------- */
@@ -719,11 +697,281 @@ function restoreGame(path, fromResult = false) {
   });
 }
 
+/* ---------------- мои игры ---------------- */
+
+async function loadLibrary(refresh) {
+  if (S.lib.loaded && !refresh) { renderGames(); return; }
+  const r = await api().library(!!refresh);
+  S.lib.games = r.games || [];
+  S.lib.scannedAt = r.scanned_at || 0;
+  S.lib.scanning = !!r.scanning;
+  S.lib.loaded = true;
+  if (S.lib.scanning) setLibStatus(S.lib.games.length ? "Обновляю список игр…" : "Ищу игры на компьютере…", true);
+  else setLibStatus(libSummary());
+  renderGames();
+}
+
+function onLibrary(ev) {
+  S.lib.games = ev.games || [];
+  S.lib.scanning = false;
+  S.lib.scannedAt = ev.scanned_at || 0;
+  S.lib.loaded = true;
+  setLibStatus(ev.error ? "Поиск прервался: " + ev.error : libSummary());
+  renderGames();
+}
+
+function libSummary() {
+  const n = S.lib.games.length;
+  if (!n) return "Игры не найдены.";
+  const when = S.lib.scannedAt ? new Date(S.lib.scannedAt * 1000).toLocaleString("ru-RU", { day: "numeric", month: "long", hour: "2-digit", minute: "2-digit" }) : "";
+  return `Найдено игр: ${n}` + (when ? ` · список обновлён ${when}` : "");
+}
+
+function setLibStatus(text, busy = false) {
+  $("#libStatus").innerHTML = (busy ? '<span class="spinner"></span>' : "") + `<span>${esc(text)}</span>`;
+  $("#libRefresh").classList.toggle("spin", busy);
+}
+
+function gameKind(g) {
+  if (g.russified) return "russified";
+  if (g.supported) return "supported";
+  return "overlay";
+}
+
+function upsertGame(g) {
+  const i = S.lib.games.findIndex((x) => x.path === g.path);
+  if (i >= 0) S.lib.games[i] = { ...S.lib.games[i], ...g };
+  else S.lib.games.push(g);
+}
+
+function renderGames() {
+  const all = S.lib.games;
+  const counts = { all: all.length, supported: 0, russified: 0, overlay: 0 };
+  all.forEach((g) => { counts[gameKind(g)]++; });
+  counts.supported += counts.russified;
+  $$("[data-cnt]").forEach((el) => { el.textContent = counts[el.dataset.cnt] ? " " + counts[el.dataset.cnt] : ""; });
+  const q = S.lib.search;
+  const list = all.filter((g) => {
+    if (q && !String(g.title).toLowerCase().includes(q) && !String(g.path).toLowerCase().includes(q)) return false;
+    const k = gameKind(g);
+    if (S.lib.filter === "supported") return g.supported || g.russified;
+    if (S.lib.filter === "russified") return k === "russified";
+    if (S.lib.filter === "overlay") return k === "overlay";
+    return true;
+  });
+  $("#gamesGrid").innerHTML = list.map(cardHtml).join("");
+  const empty = !list.length && !(S.lib.scanning && !all.length);
+  $("#gamesEmpty").classList.toggle("hidden", !empty);
+  if (empty) {
+    $("#gamesEmptyTitle").textContent = all.length ? "Ничего не найдено" : "Игры не найдены";
+    $("#gamesEmptyText").textContent = all.length ? "Попробуйте другой запрос или фильтр."
+      : "Добавьте папку игры вручную или укажите папки для поиска в настройках.";
+  }
+  $$("#gamesGrid .gcard").forEach((el) => {
+    el.addEventListener("click", () => openGame(S.lib.games.find((g) => g.path === el.dataset.path)));
+    const img = el.querySelector("img");
+    if (img) img.addEventListener("error", () => coverFallback(img, el.dataset.appid, el.dataset.title), { once: true });
+  });
+}
+
+function hue(s) {
+  let h = 0;
+  for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) % 360;
+  return h;
+}
+
+function initials(t) {
+  const words = String(t).replace(/[^\p{L}\p{N} ]/gu, " ").split(/\s+/).filter(Boolean);
+  return ((words[0] || "?")[0] + (words[1] ? words[1][0] : "")).toUpperCase();
+}
+
+function placeholder(g) {
+  return `<div class="gph" style="--h:${hue(g.title)}">${esc(initials(g.title))}<small>${esc(g.engine_title || "")}</small></div>`;
+}
+
+async function coverFallback(img, appid, title) {
+  // нет интернета — обложка из кэша Steam; нет и её — заглушка с инициалами (цвет — от названия)
+  const data = appid ? await api().game_cover(appid) : "";
+  if (data) { img.src = data; return; }
+  const g = S.lib.games.find((x) => x.title === title) || { title, engine_title: "" };
+  const box = document.createElement("div");
+  box.innerHTML = placeholder(g);
+  img.replaceWith(box.firstChild);
+}
+
+function statusBadge(g) {
+  if (g.russified && g.intact === false) return `<span class="gstatus warn">${icon("alert")}Перевод слетел</span>`;
+  if (g.russified) return `<span class="gstatus ok">${icon("check")}На русском</span>`;
+  if (!g.supported) return `<span class="gstatus overlay">${icon("live")}Оверлей</span>`;
+  return "";
+}
+
+function cardHtml(g) {
+  const cover = g.cover ? `<img src="${esc(g.cover)}" alt="" loading="lazy">` : placeholder(g);
+  const src = (g.sources || [g.source]).map((x) => ({ steam: "Steam", gog: "GOG", epic: "Epic", ubisoft: "Ubisoft", itch: "itch.io", xbox: "Game Pass", registry: "", folder: "", manual: "вручную", russified: "" }[x] ?? x)).filter(Boolean);
+  return `<div class="gcard" data-path="${esc(g.path)}" data-appid="${esc(g.appid || "")}" data-title="${esc(g.title)}" title="${esc(g.path)}">
+    <div class="gcover" style="--h:${hue(g.title)}">${cover}${statusBadge(g)}</div>
+    <div class="gbody">
+      <div class="gtitle">${esc(g.title)}</div>
+      <div class="gmeta"><span class="chip ${g.supported ? "accent" : ""}">${esc(g.engine_title || "?")}</span><span class="src">${esc(src.join(" · "))}</span></div>
+    </div>
+  </div>`;
+}
+
+function openGame(g) {
+  if (!g) return;
+  S.lib.current = g;
+  const m = $("#gameModal");
+  const cover = $("#gmCover");
+  cover.innerHTML = g.cover ? `<img src="${esc(g.cover)}" alt="">` : placeholder(g);
+  cover.style.setProperty("--h", hue(g.title));
+  const img = cover.querySelector("img");
+  if (img) img.addEventListener("error", () => coverFallback(img, g.appid, g.title), { once: true });
+  $("#gmTitle").textContent = g.title;
+  $("#gmPath").textContent = g.path;
+  const srcNames = { steam: "Steam", gog: "GOG", epic: "Epic Games", ubisoft: "Ubisoft Connect", itch: "itch.io", xbox: "Game Pass / Microsoft Store", registry: "Установлена в Windows", folder: "Папка поиска", manual: "Добавлена вручную", russified: "Переводилась в программе" };
+  $("#gmChips").innerHTML = [`<span class="chip ${g.supported ? "accent" : ""}">${icon("gamepad")}${esc(g.engine_title || "Движок не определён")}</span>`]
+    .concat((g.sources || []).map((x) => `<span class="chip">${esc(srcNames[x] || x)}</span>`)).join("");
+
+  const st = [];
+  if (g.russified && g.intact === false) {
+    st.push(["warn", "alert", "Перевод слетел", "Игра обновилась или Steam проверил целостность файлов. Нажмите «Переустановить перевод» — готовые строки возьмутся из памяти, переведутся только новые."]);
+  } else if (g.russified) {
+    const lines = g.total ? `Переведено ${g.translated ?? "?"} из ${g.total} строк` : "Игра русифицирована";
+    const parts = [g.translator, g.date].filter(Boolean).join(" · ");
+    st.push(["ok", "check-circle", g.from_package ? "Установлен русификатор из архива" : "Игра на русском", lines + (parts ? " · " + parts : "")]);
+  } else if (g.supported) {
+    st.push(["info", "info", "Можно русифицировать", "Движок поддерживается: текст переведётся файлами, программа во время игры не нужна."]);
+  } else {
+    const why = (g.sources || []).includes("xbox") ? "Файлы игр Game Pass / Microsoft Store защищены." : "Этот движок пока не переводится файлами.";
+    st.push(["info", "live", "Только живой перевод", why + " Играйте с оверлеем: перевод появится поверх игры."]);
+  }
+  if (g.live) st.push(["live", "live", `Допереведено на лету: ${g.live}`, "Столько строк игра собрала кодом — их перевела живая «доводка». Они войдут и в архив-русификатор."]);
+  $("#gmState").innerHTML = st.map(([c, i, t, d]) => `<div class="state-box ${c}">${icon(i)}<div><b>${esc(t)}</b><span class="muted">${esc(d)}</span></div></div>`).join("");
+
+  const acts = [];
+  if (g.russified && g.intact === false) acts.push(["primary", "refresh", "Переустановить перевод", "reapply"]);
+  else if (!g.russified && g.supported) acts.push(["primary", "globe", "Русифицировать", "russify"]);
+  if (g.russified && g.intact !== false) acts.push(["primary", "play", "Играть", "play"]);
+  else acts.push(["", "play", "Играть", "play"]);
+  if (!g.supported) acts.push(["", "live", "Живой перевод", "live"]);
+  if (g.russified && !g.from_package) acts.push(["", "package", "Создать файл русификатора", "export"]);
+  if (g.russified) acts.push(["ghost", "undo", "Откатить", "restore"]);
+  $("#gmActions").innerHTML = acts.map(([k, i, t, a]) => `<button class="btn ${k}" data-act="${a}">${icon(i)}${esc(t)}</button>`).join("");
+  const links = [["folder-open", "Открыть папку", "folder"]];
+  if (g.russified && g.engine === "unity") links.push(["link", "Ярлык на рабочий стол", "shortcut"]);
+  if ((g.sources || []).includes("manual") || !(g.sources || []).length) links.push(["eye-off", "Убрать из списка", "hide"]);
+  else links.push(["eye-off", "Скрыть", "hide"]);
+  $("#gmLinks").innerHTML = links.map(([i, t, a]) => `<button class="btn ghost sm" data-act="${a}">${icon(i)}${esc(t)}</button>`).join("");
+  $$("#gameModal [data-act]").forEach((b) => b.addEventListener("click", () => gameAction(b.dataset.act, g)));
+  m.classList.remove("hidden");
+}
+
+async function gameAction(act, g) {
+  const close = () => $("#gameModal").classList.add("hidden");
+  if (act === "russify" || act === "reapply") {
+    close();
+    await detectGame(g.path);
+    showPage("main");
+    if (act === "reapply") { S.reuseNext = true; toast("Нажмите «Русифицировать» — готовые строки возьмутся из памяти"); }
+  } else if (act === "play") {
+    const r = await api().play_game(g.path, g.appid || "");
+    if (!r.ok) toast(r.error, true); else toast("Запускаю «" + g.title + "»…");
+  } else if (act === "export") {
+    close();
+    await detectGame(g.path, true);
+    openExport();
+  } else if (act === "restore") {
+    restoreGame(g.path);
+  } else if (act === "folder") {
+    api().open_folder(g.path);
+  } else if (act === "shortcut") {
+    const r = await api().desktop_shortcut(g.path);
+    toast(r.ok ? "Ярлык «" + r.name + "» создан на рабочем столе" : r.error, !r.ok);
+  } else if (act === "live") {
+    close();
+    showPage("live");
+  } else if (act === "hide") {
+    await api().library_hide(g.path);
+    S.lib.games = S.lib.games.filter((x) => x.path !== g.path);
+    close();
+    renderGames();
+    toast("Игра убрана из списка");
+  }
+}
+
+async function renderLibFolders() {
+  const folders = await api().library_folders();
+  $("#setLibFolders").innerHTML = folders.length ? folders.map((f) => `<div class="folder-item"><span class="mono small">${esc(f)}</span>
+    <button class="icon-btn sm" data-rmf="${esc(f)}" title="Убрать">${icon("x")}</button></div>`).join("")
+    : '<span class="muted small">Не добавлены.</span>';
+  $$("[data-rmf]").forEach((b) => b.addEventListener("click", async () => { await api().library_remove_folder(b.dataset.rmf); renderLibFolders(); }));
+}
+
+/* ---------------- установка архива ---------------- */
+
+async function openImport(path) {
+  const r = await api().import_open(path || "");
+  if (!r.ok) { if (r.error) toast(r.error, true); return; }
+  S.imp = { path: r.path, game: r.game };
+  $("#imInfo").innerHTML = `<b>${esc(r.title)}</b> · ${esc(r.engine)}` + (r.total ? ` · переведено ${r.translated} из ${r.total} строк` : "") +
+    (r.translator ? ` · ${esc(r.translator)}` : "") + (r.created ? `<br><span class="small">создан ${esc(r.created)}</span>` : "");
+  $("#imGame").textContent = r.game || "Игра не найдена — укажите папку";
+  setImportCheck(!!r.game, r.exact, r.game ? r.check : "Нажмите «Изменить…» и выберите папку игры (где её .exe).");
+  $("#imProgress").classList.add("hidden");
+  $("#imMsgs").innerHTML = "";
+  $("#imGo").classList.remove("hidden");
+  $("#importModal").classList.remove("hidden");
+}
+
+function setImportCheck(ok, exact, text) {
+  const el = $("#imCheck");
+  el.textContent = text || "";
+  el.style.color = ok ? (exact ? "var(--ok)" : "var(--warn)") : "var(--danger)";
+  $("#imGo").disabled = !ok || S.busy;
+}
+
+async function runImport() {
+  if (!S.imp || !S.imp.game) return;
+  const r = await api().import_install(S.imp.path, S.imp.game);
+  if (!r.ok) return toast(r.error, true);
+  S.busy = true;
+  $("#imGo").disabled = true;
+  const box = $("#imProgress");
+  box.classList.remove("hidden");
+  box.querySelector(".bar").classList.add("indeterminate");
+  box.querySelector(".dl-text").textContent = "Установка…";
+}
+
+function onImportProgress(ev) {
+  const box = $("#imProgress");
+  const bar = box.querySelector(".bar");
+  if (ev.fraction != null) { bar.classList.remove("indeterminate"); bar.querySelector(".bar-fill").style.width = (ev.fraction * 100).toFixed(1) + "%"; }
+  box.querySelector(".dl-text").textContent = ev.message || "";
+}
+
+async function onImportDone(ev) {
+  S.busy = false;
+  $("#imProgress").classList.add("hidden");
+  updateRunState();
+  if (!ev.ok) {
+    $("#imGo").disabled = false;
+    $("#imMsgs").innerHTML = `<div class="msg e">${icon("x-circle")}<span>${esc(ev.error)}</span></div>`;
+    return;
+  }
+  $("#imGo").classList.add("hidden");
+  $("#imMsgs").innerHTML = [`<div class="msg n">${icon("check-circle")}<span>Готово! Русификатор установлен — запускайте игру.</span></div>`]
+    .concat((ev.notes || []).map((m) => `<div class="msg w">${icon("alert")}<span>${esc(m)}</span></div>`)).join("");
+  toast("Русификатор установлен");
+  if (S.lib.loaded) { const g = await api().game_status(ev.game); if (g && g.path) { upsertGame(g); renderGames(); } }
+  if (S.game && S.game.path === ev.game) detectGame(ev.game, true);
+}
+
 /* ---------------- архив-русификатор ---------------- */
 
 async function openExport() {
   if (!S.game) return;
-  if (!S.game.can_export && !S.exportAfterRun) {
+  if (!S.game.can_export) {
     await detectGame(S.game.path, true);
     if (!S.game || !S.game.can_export) return toast((S.game && S.game.export_reason) || "Сначала русифицируйте игру.", true);
   }

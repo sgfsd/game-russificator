@@ -184,11 +184,37 @@ class GameBackup:
                 broken.append(rel)
         return not broken, broken
 
+    def forget_updated(self) -> List[str]:
+        """Забыть файлы, которые с момента русификации заменила сама игра (обновление, «проверка
+        целостности» Steam): их старые оригиналы из бэкапа возвращать нельзя — это откатило бы
+        обновление. Такие файлы и есть новые оригиналы. Возвращает список забытых путей."""
+        if not self.snapshot_state:
+            return []
+        forgotten: List[str] = []
+        for rel in list(self.modified):
+            snap = self.snapshot_state.get(rel)
+            try:
+                st = (self.game_dir / rel).stat()
+            except OSError:
+                continue            # файла нет — вернём оригинал из бэкапа
+            if snap and (st.st_size != snap[0] or st.st_mtime_ns != snap[1]):
+                forgotten.append(rel)
+                del self.modified[rel]
+                (self.root / rel).unlink(missing_ok=True)
+                self.snapshot_state.pop(rel, None)
+        if forgotten:
+            self._save()
+        return forgotten
+
     # ---------- откат ----------
 
     def restore(self) -> Tuple[int, List[str]]:
         """Вернуть оригиналы и удалить созданное. Возвращает (файлов, заметки)."""
         notes: List[str] = []
+        updated = self.forget_updated()
+        if updated:
+            notes.append(f"Игра обновилась после русификации: {len(updated)} файл(ов) уже новые — "
+                         "они оставлены как есть.")
         restored = 0
         for rel in list(self.modified):
             src = self.root / rel
@@ -212,10 +238,10 @@ class GameBackup:
         shutil.rmtree(self.root, ignore_errors=True)
         self.modified, self.created = {}, []
         self.snapshot_state, self.info = {}, {}
+        if removed:
+            notes.insert(0, f"Удалено файлов русификатора: {removed}.")
         if restored:
             notes.insert(0, f"Восстановлено оригинальных файлов: {restored}.")
-        if removed:
-            notes.insert(1 if restored else 0, f"Удалено файлов русификатора: {removed}.")
         return restored + removed, notes
 
 

@@ -379,3 +379,72 @@ input.num { width: 90px; text-align: center; }
 .export-done b { word-break: break-all; }
 .export-foot { padding: 12px 28px 24px; }
 .run-actions { flex-wrap: wrap; justify-content: flex-end; }
+
+/* ---------- утилиты ---------- */
+.col { display: flex; flex-direction: column; }
+.gap-s { gap: 6px; }
+.page.wide { max-width: 1240px; }
+
+/* ---------- мои игры ---------- */
+.toolbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 12px; }
+.search { flex: 1 1 260px; min-width: 200px; display: flex; align-items: center; gap: 8px; padding: 0 12px; border-radius: var(--radius-sm); border: 1.5px solid var(--border); background: var(--panel); transition: .15s; }
+.search:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.search .i { color: var(--muted); width: 16px; height: 16px; }
+.search input { border: 0 !important; background: transparent !important; box-shadow: none !important; padding: 10px 0 !important; }
+.filters { display: flex; gap: 6px; flex-wrap: wrap; }
+.filter { padding: 7px 12px; border-radius: 99px; border: 1.5px solid var(--border); background: var(--panel); cursor: pointer; font-size: 12.5px; color: var(--muted); transition: .15s; display: inline-flex; gap: 6px; align-items: center; }
+.filter:hover { border-color: var(--border-2); color: var(--text); }
+.filter.active { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+.filter .cnt { color: var(--faint); font-variant-numeric: tabular-nums; }
+.filter.active .cnt { color: #b7adff; }
+.toolbar-2 .icon-btn { height: 32px; width: 36px; }
+.toolbar-2 { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+.lib-status { display: flex; align-items: center; gap: 8px; min-height: 20px; }
+.lib-status .spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--border-2); border-top-color: var(--accent); animation: spin .9s linear infinite; }
+
+.games-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 16px; }
+.gcard { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; cursor: pointer; transition: transform .15s, border-color .15s, box-shadow .15s; display: flex; flex-direction: column; min-width: 0; }
+.gcard:hover { transform: translateY(-2px); border-color: var(--border-2); box-shadow: 0 10px 26px rgba(0, 0, 0, .35); }
+.gcover { position: relative; aspect-ratio: 460 / 215; background: var(--bg-2); overflow: hidden; }
+.gcover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.gph { position: absolute; inset: 0; display: grid; place-items: center; font-size: 30px; font-weight: 750; letter-spacing: .02em; color: rgba(255, 255, 255, .92);
+  background: linear-gradient(135deg, hsl(var(--h), 55%, 34%), hsl(calc(var(--h) + 50), 60%, 22%)); text-shadow: 0 2px 12px rgba(0, 0, 0, .35); }
+.gph small { position: absolute; bottom: 8px; left: 10px; font-size: 11px; font-weight: 600; letter-spacing: .04em; opacity: .75; text-transform: uppercase; }
+.gstatus { position: absolute; top: 8px; right: 8px; display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 99px; font-size: 11.5px; font-weight: 600;
+  background: rgba(13, 15, 20, .82); backdrop-filter: blur(6px); color: var(--text); }
+.gstatus .i { width: 13px; height: 13px; }
+.gstatus.ok { color: var(--ok); }
+.gstatus.warn { color: var(--warn); }
+.gstatus.overlay { color: #5eead4; }
+.gbody { padding: 11px 13px 13px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.gtitle { font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gmeta { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); min-width: 0; white-space: nowrap; overflow: hidden; }
+.gmeta .chip { padding: 2px 8px; font-size: 11.5px; flex: none; }
+.gmeta .src { overflow: hidden; text-overflow: ellipsis; }
+.empty { text-align: center; padding: 60px 20px; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.empty .i.big { width: 40px; height: 40px; }
+
+.folder-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.folder-item { display: flex; align-items: center; gap: 10px; padding: 7px 8px 7px 12px; border-radius: var(--radius-sm); background: var(--bg-2); border: 1px solid var(--border); }
+.folder-item .mono { flex: 1; min-width: 0; word-break: break-all; }
+
+/* карточка игры */
+.modal-card.game { padding: 0; overflow: hidden; width: min(640px, 94vw); max-height: 92vh; display: flex; flex-direction: column; }
+.gm-cover { position: relative; aspect-ratio: 460 / 175; background: var(--bg-2); flex: none; overflow: hidden; }
+.gm-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.gm-cover::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, transparent 45%, var(--panel)); }
+.gm-body { padding: 14px 26px 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+.gm-body h2 { font-size: 22px; overflow-wrap: anywhere; }
+.gm-path { color: var(--muted); word-break: break-all; margin-top: -6px; }
+.gm-state { display: flex; flex-direction: column; gap: 8px; }
+.gm-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px; }
+.gm-links { display: flex; flex-wrap: wrap; gap: 6px; }
+.state-box { display: flex; gap: 12px; padding: 12px 14px; border-radius: var(--radius-sm); background: var(--bg-2); border: 1px solid var(--border); font-size: 13px; }
+.state-box > .i { width: 20px; height: 20px; flex: none; margin-top: 1px; }
+.state-box.ok { border-color: rgba(61, 220, 151, .3); } .state-box.ok > .i { color: var(--ok); }
+.state-box.warn { border-color: rgba(255, 181, 71, .35); } .state-box.warn > .i { color: var(--warn); }
+.state-box.info > .i { color: var(--accent); }
+.state-box.live { border-color: rgba(94, 234, 212, .3); } .state-box.live > .i { color: #5eead4; }
+.state-box b { display: block; margin-bottom: 2px; }
+.icon-btn.sm { width: 30px; height: 28px; border-radius: 8px; }
+.icon-btn.sm .i { width: 14px; height: 14px; }

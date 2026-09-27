@@ -56,6 +56,9 @@ STAGES = {
 class PipelineOptions:
     font_path: Optional[Path] = None      # свой шрифт; None — из библиотеки
     use_memory: bool = True               # общая память переводов
+    #: взять готовые переводы прошлого прохода, даже если способ перевода другой
+    #: («Переустановить» после обновления игры: переводятся только новые строки)
+    reuse_translations: bool = False
 
 
 @dataclass
@@ -290,7 +293,7 @@ class Pipeline:
             return
         if old.engine != project.engine:
             return
-        if old.meta.get("translator", translator_id) != translator_id:
+        if old.meta.get("translator", translator_id) != translator_id and not self.options.reuse_translations:
             self.info("Способ перевода изменился — текст переводится заново")
             return
         n = project.merge_translations(old)

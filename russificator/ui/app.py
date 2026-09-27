@@ -59,6 +59,8 @@ class Api:
         self._last_progress = 0.0
         self._live = None                         # LiveServer живого перевода
         self._live_cancel = threading.Event()
+        from .games import Library
+        self._library = Library(self._emit)
 
     # ---------- связь с окном ----------
 
@@ -332,9 +334,11 @@ class Api:
             self._emit({"type": "run_started", "game": game, "mode": mode})
             try:
                 translator = create_translator(mode, opts, Path(game).name)
-                pipeline = Pipeline(translator, PipelineOptions(font_path=Path(font) if font else None),
+                pipeline = Pipeline(translator, PipelineOptions(font_path=Path(font) if font else None,
+                                                                reuse_translations=bool(options.get("reuse"))),
                                     on_event=self._emit, cancel=self._cancel)
                 result = pipeline.run(Path(game))
+                self._library.refresh_status(game)
             except Exception as exc:  # noqa: BLE001
                 log.exception("Русификация упала")
                 self._emit({"type": "run_finished", "final": True, "success": False, "errors": [_err(exc)],
@@ -350,6 +354,165 @@ class Api:
                           "memory": result.from_memory},
             })
         return self._run_task("run", work)
+
+    # ---------- мои игры ----------
+
+    def library(self, refresh: bool = False) -> Dict[str, Any]:
+        """Список игр из кэша; поиск в фоне — если попросили или список старше суток."""
+        snap = self._library.snapshot(self._cfg)
+        if refresh or not snap["games"] or time.time() - snap["scanned_at"] > 24 * 3600:
+            self._library.scan(self._cfg)
+            snap["scanning"] = True
+        return snap
+
+    def library_add(self, path: str = "") -> Dict[str, Any]:
+        """Добавить игру вручную (папка — корень игры)."""
+        if not path:
+            path = self.pick_folder() or ""
+        if not path:
+            return {"ok": False}
+        p = Path(path)
+        if not p.is_dir():
+            return {"ok": False, "error": "Папка не найдена."}
+        manual = [m for m in self._cfg.get("library_manual") or [] if Path(m) != p] + [str(p)]
+        hidden = [h for h in self._cfg.get("library_hidden") or [] if Path(h) != p]
+        self._cfg.update(library_manual=manual, library_hidden=hidden)
+        settings.save(self._cfg)
+        return {"ok": True, "game": self._library.add(str(p))}
+
+    def library_hide(self, path: str) -> Dict[str, Any]:
+        p = Path(path)
+        self._cfg["library_manual"] = [m for m in self._cfg.get("library_manual") or [] if Path(m) != p]
+        self._cfg["library_hidden"] = list(dict.fromkeys((self._cfg.get("library_hidden") or []) + [str(p)]))
+        settings.save(self._cfg)
+        return {"ok": True}
+
+    def library_folders(self) -> List[str]:
+        return list(self._cfg.get("library_folders") or [])
+
+    def library_add_folder(self) -> Dict[str, Any]:
+        d = self.pick_folder()
+        if not d:
+            return {"ok": False}
+        folders = [f for f in self._cfg.get("library_folders") or [] if Path(f) != Path(d)] + [d]
+        self._cfg["library_folders"] = folders
+        settings.save(self._cfg)
+        self._library.scan(self._cfg)
+        return {"ok": True, "folders": folders}
+
+    def library_remove_folder(self, path: str) -> Dict[str, Any]:
+        self._cfg["library_folders"] = [f for f in self._cfg.get("library_folders") or [] if f != path]
+        settings.save(self._cfg)
+        return {"ok": True, "folders": self._cfg["library_folders"]}
+
+    def game_status(self, path: str) -> Dict[str, Any]:
+        g = self._library.refresh_status(path)
+        if g is not None:
+            return g
+        from .games import status
+        return status(Path(path))
+
+    def game_cover(self, appid: str) -> str:
+        """Обложка Steam из локального кэша как data-URL (если в сети её не достать)."""
+        import base64
+        from .games import steam_cover_file
+        f = steam_cover_file(appid)
+        if f is None:
+            return ""
+        try:
+            return "data:image/jpeg;base64," + base64.b64encode(f.read_bytes()).decode("ascii")
+        except OSError:
+            return ""
+
+    def play_game(self, path: str, appid: str = "") -> Dict[str, Any]:
+        """Запустить игру: Steam-игру — через Steam, остальное — exe (IL2CPP с доводкой — через --play)."""
+        from .. import library as lib
+        from ..engines.unity import xunity
+        game = Path(path)
+        if appid and appid.isdigit():
+            try:
+                webbrowser.open(f"steam://rungameid/{appid}")
+                return {"ok": True}
+            except Exception:  # noqa: BLE001
+                pass
+        if xunity.is_installed(game) and not (game / "BepInEx" / "plugins" / xunity.PLUGIN).is_file():
+            from ..core import launcher
+            exe, args, workdir = launcher.play_command()
+            try:
+                subprocess.Popen([exe, *args, str(game)], cwd=workdir)
+                return {"ok": True}
+            except OSError:
+                pass
+        exe = self._game_exe(game) if game.is_dir() else None
+        exe = exe or lib.main_exe(game)
+        if exe is None:
+            return {"ok": False, "error": "Не найден .exe игры — запустите её вручную."}
+        try:
+            subprocess.Popen([str(exe)], cwd=str(exe.parent))
+        except OSError as exc:
+            return {"ok": False, "error": f"Не удалось запустить игру: {exc}"}
+        return {"ok": True}
+
+    # ---------- установка готового русификатора (архив) ----------
+
+    def import_open(self, path: str = "") -> Dict[str, Any]:
+        """Открыть архив-русификатор: что внутри и где игра."""
+        from ..core.package import PackageError, check_game, find_game, open_package
+        if not path:
+            import webview
+            res = self._window.create_file_dialog(webview.FileDialog.OPEN,
+                                                  file_types=("Русификатор (*.zip)", "Все файлы (*.*)"))
+            path = res[0] if res else ""
+        if not path:
+            return {"ok": False}
+        try:
+            pkg = open_package(Path(path))
+        except PackageError as exc:
+            return {"ok": False, "error": str(exc)}
+        try:
+            cands = find_game(pkg)
+            game = next((c for c in cands if check_game(pkg, c).ok), None)
+            chk = check_game(pkg, game) if game else None
+            st = pkg.info.get("stats") or {}
+            return {"ok": True, "path": path, "title": pkg.title, "engine": pkg.game.get("engine_title") or pkg.engine,
+                    "translator": pkg.info.get("translator", ""), "translated": st.get("translated", 0),
+                    "total": st.get("total", 0), "created": pkg.info.get("created", ""),
+                    "game": str(game) if game else "", "check": chk.message if chk else "",
+                    "exact": bool(chk and chk.exact)}
+        finally:
+            pkg.close()
+
+    def import_check(self, pkg_path: str, game_dir: str) -> Dict[str, Any]:
+        from ..core.package import PackageError, check_game, open_package
+        try:
+            pkg = open_package(Path(pkg_path))
+        except PackageError as exc:
+            return {"ok": False, "error": str(exc)}
+        try:
+            chk = check_game(pkg, Path(game_dir))
+            return {"ok": chk.ok, "exact": chk.exact, "message": chk.message}
+        finally:
+            pkg.close()
+
+    def import_install(self, pkg_path: str, game_dir: str) -> Dict[str, Any]:
+        from ..core.package import PackageError, install_package, open_package
+
+        def work():
+            status = (lambda m, f=None: self._emit({"type": "import", "message": m, "fraction": f}))
+            try:
+                pkg = open_package(Path(pkg_path))
+                try:
+                    res = install_package(pkg, Path(game_dir), status=status)
+                finally:
+                    pkg.close()
+                self._library.refresh_status(game_dir)
+                self._emit(dict(res, type="import_done", ok=True, game=game_dir, final=True))
+            except PackageError as exc:
+                self._emit({"type": "import_done", "ok": False, "error": str(exc), "final": True})
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Установка архива упала")
+                self._emit({"type": "import_done", "ok": False, "error": _err(exc), "final": True})
+        return self._run_task("import", work)
 
     # ---------- архив-русификатор «для друзей» ----------
 
@@ -487,6 +650,7 @@ class Api:
             return {"ok": False, "error": "Дождитесь окончания текущей операции."}
         try:
             count, notes = restore_backups(Path(path))
+            self._library.refresh_status(path)
             return {"ok": bool(count), "notes": notes}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "notes": [f"Откат не удался: {exc}"]}

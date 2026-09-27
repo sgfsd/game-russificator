@@ -24,6 +24,7 @@
 
     <nav class="nav">
       <button class="nav-item active" data-page="main"><span class="i" data-icon="globe"></span>Русификация</button>
+      <button class="nav-item" data-page="games"><span class="i" data-icon="gamepad"></span>Мои игры</button>
       <button class="nav-item" data-page="models"><span class="i" data-icon="layers"></span>Модели</button>
       <button class="nav-item" data-page="settings"><span class="i" data-icon="gear"></span>Настройки</button>
     </nav>
@@ -53,7 +54,10 @@
           <div class="game-empty" id="gameEmpty">
             <span class="i big" data-icon="folder"></span>
             <div class="grow"><b>Выберите папку с игрой</b><span class="muted">Корень игры — там, где лежит её .exe. Движок определится сам.</span></div>
-            <button class="btn" id="pickGame"><span class="i" data-icon="folder-open"></span>Обзор…</button>
+            <div class="row gap">
+              <button class="btn ghost" id="pickFromLib"><span class="i" data-icon="gamepad"></span>Мои игры</button>
+              <button class="btn" id="pickGame"><span class="i" data-icon="folder-open"></span>Обзор…</button>
+            </div>
           </div>
           <div class="game-info hidden" id="gameInfo">
             <div class="game-main">
@@ -62,7 +66,10 @@
               <div class="chips" id="gameChips"></div>
               <div class="notes" id="gameNotes"></div>
             </div>
-            <button class="btn ghost" id="changeGame">Сменить</button>
+            <div class="col gap-s">
+              <button class="btn ghost" id="changeGame"><span class="i" data-icon="folder-open"></span>Сменить</button>
+              <button class="btn ghost sm" id="changeFromLib"><span class="i" data-icon="gamepad"></span>Мои игры</button>
+            </div>
           </div>
         </div>
       </div>
@@ -179,18 +186,6 @@
       </div>
     </section>
 
-    <!-- ============ живой перевод (Unity) ============ -->
-    <div class="live-bar hidden" id="liveBar">
-      <span class="live-dot" id="liveDot"></span>
-      <div class="grow">
-        <b>Живой перевод</b>
-        <div class="muted small" id="liveText">Текст, который игра собирает на лету, переводится прямо в игре.</div>
-      </div>
-      <button class="btn ghost sm hidden" id="liveStop"><span class="i" data-icon="stop"></span>Выключить</button>
-      <button class="btn ghost sm" id="liveDesk" title="Ярлык запускает игру сразу с живым переводом — программу открывать не нужно"><span class="i" data-icon="link"></span>Ярлык на рабочий стол</button>
-      <button class="btn primary" id="livePlay"><span class="i" data-icon="play"></span>Играть с живым переводом</button>
-    </div>
-
     <!-- ============ процесс ============ -->
     <section class="page" id="page-run">
       <header class="page-head">
@@ -238,6 +233,39 @@
       </div>
     </section>
 
+    <!-- ============ мои игры ============ -->
+    <section class="page wide" id="page-games">
+      <header class="page-head">
+        <h1>Мои игры</h1>
+        <p>Игры на этом компьютере — Steam, GOG, Epic, Game Pass и другие. Выберите игру и русифицируйте её
+          в пару кликов. Нет в списке — добавьте папку игры вручную.</p>
+      </header>
+      <div class="toolbar">
+        <label class="search"><span class="i" data-icon="search"></span>
+          <input id="gameSearch" type="text" placeholder="Поиск по названию" spellcheck="false"></label>
+        <div class="filters" id="gameFilters">
+          <button class="filter active" data-filter="all">Все<span class="cnt" data-cnt="all"></span></button>
+          <button class="filter" data-filter="supported">Можно русифицировать<span class="cnt" data-cnt="supported"></span></button>
+          <button class="filter" data-filter="russified">Русифицированы<span class="cnt" data-cnt="russified"></span></button>
+          <button class="filter" data-filter="overlay">Только оверлей<span class="cnt" data-cnt="overlay"></span></button>
+        </div>
+      </div>
+      <div class="toolbar-2">
+        <div class="lib-status muted small" id="libStatus"></div>
+        <div class="row gap">
+          <button class="icon-btn" id="libRefresh" title="Найти игры заново"><span class="i" data-icon="refresh"></span></button>
+          <button class="btn ghost sm" id="libAdd"><span class="i" data-icon="plus"></span>Добавить папку игры</button>
+          <button class="btn sm" id="libImport"><span class="i" data-icon="package"></span>Установить русификатор из архива</button>
+        </div>
+      </div>
+      <div class="games-grid" id="gamesGrid"></div>
+      <div class="empty hidden" id="gamesEmpty">
+        <span class="i big" data-icon="gamepad"></span>
+        <b id="gamesEmptyTitle">Игры не найдены</b>
+        <p class="muted" id="gamesEmptyText">Добавьте папку игры вручную или укажите папки для поиска в настройках.</p>
+      </div>
+    </section>
+
     <!-- ============ модели ============ -->
     <section class="page" id="page-models">
       <header class="page-head">
@@ -279,6 +307,12 @@
           <div class="grow"><b>Шрифт с кириллицей</b><div class="muted small">Подключается к игре, если в её шрифте нет русских букв. По умолчанию — встроенный PT Sans.</div>
             <div class="mono small path" id="setFont"></div></div>
           <div class="row gap"><button class="btn ghost" id="setFontReset">Встроенный</button><button class="btn" id="setFontPick">Выбрать .ttf…</button></div>
+        </div>
+        <div class="setting">
+          <div class="grow"><b>Папки для поиска игр</b><div class="muted small">«Мои игры» находят Steam, GOG, Epic,
+            Ubisoft, itch.io и Game Pass сами. Здесь — папки, где игры лежат просто так (например, D:\Games).</div>
+            <div class="folder-list" id="setLibFolders"></div></div>
+          <div class="row gap"><button class="btn" id="setLibAdd"><span class="i" data-icon="plus"></span>Добавить…</button></div>
         </div>
         <div class="setting">
           <div class="grow"><b>Потоки процессора</b><div class="muted small">Для машинного перевода и нейросети на ПК. 0 — автоматически.</div></div>
@@ -328,6 +362,51 @@
     </div>
     <button class="btn tg big" id="openTg"><span class="i" data-icon="send"></span>Написать в Telegram</button>
     <p class="muted small center">Напишите название игры — обсудим объём, сроки и цену.</p>
+  </div>
+</div>
+
+<!-- ============ карточка игры ============ -->
+<div class="modal hidden" id="gameModal">
+  <div class="modal-card game">
+    <button class="modal-x" data-close><span class="i" data-icon="x"></span></button>
+    <div class="gm-cover" id="gmCover"></div>
+    <div class="gm-body">
+      <h2 id="gmTitle"></h2>
+      <div class="gm-path mono small" id="gmPath"></div>
+      <div class="chips" id="gmChips"></div>
+      <div class="gm-state" id="gmState"></div>
+      <div class="gm-actions" id="gmActions"></div>
+      <div class="gm-links" id="gmLinks"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ установка архива ============ -->
+<div class="modal hidden" id="importModal">
+  <div class="modal-card export">
+    <button class="modal-x" data-close><span class="i" data-icon="x"></span></button>
+    <div class="export-hero">
+      <div class="export-badge"><span class="i" data-icon="package"></span></div>
+      <h2>Установка русификатора</h2>
+      <p id="imInfo"></p>
+    </div>
+    <div class="export-body">
+      <div class="export-field">
+        <span class="muted small">Папка игры</span>
+        <div class="path-pick">
+          <span class="i" data-icon="folder"></span>
+          <span class="mono small grow" id="imGame"></span>
+          <button class="btn ghost sm" id="imPick">Изменить…</button>
+        </div>
+        <span class="small" id="imCheck"></span>
+      </div>
+      <div class="dl hidden" id="imProgress"><div class="bar"><div class="bar-fill"></div></div><div class="dl-text muted"></div></div>
+      <div class="msgs" id="imMsgs"></div>
+    </div>
+    <div class="row gap end export-foot">
+      <button class="btn ghost" data-close>Закрыть</button>
+      <button class="btn primary" id="imGo"><span class="i" data-icon="download"></span>Установить</button>
+    </div>
   </div>
 </div>
 

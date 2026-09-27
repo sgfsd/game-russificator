@@ -400,3 +400,16 @@ def test_delta_roundtrip(tmp_path):
     a.write_bytes(big)
     b.write_bytes(os.urandom(3_000_000))                         # совсем другой файл — патч не нужен
     assert delta.make_patch(a, b, tmp_path / "p2") is None
+
+
+def test_restore_after_game_update_keeps_new_files(mv_game):
+    """Игра обновилась после русификации: откат не должен вернуть старые файлы поверх новых."""
+    _russify(mv_game)
+    f = mv_game / "www/data/Map001.json"
+    f.write_text('{"events": [null], "updated": true}', encoding="utf-8")   # обновление игры
+    os.utime(f, ns=(10**18, 10**18))
+    count, notes = restore_backups(mv_game)
+    assert json.loads(f.read_text(encoding="utf-8"))["updated"] is True
+    assert any("обновилась" in n for n in notes)
+    assert "RU " not in (mv_game / "www/data/Items.json").read_text(encoding="utf-8")   # остальное откатилось
+    assert not (mv_game / BACKUP_DIR).exists()
