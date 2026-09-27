@@ -183,7 +183,8 @@ def check(version: str, work: Path) -> bool:
         install_package(pkg, friend)
     finally:
         pkg.close()
-    (friend / "game" / "zzz_ci_driver.rpy")  # после zz_russificator.rpy.write_text(DRIVER, encoding="utf-8")
+    # после zz_russificator.rpy (тот же приоритет init — порядок по имени файла)
+    (friend / "game" / "zzz_ci_driver.rpy").write_text(DRIVER, encoding="utf-8")
 
     ok = True
     r = renpy(sdk, friend, "lint", timeout=300)
