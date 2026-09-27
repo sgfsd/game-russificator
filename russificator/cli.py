@@ -8,6 +8,9 @@
     russificator models --provider gemini --api-key KEY                 # список моделей
     russificator restore "C:/Games/MyGame"
     russificator play "C:/Games/MyGame"          # игра + живой перевод (Unity)
+    russificator export "C:/Games/MyGame" --out "D:/Русификаторы"   # архив для друзей
+    russificator install "D:/Игра — русификатор.zip" "C:/Games/MyGame"
+    russificator games                           # установленные игры (Steam, GOG, Epic…)
     russificator order
 """
 
@@ -66,6 +69,17 @@ def main(argv=None) -> int:
     p.add_argument("--api-key", default=os.environ.get("RUSSIFICATOR_API_KEY", ""))
     p.add_argument("--base-url", default="")
 
+    p = sub.add_parser("export", help="создать архив-русификатор для друзей (из русифицированной игры)")
+    p.add_argument("game_dir")
+    p.add_argument("--out", default=".", help="куда сохранить архив")
+    p.add_argument("--no-credit", action="store_true", help="без надписи о программе в игре")
+
+    p = sub.add_parser("install", help="установить архив-русификатор в игру")
+    p.add_argument("package", help="архив .zip (или распакованная папка)")
+    p.add_argument("game_dir")
+
+    sub.add_parser("games", help="установленные игры на компьютере")
+
     sub.add_parser("order", help="заказать качественный перевод у автора")
 
     args = parser.parse_args(argv)
@@ -108,6 +122,44 @@ def main(argv=None) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"Не удалось получить список моделей: {exc}")
             return 2
+        return 0
+
+    if args.cmd == "export":
+        from russificator.core.package import PackageError, export_package
+        try:
+            res = export_package(Path(args.game_dir), Path(args.out), credit=not args.no_credit,
+                                 status=lambda m, f=None: print(m))
+        except PackageError as exc:
+            print(f"Ошибка: {exc}")
+            return 2
+        print(f"Готово: {res['path']} ({res['size'] // 1024} КБ)", *res.get("notes", []), sep="\n")
+        return 0
+
+    if args.cmd == "install":
+        from russificator.core.package import PackageError, check_game, install_package, open_package
+        try:
+            pkg = open_package(Path(args.package))
+        except PackageError as exc:
+            print(f"Ошибка: {exc}")
+            return 2
+        try:
+            chk = check_game(pkg, Path(args.game_dir))
+            print(chk.message)
+            if not chk.ok:
+                return 2
+            res = install_package(pkg, Path(args.game_dir), status=lambda m, f=None: print(m))
+            print("Готово.", *res.get("notes", []), sep="\n")
+            return 0
+        except PackageError as exc:
+            print(f"Ошибка: {exc}")
+            return 1
+        finally:
+            pkg.close()
+
+    if args.cmd == "games":
+        from russificator.library import discover
+        for g in discover():
+            print(f"{g.title:40.40}  {g.to_dict()['engine_title']:18.18}  {g.path}")
         return 0
 
     if args.cmd == "order":

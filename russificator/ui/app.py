@@ -355,6 +355,14 @@ class Api:
             })
         return self._run_task("run", work)
 
+    # ---------- обновления ----------
+
+    def check_update(self, force: bool = False) -> Dict[str, Any]:
+        from .. import updates
+        info = updates.check(self._cfg, russificator.__version__, force=bool(force))
+        settings.save(self._cfg)
+        return info
+
     # ---------- живой перевод (оверлей поверх любой игры) ----------
 
     def _live_call(self, path: str, timeout: float = 0.6) -> Optional[Dict[str, Any]]:

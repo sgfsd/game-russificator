@@ -14,6 +14,13 @@
  *  - уменьшает шрифт строки журнала боя, если она шире окна.
  * Пока текст помещается, ничего не меняется. Любая ошибка внутри плагина
  * возвращает стандартное поведение движка.
+ *
+ * Alt+T — показать оригинал реплик и выборов (и обратно, со следующей реплики).
+ *
+ * @param credit
+ * @text Надпись о программе
+ * @desc Строка в углу титульного экрана (только в русификаторах «для друзей»).
+ * @default
  */
 
 (function () {
@@ -199,6 +206,70 @@
                 // надпись необязательна
             }
         };
+    }
+
+    // ---------- Alt+T: перевод / оригинал ----------
+
+    var ORIG = null, SHOW_ORIG = false;
+    try {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', 'js/plugins/Russificator_orig.json');
+        xhr.overrideMimeType('application/json');
+        xhr.onload = function () {
+            if (xhr.status < 400) {
+                try { ORIG = JSON.parse(xhr.responseText); } catch (e) { ORIG = null; }
+            }
+        };
+        xhr.onerror = function () { ORIG = null; };
+        xhr.send();
+    } catch (e) {
+        ORIG = null;
+    }
+
+    function orig(map, s) {
+        return SHOW_ORIG && ORIG && ORIG[map] && Object.prototype.hasOwnProperty.call(ORIG[map], s) ? ORIG[map][s] : s;
+    }
+
+    if (typeof Game_Message !== 'undefined') {
+        var _allText = Game_Message.prototype.allText;
+        Game_Message.prototype.allText = function () {
+            var t = _allText.apply(this, arguments);
+            try { return orig('m', t); } catch (e) { return t; }
+        };
+        var _choices = Game_Message.prototype.choices;
+        Game_Message.prototype.choices = function () {
+            var c = _choices.apply(this, arguments);
+            try { return SHOW_ORIG && c && c.map ? c.map(function (s) { return orig('c', s); }) : c; } catch (e) { return c; }
+        };
+    }
+
+    function toast(text) {
+        try {
+            var el = document.getElementById('russificator-toast');
+            if (!el) {
+                el = document.createElement('div');
+                el.id = 'russificator-toast';
+                el.style.cssText = 'position:fixed;top:12px;right:12px;z-index:99999;padding:8px 14px;border-radius:8px;' +
+                    'background:rgba(14,16,24,.88);color:#f5f6fa;font:14px sans-serif;pointer-events:none;transition:opacity .4s';
+                document.body.appendChild(el);
+            }
+            el.textContent = text;
+            el.style.opacity = '1';
+            clearTimeout(el._t);
+            el._t = setTimeout(function () { el.style.opacity = '0'; }, 1800);
+        } catch (e) {
+            // без подсказки
+        }
+    }
+
+    if (typeof document !== 'undefined') {
+        document.addEventListener('keydown', function (e) {
+            if (e.altKey && !e.ctrlKey && e.keyCode === 84) {
+                SHOW_ORIG = !SHOW_ORIG;
+                toast(SHOW_ORIG ? 'Оригинал · Alt+T — перевод' : 'Перевод · Alt+T — оригинал');
+                e.preventDefault();
+            }
+        });
     }
 
     if (typeof Window_BattleLog !== 'undefined') {

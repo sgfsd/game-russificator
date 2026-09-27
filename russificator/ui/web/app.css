@@ -492,3 +492,10 @@ kbd { display: inline-block; min-width: 26px; text-align: center; padding: 3px 7
 .feed-item { padding: 9px 12px; border-radius: var(--radius-sm); background: var(--bg-2); border: 1px solid var(--border); font-size: 13px; }
 .feed-item .src { color: var(--faint); font-size: 12px; margin-bottom: 2px; }
 .tips ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; display: flex; flex-direction: column; gap: 6px; }
+
+/* ---------- обновление ---------- */
+.update-cta { display: flex; gap: 12px; align-items: center; text-align: left; cursor: pointer; padding: 12px 14px; border-radius: var(--radius);
+  border: 1px solid rgba(94, 234, 212, .4); background: linear-gradient(135deg, rgba(94, 234, 212, .14), rgba(139, 123, 255, .10)); transition: .2s; }
+.update-cta:hover { transform: translateY(-1px); box-shadow: 0 8px 22px rgba(94, 234, 212, .15); }
+.update-cta .i { width: 20px; height: 20px; color: #5eead4; }
+.update-cta small { display: block; color: var(--muted); font-size: 12px; }

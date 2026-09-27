@@ -240,7 +240,32 @@ def version_of(game_root: Path) -> str:
     return "mz" if (base / "js" / "rmmz_core.js").is_file() else "mv"
 
 
+#: оригиналы переведённых реплик и выборов — для Alt+T в игре (перевод / оригинал)
+ORIG_FILE = "Russificator_orig.json"
+
+
 def inject(game_root: Path, project, version: Optional[str] = None) -> Tuple[int, List[str]]:
+    count, warnings = _inject(game_root, project, version)
+    _write_originals(game_root, project.backup)
+    return count, warnings
+
+
+_orig: Dict[str, Dict[str, str]] = {"m": {}, "c": {}}
+
+
+def _write_originals(game_root: Path, backup) -> None:
+    """js/plugins/Russificator_orig.json: переведённая реплика -> оригинал (плагин показывает его по Alt+T)."""
+    base = game_root / "www" if (game_root / "www").is_dir() else game_root
+    plugins = base / "js" / "plugins"
+    data = {"m": dict(_orig["m"]), "c": dict(_orig["c"])}
+    _orig["m"].clear()
+    _orig["c"].clear()
+    if not plugins.is_dir() or not (data["m"] or data["c"]):
+        return
+    backup.write_text(plugins / ORIG_FILE, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+
+
+def _inject(game_root: Path, project, version: Optional[str] = None) -> Tuple[int, List[str]]:
     ddir = data_dir(game_root)
     box = layout.box_for(version or version_of(game_root), game_root)
     warnings: List[str] = []
@@ -324,6 +349,8 @@ def _apply_list(cmds: List[Any], prefix: str, keys: Dict[str, Entry],
                 english = max(layout.text_width(str((b.get("parameters") or [""])[0]), box) for b in block)
                 lines = layout.wrap(e.translation, box, face=code == 101 and bool((e.notes or {}).get("face")),
                                     scroll=code == 105, min_width=english)
+                if code == 101 and len(_orig["m"]) < 200000:
+                    _orig["m"]["\n".join(lines)] = "\n".join(str((b.get("parameters") or [""])[0]) for b in block)
                 for line in lines:
                     new = dict(block[0])
                     new["parameters"] = [line]
@@ -337,6 +364,8 @@ def _apply_list(cmds: List[Any], prefix: str, keys: Dict[str, Entry],
             for k in range(len(params[0])):
                 e = keys.get(f"{prefix}|c{i}|choice{k}")
                 if e is not None:
+                    if isinstance(params[0][k], str) and len(_orig["c"]) < 50000:
+                        _orig["c"][e.translation] = params[0][k]
                     params[0][k] = e.translation
                     count += 1
         elif code in (320, 324, 325):

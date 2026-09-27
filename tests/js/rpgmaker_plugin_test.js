@@ -201,4 +201,50 @@ lzb.drawLineText(0);
 var rz = Math.max.apply(null, lzb.drawn.map(function (d) { return d.x + d.w; }));
 assert.ok(rz <= 300 + 0.01, 'MZ: строка боя в окне, ' + rz);
 
+// --- Alt+T: оригинал реплик и выборов; надпись о программе на титульном экране ---
+(function () {
+    var g = makeMV();
+    var handlers = [];
+    g.document = { addEventListener: function (t, fn) { if (t === 'keydown') handlers.push(fn); },
+                   getElementById: function () { return null; },
+                   createElement: function () { return { style: {} }; }, body: { appendChild: function () {} } };
+    g.setTimeout = function () { return 0; };
+    g.clearTimeout = function () {};
+    g.XMLHttpRequest = function () {};
+    g.XMLHttpRequest.prototype.open = function () {};
+    g.XMLHttpRequest.prototype.overrideMimeType = function () {};
+    g.XMLHttpRequest.prototype.send = function () {
+        this.status = 200;
+        this.responseText = JSON.stringify({ m: { 'Привет,\nпутник!': 'Hello,\ntraveler!' }, c: { 'Да': 'Yes' } });
+        this.onload();
+    };
+    function Game_Message() { this._texts = ['Привет,', 'путник!']; this._choices = ['Да', 'Нет']; }
+    Game_Message.prototype.allText = function () { return this._texts.join('\n'); };
+    Game_Message.prototype.choices = function () { return this._choices; };
+    g.Game_Message = Game_Message;
+    var drawn = [];
+    function Bitmap2(w, h) { this.width = w; this.height = h; }
+    Bitmap2.prototype.drawText = function (t) { drawn.push(t); };
+    g.Bitmap = Bitmap2;
+    g.Sprite = function (b) { this.bitmap = b; };
+    g.Graphics = { width: 816, height: 624 };
+    function Scene_Title() { this.children = []; }
+    Scene_Title.prototype.create = function () {};
+    Scene_Title.prototype.addChild = function (c) { this.children.push(c); };
+    g.Scene_Title = Scene_Title;
+    g.PluginManager = { parameters: function () { return { credit: 'Автоперевод: Русификатор игр' }; } };
+    load(g);
+    var msg = new g.Game_Message();
+    assert.strictEqual(msg.allText(), 'Привет,\nпутник!', 'по умолчанию — перевод');
+    handlers[0]({ altKey: true, ctrlKey: false, keyCode: 84, preventDefault: function () {} });
+    assert.strictEqual(msg.allText(), 'Hello,\ntraveler!', 'Alt+T — оригинал реплики');
+    assert.deepStrictEqual(msg.choices(), ['Yes', 'Нет'], 'Alt+T — оригинал выборов');
+    handlers[0]({ altKey: true, ctrlKey: false, keyCode: 84, preventDefault: function () {} });
+    assert.strictEqual(msg.allText(), 'Привет,\nпутник!', 'снова перевод');
+    var title = new g.Scene_Title();
+    title.create();
+    assert.strictEqual(title.children.length, 1, 'надпись добавлена на титульный экран');
+    assert.deepStrictEqual(drawn, ['Автоперевод: Русификатор игр']);
+})();
+
 console.log('OK');

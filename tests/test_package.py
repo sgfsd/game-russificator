@@ -413,3 +413,14 @@ def test_restore_after_game_update_keeps_new_files(mv_game):
     assert any("обновилась" in n for n in notes)
     assert "RU " not in (mv_game / "www/data/Items.json").read_text(encoding="utf-8")   # остальное откатилось
     assert not (mv_game / BACKUP_DIR).exists()
+
+
+def test_mv_originals_for_alt_t(mv_game):
+    """Для Alt+T в игре: переведённая реплика -> оригинальные строки, выбор -> оригинал."""
+    _russify(mv_game)
+    data = json.loads((mv_game / "www/js/plugins/Russificator_orig.json").read_text(encoding="utf-8"))
+    (tr, orig), = data["m"].items()
+    assert tr.startswith("RU Hello there") and orig == "Hello there, traveler! Welcome to the quiet village."
+    assert data["c"] == {"RU Yes": "Yes", "RU No": "No"}
+    restore_backups(mv_game)
+    assert not (mv_game / "www/js/plugins/Russificator_orig.json").exists()

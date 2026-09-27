@@ -31,6 +31,10 @@
     </nav>
 
     <div class="sidebar-foot">
+      <button class="update-cta hidden" id="updateCta" title="Открыть страницу релиза">
+        <span class="i" data-icon="download"></span>
+        <span><b id="updateTitle">Вышла новая версия</b><small id="updateSub">скачать с GitHub</small></span>
+      </button>
       <button class="order-cta" id="orderCta">
         <span class="i" data-icon="pen"></span>
         <span><b>Заказать перевод</b><small>ручная работа от автора</small></span>
@@ -433,6 +437,14 @@
           <div class="grow"><b>Своя модель GGUF</b><div class="muted small">Для опытных: любая модель llama.cpp вместо Gemma 4 в режиме «Нейросеть на ПК».</div>
             <div class="mono small path" id="setGguf"></div></div>
           <div class="row gap"><button class="btn ghost" id="setGgufReset">Не использовать</button><button class="btn" id="setGgufPick">Выбрать…</button></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="setting">
+          <div class="grow"><b>Проверять обновления</b><div class="muted small" id="updInfo">Раз в 12 часов программа
+            смотрит, не вышла ли новая версия на GitHub. Сама ничего не скачивает.</div></div>
+          <div class="row gap"><button class="btn ghost sm" id="updCheck"><span class="i" data-icon="refresh"></span>Проверить сейчас</button>
+            <label class="switch"><input type="checkbox" id="setUpdates"><span></span></label></div>
         </div>
       </div>
       <div class="card about">

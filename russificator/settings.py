@@ -44,6 +44,9 @@ DEFAULTS: Dict[str, Any] = {
     "live_always": [],               # exe, которые переводить всегда
     "live_never": [],                # exe, которые не переводить никогда
     "live_profiles": {},             # exe -> {"region": [x, y, w, h] доли окна}
+    "check_updates": True,           # раз в 12 часов проверять новую версию на GitHub
+    "update_checked_at": 0,
+    "update_latest": {},
 }
 
 

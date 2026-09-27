@@ -98,6 +98,23 @@ async function boot() {
   if (st.game_dir) detectGame(st.game_dir, true);
   updateRunState();
   api().overlay_status().then((x) => { S.liveSt = x; $("#navLiveDot").classList.toggle("hidden", !x.running); });
+  setTimeout(() => checkUpdate(false), 2500);
+}
+
+async function checkUpdate(force) {
+  const u = await api().check_update(!!force);
+  S.update = u;
+  $("#updateCta").classList.toggle("hidden", !u.available);
+  if (u.available) {
+    $("#updateTitle").textContent = `Вышла версия ${u.version}`;
+    $("#updateSub").textContent = "скачать с GitHub";
+  }
+  const info = $("#updInfo");
+  if (force) {
+    info.textContent = u.error ? "Не удалось проверить: нет связи с GitHub." : u.available
+      ? `Доступна версия ${u.version} (у вас ${u.current}).` : `У вас последняя версия (${u.current}).`;
+    if (u.available) toast(`Вышла версия ${u.version}`);
+  }
 }
 
 /* ---------------- навигация ---------------- */
@@ -276,6 +293,9 @@ function bindUi() {
     if (f) { await api().save_settings({ local_custom_model: f }); S.init.settings.local_custom_model = f; fillSettings(); renderPresets(); }
   });
   $("#setGgufReset").addEventListener("click", async () => { await api().save_settings({ local_custom_model: "" }); S.init.settings.local_custom_model = ""; fillSettings(); renderPresets(); });
+  $("#updateCta").addEventListener("click", () => S.update && api().open_url(S.update.url));
+  $("#updCheck").addEventListener("click", () => checkUpdate(true));
+  $("#setUpdates").addEventListener("change", (e) => api().save_settings({ check_updates: e.target.checked }));
   $("#setThreads").addEventListener("change", (e) => api().save_settings({ threads: Math.max(0, +e.target.value || 0) }));
   $("#setParallel").addEventListener("change", (e) => api().save_settings({ cloud_parallel: Math.min(16, Math.max(1, +e.target.value || 4)) }));
 }
@@ -729,6 +749,7 @@ function fillSettings() {
   $("#setThreads").value = st.threads || 0;
   $("#setParallel").value = st.cloud_parallel || 4;
   $("#setGguf").textContent = st.local_custom_model || "Не используется — Gemma 4 из списка моделей";
+  $("#setUpdates").checked = st.check_updates !== false;
 }
 
 /* ---------------- откат ---------------- */
