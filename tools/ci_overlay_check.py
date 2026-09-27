@@ -96,6 +96,11 @@ def check_windows() -> bool:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):     # консоль CI в cp1252 — русские сообщения не должны ронять проверку
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
     if sys.platform != "win32":
         print("только для Windows")
         return 0

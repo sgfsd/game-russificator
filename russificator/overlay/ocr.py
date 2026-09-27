@@ -53,6 +53,10 @@ class Ocr:
 # ------------------------------------------------------------------ pythonnet
 
 class DotNetOcr(Ocr):
+    """WinRT через pythonnet. Объекты WinRT приходят как ``__ComObject`` — у них нет атрибутов
+    и итерации в Python, поэтому всё читается отражением через известные типы и интерфейсы
+    (коллекции WinRT CLR показывает как ``IReadOnlyList<T>``)."""
+
     name = "pythonnet"
 
     def __init__(self, lang: str = "en"):
@@ -62,9 +66,10 @@ class DotNetOcr(Ocr):
             raise OcrUnavailable("winrt", f"pythonnet недоступен: {exc}") from exc
         import clr
         clr.AddReference("System.Runtime.WindowsRuntime")
-        from System import Activator, Array, Byte, Enum, IntPtr, Type  # type: ignore
+        from System import Activator, Array, Byte, Enum, Int32, IntPtr, Object, Type  # type: ignore
         from System.Runtime.InteropServices import Marshal  # type: ignore
         self._Array, self._Byte, self._Enum, self._IntPtr, self._Marshal = Array, Byte, Enum, IntPtr, Marshal
+        self._Object, self._Int32 = Object, Int32
 
         def wrt(name: str, *asms: str):
             for a in asms:
@@ -73,13 +78,21 @@ class DotNetOcr(Ocr):
                     return t
             raise OcrUnavailable("winrt", f"тип WinRT не найден: {name}")
 
-        self.Engine = wrt("Windows.Media.Ocr.OcrEngine", "Windows.Foundation", "Windows.Media", "Windows")
-        result_t = wrt("Windows.Media.Ocr.OcrResult", "Windows.Foundation", "Windows.Media", "Windows")
-        self.Bitmap = wrt("Windows.Graphics.Imaging.SoftwareBitmap", "Windows.Graphics", "Windows.Foundation", "Windows")
-        self.PixelFormat = wrt("Windows.Graphics.Imaging.BitmapPixelFormat", "Windows.Graphics",
-                               "Windows.Foundation", "Windows")
-        self.AlphaMode = wrt("Windows.Graphics.Imaging.BitmapAlphaMode", "Windows.Graphics", "Windows.Foundation",
-                             "Windows")
+        media = ("Windows.Foundation", "Windows.Media", "Windows")
+        graphics = ("Windows.Graphics", "Windows.Foundation", "Windows")
+        self.Engine = wrt("Windows.Media.Ocr.OcrEngine", *media)
+        result_t = wrt("Windows.Media.Ocr.OcrResult", *media)
+        self._line_t = wrt("Windows.Media.Ocr.OcrLine", *media)
+        self._word_t = wrt("Windows.Media.Ocr.OcrWord", *media)
+        lang_t = wrt("Windows.Globalization.Language", "Windows.Globalization", "Windows.Foundation", "Windows")
+        self.Bitmap = wrt("Windows.Graphics.Imaging.SoftwareBitmap", *graphics)
+        self.PixelFormat = wrt("Windows.Graphics.Imaging.BitmapPixelFormat", *graphics)
+        self.AlphaMode = wrt("Windows.Graphics.Imaging.BitmapAlphaMode", *graphics)
+        self._ro_list = Type.GetType("System.Collections.Generic.IReadOnlyList`1")
+        self._ro_coll = Type.GetType("System.Collections.Generic.IReadOnlyCollection`1")
+        self._disposable = Type.GetType("System.IDisposable")
+        if self._ro_list is None or self._ro_coll is None:
+            raise OcrUnavailable("winrt", "IReadOnlyList не найден")
         rt = "System.Runtime.WindowsRuntime, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
         ext = Type.GetType(f"System.WindowsRuntimeSystemExtensions, {rt}")
         bufext = Type.GetType(f"System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions, {rt}")
@@ -97,14 +110,35 @@ class DotNetOcr(Ocr):
             raise OcrUnavailable("winrt", "SoftwareBitmap.CreateCopyFromBuffer не найден")
         self._create = creates[0]
         self._recognize = self.Engine.GetMethod("RecognizeAsync")
-        langs = list(self.Engine.GetProperty("AvailableRecognizerLanguages").GetValue(None, None))
-        pick = next((x for x in langs if str(x.LanguageTag).lower().startswith(lang.lower())), None)
+        self._lines_p = result_t.GetProperty("Lines")
+        self._words_p = self._line_t.GetProperty("Words")
+        self._text_p = self._line_t.GetProperty("Text")
+        self._rect_p = self._word_t.GetProperty("BoundingRect")
+        tag_p = lang_t.GetProperty("LanguageTag")
+
+        # язык: сначала напрямую (en-US, en-GB…), затем среди установленных
+        supported = self.Engine.GetMethod("IsLanguageSupported")
+        pick = None
+        for tag in ([lang] if "-" in lang else []) + [f"{lang}-US", f"{lang}-GB", lang]:
+            try:
+                cand = Activator.CreateInstance(lang_t, Array[Object]([tag]))
+                if bool(supported.Invoke(None, Array[Object]([cand]))):
+                    pick = cand
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        if pick is None:
+            try:
+                langs = self._items(self.Engine.GetProperty("AvailableRecognizerLanguages").GetValue(None, None), lang_t)
+                pick = next((x for x in langs if str(tag_p.GetValue(x, None)).lower().startswith(lang.lower())), None)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("список языков распознавания: %s", exc)
         if pick is None:
             raise OcrUnavailable("no_language", "распознавание английского не установлено в Windows")
-        self.engine = self.Engine.GetMethod("TryCreateFromLanguage").Invoke(None, [pick])
+        self.engine = self.Engine.GetMethod("TryCreateFromLanguage").Invoke(None, Array[Object]([pick]))
         if self.engine is None:
             raise OcrUnavailable("no_language", "распознавание английского не установлено в Windows")
-        self.lang = str(pick.LanguageTag)
+        self.lang = str(tag_p.GetValue(pick, None))
         try:
             self.max_dim = int(self.Engine.GetProperty("MaxImageDimension").GetValue(None, None))
         except Exception:  # noqa: BLE001
@@ -113,37 +147,53 @@ class DotNetOcr(Ocr):
         self._alpha = self._Enum.ToObject(self.AlphaMode, 2)       # Ignore
         self._lock = threading.Lock()
 
+    def _items(self, vector, elem_t) -> list:
+        """Элементы коллекции WinRT (IVectorView<T>) через IReadOnlyList<T>."""
+        if vector is None:
+            return []
+        count = int(self._ro_coll.MakeGenericType(elem_t).GetProperty("Count").GetValue(vector, None))
+        item = self._ro_list.MakeGenericType(elem_t).GetProperty("Item")
+        return [item.GetValue(vector, self._Array[self._Object]([self._Int32(i)])) for i in range(count)]
+
+    def _dispose(self, obj) -> None:
+        try:
+            if obj is not None and self._disposable is not None:
+                self._disposable.GetMethod("Dispose").Invoke(obj, None)     # IClosable.Close()
+        except Exception:  # noqa: BLE001
+            pass
+
     def recognize(self, w: int, h: int, bgra: bytes) -> List[Line]:
         n = w * h * 4
         with self._lock:
             raw = (ctypes.c_char * n).from_buffer_copy(bgra[:n])
             arr = self._Array.CreateInstance(self._Byte, n)
             self._Marshal.Copy(self._IntPtr(ctypes.addressof(raw)), arr, 0, n)
-            buf = self._as_buffer.Invoke(None, [arr])
-            bmp = self._create.Invoke(None, [buf, self._fmt, w, h, self._alpha])
+            buf = self._as_buffer.Invoke(None, self._Array[self._Object]([arr]))
+            bmp = self._create.Invoke(None, self._Array[self._Object](
+                [buf, self._fmt, self._Int32(w), self._Int32(h), self._alpha]))
             try:
-                op = self._recognize.Invoke(self.engine, [bmp])
-                task = self._as_task.Invoke(None, [op])
-                task.Wait(15000)
-                result = task.Result
+                op = self._recognize.Invoke(self.engine, self._Array[self._Object]([bmp]))
+                task = self._as_task.Invoke(None, self._Array[self._Object]([op]))
+                if not task.Wait(15000):
+                    raise RuntimeError("распознавание не ответило за 15 с")
+                result = task.GetType().GetProperty("Result").GetValue(task, None)
                 out: List[Line] = []
-                for line in result.Lines:
+                for line in self._items(self._lines_p.GetValue(result, None), self._line_t):
                     xs, ys, xe, ye = [], [], [], []
-                    for word in line.Words:
-                        r = word.BoundingRect
-                        xs.append(float(r.X))
-                        ys.append(float(r.Y))
-                        xe.append(float(r.X) + float(r.Width))
-                        ye.append(float(r.Y) + float(r.Height))
+                    for word in self._items(self._words_p.GetValue(line, None), self._word_t):
+                        r = self._rect_p.GetValue(word, None)
+                        x, y = float(r.X), float(r.Y)
+                        xs.append(x)
+                        ys.append(y)
+                        xe.append(x + float(r.Width))
+                        ye.append(y + float(r.Height))
                     if xs:
                         x0, y0 = int(min(xs)), int(min(ys))
-                        out.append(Line(str(line.Text), x0, y0, int(max(xe)) - x0, int(max(ye)) - y0))
+                        out.append(Line(str(self._text_p.GetValue(line, None)), x0, y0,
+                                        int(max(xe)) - x0, int(max(ye)) - y0))
                 return out
             finally:
-                try:
-                    bmp.Dispose()
-                except Exception:  # noqa: BLE001
-                    pass
+                self._dispose(bmp)
 
 
 # ------------------------------------------------------------------ PowerShell

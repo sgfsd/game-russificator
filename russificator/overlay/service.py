@@ -322,10 +322,10 @@ class LiveService:
         self.target_reason = reason
         self.tracker = Tracker()
         self._shown_sig = self._frame_sig = ""
-        # в играх с XUnity (русифицированы файлами) Alt+T уже занят — там он переключает перевод игры
-        game_dir = self._decider.game_dir(fg.exe) or str(Path(fg.exe).parent)
-        xunity = (Path(game_dir) / "BepInEx" / "plugins" / "XUnity.AutoTranslator").is_dir()
-        keys = [HOTKEYS["now"], HOTKEYS["region"]] + ([] if xunity else [HOTKEYS["toggle"]])
+        # в играх, русифицированных файлами, Alt+T уже занят самой игрой (переключает перевод/оригинал) —
+        # глобальная клавиша оверлея его бы перехватила
+        own = self._russified(fg.exe)
+        keys = [HOTKEYS["now"], HOTKEYS["region"]] + ([] if own else [HOTKEYS["toggle"]])
         self._black = 0
         self._picture = False
         self.hint = ""
@@ -335,6 +335,18 @@ class LiveService:
         if fg.exe not in self._announced:
             self._announced.add(fg.exe)
             log.info("игра: %s (%s) — %s", name, fg.exe, reason)
+
+    def _russified(self, exe: str) -> bool:
+        """Игра русифицирована программой (или в ней XUnity): папка игры — выше exe на 0–3 уровня."""
+        from ..core.backup import BACKUP_DIR
+        dirs = [self._decider.game_dir(exe)] + [str(p) for p in list(Path(exe).parents)[:4]]
+        for d in dirs:
+            if not d:
+                continue
+            root = Path(d)
+            if (root / BACKUP_DIR).is_dir() or (root / "BepInEx" / "plugins" / "XUnity.AutoTranslator").is_dir():
+                return True
+        return False
 
     def _drop_target(self) -> None:
         if self.target is not None:

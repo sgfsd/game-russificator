@@ -261,6 +261,27 @@ def test_live_black_frame_hint(tmp_path, monkeypatch):
     assert svc.status()["hint"] == ""
 
 
+def test_live_leaves_alt_t_to_russified_games(tmp_path, monkeypatch):
+    """В игре, русифицированной файлами, Alt+T переключает перевод в самой игре — оверлей его не занимает."""
+    monkeypatch.setenv("RUSSIFICATOR_HOME", str(tmp_path / "home"))
+    from russificator import paths
+    paths.set_home(None)
+    from russificator.overlay import service, win32
+    game = tmp_path / "VN"
+    (game / "russificator_backup").mkdir(parents=True)
+    (game / "lib" / "py3-windows-x86_64").mkdir(parents=True)
+    exe = str(game / "lib" / "py3-windows-x86_64" / "VN.exe")
+    fg = win32.WindowInfo(hwnd=7, pid=70, exe=exe, title="VN", client=(0, 0, 640, 360), window=(0, 0, 640, 360),
+                          monitor=(0, 0, 640, 360), minimized=False)
+    monkeypatch.setattr(win32, "foreground", lambda: fg)
+    monkeypatch.setattr(win32, "capture", lambda x, y, w, h: bytes(w * h * 4))
+    svc = service.LiveService(quiet=True)
+    svc.gui = _FakeGui()
+    svc.ocr = _FakeOcr([])
+    svc._tick()
+    assert svc.target is not None and "toggle" not in svc.gui.keys and "now" in svc.gui.keys
+
+
 def test_live_ocr_downscale_for_huge_frames(tmp_path, monkeypatch):
     pytest.importorskip("PIL")
     monkeypatch.setenv("RUSSIFICATOR_HOME", str(tmp_path / "home"))

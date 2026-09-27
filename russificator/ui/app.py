@@ -405,8 +405,9 @@ class Api:
         st["windows"] = sys.platform == "win32"
         return st
 
-    def overlay_start(self) -> Dict[str, Any]:
-        """Включить живой перевод: запустить процесс оверлея (он живёт в трее)."""
+    def overlay_start(self, quiet: bool = False) -> Dict[str, Any]:
+        """Включить живой перевод: запустить процесс оверлея (он живёт в трее).
+        ``quiet`` — без всплывающей подсказки в трее (запуск вместе с программой)."""
         from ..core import launcher
         self._cfg["live_enabled"] = True
         settings.save(self._cfg)
@@ -416,7 +417,7 @@ class Api:
             return {"ok": False, "error": "Живой перевод работает только в Windows."}
         exe, args, workdir = launcher._program()
         try:
-            subprocess.Popen([exe, *args, "--overlay"], cwd=workdir,
+            subprocess.Popen([exe, *args, "--overlay"] + (["--quiet"] if quiet else []), cwd=workdir,
                              creationflags=getattr(subprocess, "DETACHED_PROCESS", 0) | 0x08000000)
         except OSError as exc:
             return {"ok": False, "error": f"Не удалось запустить живой перевод: {exc}"}
@@ -876,7 +877,7 @@ def run(argv=None) -> int:
 
     window.events.closing += on_closing
     if api._cfg.get("live_enabled"):            # живой перевод был включён — поднимаем его вместе с программой
-        threading.Thread(target=api.overlay_start, daemon=True).start()
+        threading.Thread(target=api.overlay_start, kwargs={"quiet": True}, daemon=True).start()
     webview.start(debug=bool(os.environ.get("RUSSIFICATOR_DEBUG")), http_server=True,
                   storage_path=str(paths.sub("webview")), private_mode=False)
     return 0
