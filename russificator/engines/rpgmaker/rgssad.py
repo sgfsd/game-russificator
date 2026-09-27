@@ -43,12 +43,60 @@ def _decrypt_data(data: bytes, key: int) -> bytes:
     return bytes(out)
 
 
+_LANES = 1 << 16          # ключей в одном «пакете» длинной арифметики
+
+
+def _xor_bigint(data: bytes, key: int) -> bytes:
+    """XOR потока ключей без numpy: ключи считаются пакетами в длинных целых.
+
+    Пакет — 65536 ключей, каждый в своей 64-битной «дорожке» одного большого
+    int. Следующий пакет получается из текущего тем же аффинным шагом для всех
+    дорожек сразу: k[i+N] = A·k[i] + B (mod 2^32), A = 7^N, B = 3·(1+7+…+7^(N-1)).
+    Умножение, сложение и маска над большим int идут на C — это в десятки раз
+    быстрее побайтового цикла (важно для установщика, где numpy нет).
+    """
+    n = len(data)
+    if n == 0:
+        return b""
+    words = (n + 3) // 4
+    lanes = min(_LANES, words)
+    ks, k = [], key & MASK
+    for _ in range(lanes):
+        ks.append(k)
+        k = (k * 7 + 3) & MASK
+    pack = bytearray(8 * lanes)
+    for i, v in enumerate(ks):
+        pack[8 * i:8 * i + 4] = v.to_bytes(4, "little")
+    cur = int.from_bytes(bytes(pack), "little")
+    a = pow(7, lanes, 1 << 32)
+    b = 0
+    for i in range(lanes):                   # b = 3·(7^0 + … + 7^(N-1)) mod 2^32
+        b = (b * 7 + 3) & MASK
+    lane_mask = int.from_bytes(b"\xff\xff\xff\xff\0\0\0\0" * lanes, "little")
+    ones = int.from_bytes((b"\1" + b"\0" * 7) * lanes, "little")
+    lane_b = b * ones
+    out = bytearray(n)
+    pos = 0
+    chunk_bytes = 4 * lanes
+    while pos < n:
+        raw = cur.to_bytes(8 * lanes, "little")
+        stream = bytearray(4 * lanes)
+        for j in range(4):
+            stream[j::4] = raw[j::8]
+        take = min(chunk_bytes, n - pos)
+        x = int.from_bytes(data[pos:pos + take], "little") ^ int.from_bytes(stream[:take], "little")
+        out[pos:pos + take] = x.to_bytes(take, "little")
+        pos += take
+        cur = (cur * a + lane_b) & lane_mask
+    return bytes(out)
+
+
 def _xor_block(data: bytes, key: int) -> bytes:
-    """Быстрый XOR потока 4-байтных ключей (numpy, если есть)."""
+    """Быстрый XOR потока 4-байтных ключей (numpy, если есть; иначе длинная арифметика)."""
     try:
         import numpy as np
     except ImportError:
-        return _decrypt_data(data, key)
+        return _xor_bigint(data, key)
     n = len(data)
     if n == 0:
         return b""

@@ -427,7 +427,7 @@ def _apply_system(data: Dict[str, Any], keys: Dict[str, Entry]) -> int:
 RUNTIME_PLUGIN = "Russificator"
 
 
-def install_runtime(game_root: Path, backup) -> bool:
+def install_runtime(game_root: Path, backup, credit: str = "") -> bool:
     """Положить js/plugins/Russificator.js и включить его последним в js/plugins.js.
 
     Плагин (resources/rpgmaker/Russificator.js) переносит слова, которые не
@@ -447,7 +447,7 @@ def install_runtime(game_root: Path, backup) -> bool:
     plugins = [p for p in plugins if not (isinstance(p, dict) and p.get("name") == RUNTIME_PLUGIN)]
     plugins.append({"name": RUNTIME_PLUGIN, "status": True,
                     "description": "Русификатор: перенос слов и подгонка шрифта под русский текст.",
-                    "parameters": {}})
+                    "parameters": {"credit": credit or ""}})
     dest = base / "js" / "plugins" / f"{RUNTIME_PLUGIN}.js"
     dest.parent.mkdir(parents=True, exist_ok=True)
     backup.write_bytes(dest, src.read_bytes())

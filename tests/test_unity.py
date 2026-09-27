@@ -84,9 +84,10 @@ def test_il2cpp_literals_encrypted_is_empty(tmp_path):
 
 
 def test_dotnet_user_strings_from_real_assembly():
-    """Любая настоящая .NET-сборка из окружения (pythonnet кладёт Python.Runtime.dll)."""
+    """Настоящая .NET-сборка: наш плагин для Unity (или Python.Runtime.dll из pythonnet)."""
     import sys
-    candidates = list(Path(sys.prefix).rglob("Python.Runtime.dll"))
+    plugin = Path(__file__).resolve().parents[1] / "russificator" / "resources" / "unity" / "Russificator.Unity.dll"
+    candidates = [plugin] if plugin.is_file() else list(Path(sys.prefix).rglob("Python.Runtime.dll"))
     if not candidates:
         pytest.skip("нет .NET-сборки для проверки")
     strings = extract.dotnet_user_strings(candidates[0])

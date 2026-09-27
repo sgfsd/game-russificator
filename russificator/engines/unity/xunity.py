@@ -128,15 +128,52 @@ def plugin_installed(game: UnityGame) -> bool:
     return (game.root / "BepInEx" / "plugins" / PLUGIN).is_file()
 
 
-def write_plugin_config(game: UnityGame, backup, server: Optional[tuple], fit: bool = True) -> None:
-    """Настройки плагина: как запустить сервер живого перевода (exe, аргументы с {pid}, папка)."""
+def plugin_config_text(server: Optional[tuple], fit: bool = True, credit: str = "") -> str:
+    """Настройки плагина: как запустить сервер живого перевода и надпись о программе."""
     lines = ["# Русификатор игр: настройки плагина Russificator.Unity (пишет программа при русификации).",
-             "# server/args — чем запустить живой перевод, когда игра стартует без программы.",
+             "# server/args — чем запустить живой перевод, когда игра стартует без программы;",
+             "# credit — надпись о программе при запуске игры (только в русификаторах «для друзей»).",
              f"port={LIVE_PORT}", f"fit={'true' if fit else 'false'}"]
     if server:
         exe, args, workdir = server
         lines += [f"server={exe}", f"args={args}", f"workdir={workdir}"]
-    backup.write_text(game.root / PLUGIN_CONFIG, "\n".join(lines) + "\n")
+    if credit:
+        lines.append("credit=" + credit.replace("\n", " "))
+    return "\n".join(lines) + "\n"
+
+
+def write_plugin_config(game: UnityGame, backup, server: Optional[tuple], fit: bool = True) -> None:
+    backup.write_text(game.root / PLUGIN_CONFIG, plugin_config_text(server, fit))
+
+
+def config_for_friends(ini: str, tmp_font: Optional[str]) -> str:
+    """AutoTranslatorConfig.ini для архива: без обращения к серверу программы (у друга её нет)."""
+    ini = re.sub(r"(?m)^Endpoint=.*$", "Endpoint=", ini)
+    if tmp_font:
+        if re.search(r"(?m)^FallbackFontTextMeshPro=", ini):
+            ini = re.sub(r"(?m)^FallbackFontTextMeshPro=.*$", f"FallbackFontTextMeshPro={tmp_font}", ini)
+        else:
+            ini = ini.replace("[Behaviour]\n", f"[Behaviour]\nFallbackFontTextMeshPro={tmp_font}\n", 1)
+    return ini
+
+
+def tmp_font_file(game: UnityGame, status: StatusFn = _noop, cancel=None) -> Optional[Path]:
+    """Готовый TMP-шрифт XUnity для версии Unity игры — файлом (для архива), или None."""
+    name = tmp_font_bundle(game)
+    if name is None:
+        return None
+    dest = paths.sub("tmp") / "tmp_fonts" / name
+    if dest.is_file():
+        return dest
+    archive = _cached(TMP_FONTS_URL, status, cancel)
+    with zipfile.ZipFile(archive) as z:
+        member = next((n for n in z.namelist() if Path(n).name == name), None)
+        if member is None:
+            return None
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with z.open(member) as src, dest.open("wb") as out:
+            shutil.copyfileobj(src, out)
+    return dest
 
 
 def _unzip(archive: Path, root: Path, backup, track_top_level: bool) -> None:

@@ -167,6 +167,40 @@
         };
     }
 
+    // ---------- надпись о программе (только в русификаторах «для друзей») ----------
+
+    var params = {};
+    try {
+        if (typeof PluginManager !== 'undefined' && PluginManager.parameters) {
+            params = PluginManager.parameters('Russificator') || {};
+        }
+    } catch (e) {
+        params = {};
+    }
+    var CREDIT = String(params.credit || '');
+
+    if (CREDIT && typeof Scene_Title !== 'undefined') {
+        var _titleCreate = Scene_Title.prototype.create;
+        Scene_Title.prototype.create = function () {
+            _titleCreate.apply(this, arguments);
+            try {
+                var w = Graphics.width, size = Math.max(12, Math.round(Graphics.height / 42)), h = size + 14;
+                var bmp = new Bitmap(w, h);
+                bmp.fontSize = size;
+                if (MZ && $gameSystem && $gameSystem.mainFontFace) bmp.fontFace = $gameSystem.mainFontFace();
+                bmp.textColor = 'rgba(255,255,255,0.85)';
+                bmp.outlineColor = 'rgba(0,0,0,0.65)';
+                bmp.outlineWidth = 3;
+                bmp.drawText(CREDIT, 0, 0, w - 14, h, 'right');
+                var sprite = new Sprite(bmp);
+                sprite.y = Graphics.height - h - 2;
+                this.addChild(sprite);
+            } catch (e) {
+                // надпись необязательна
+            }
+        };
+    }
+
     if (typeof Window_BattleLog !== 'undefined') {
         var _drawLineText = Window_BattleLog.prototype.drawLineText;
         Window_BattleLog.prototype.drawLineText = function (index) {

@@ -18,7 +18,7 @@ import json
 import shutil
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 BACKUP_DIR = "russificator_backup"
 MANIFEST = "manifest.json"
@@ -38,6 +38,10 @@ class GameBackup:
         self.root = self.game_dir / BACKUP_DIR
         self.modified: Dict[str, str] = {}   # относительный путь -> sha1 оригинала
         self.created: List[str] = []         # файлы, созданные русификатором
+        #: состояние файлов сразу после русификации: путь -> [размер, mtime_ns]
+        #: (по нему «Мои игры» видят, что обновление игры затёрло перевод)
+        self.snapshot_state: Dict[str, List[int]] = {}
+        self.info: Dict[str, object] = {}    # чем и когда русифицировано (для «Моих игр»)
         self._load()
 
     # ---------- манифест ----------
@@ -51,13 +55,16 @@ class GameBackup:
             data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
             self.modified = dict(data.get("modified", {}))
             self.created = list(data.get("created", []))
+            self.snapshot_state = dict(data.get("snapshot", {}))
+            self.info = dict(data.get("info", {}))
         except (OSError, ValueError):
             pass
 
     def _save(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         data = {"version": 2, "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "modified": self.modified, "created": self.created}
+                "modified": self.modified, "created": self.created,
+                "snapshot": self.snapshot_state, "info": self.info}
         tmp = self.manifest_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         tmp.replace(self.manifest_path)
@@ -124,6 +131,59 @@ class GameBackup:
             self.track_new(dest)
         shutil.copy2(src, dest)
 
+    # ---------- состояние после русификации ----------
+
+    def _files(self) -> List[str]:
+        """Все файлы русификации: изменённые и созданные (папки — по файлам внутри)."""
+        out = list(self.modified)
+        for rel in self.created:
+            p = self.game_dir / rel
+            if p.is_dir():
+                out += [f.relative_to(self.game_dir).as_posix() for f in p.rglob("*") if f.is_file()]
+            else:
+                out.append(rel)
+        return out
+
+    def snapshot(self, info: Optional[Dict[str, object]] = None) -> None:
+        """Запомнить состояние файлов сразу после русификации (и чем русифицировано)."""
+        state: Dict[str, List[int]] = {}
+        for rel in self._files():
+            if len(state) >= 20000:
+                break
+            try:
+                st = (self.game_dir / rel).stat()
+            except OSError:
+                continue
+            state[rel] = [st.st_size, st.st_mtime_ns]
+        self.snapshot_state = state
+        if info is not None:
+            self.info = dict(info)
+        self._save()
+
+    def check(self) -> Tuple[bool, List[str]]:
+        """Цела ли русификация: (цела, какие файлы пропали или изменились).
+
+        Изменённые файлы игры сверяются с состоянием после русификации: если
+        обновление игры или «проверка целостности» Steam вернули оригинал —
+        перевод слетел. Созданные файлы достаточно найти на месте (их
+        содержимое меняет сама игра — XUnity дописывает свой кэш переводов).
+        """
+        broken: List[str] = []
+        for rel in self.modified:
+            p = self.game_dir / rel
+            snap = self.snapshot_state.get(rel)
+            try:
+                st = p.stat()
+            except OSError:
+                broken.append(rel)
+                continue
+            if snap and (st.st_size != snap[0] or st.st_mtime_ns != snap[1]):
+                broken.append(rel)
+        for rel in self.created:
+            if not (self.game_dir / rel).exists():
+                broken.append(rel)
+        return not broken, broken
+
     # ---------- откат ----------
 
     def restore(self) -> Tuple[int, List[str]]:
@@ -151,6 +211,7 @@ class GameBackup:
             _prune_empty(p.parent, self.game_dir)
         shutil.rmtree(self.root, ignore_errors=True)
         self.modified, self.created = {}, []
+        self.snapshot_state, self.info = {}, {}
         if restored:
             notes.insert(0, f"Восстановлено оригинальных файлов: {restored}.")
         if removed:

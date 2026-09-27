@@ -23,6 +23,7 @@ import hashlib
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -264,6 +265,13 @@ class Pipeline:
         # 7. шрифт
         self.stage("font")
         self._install_font(plugin, effective_dir, project)
+        try:   # состояние после русификации — «Мои игры» по нему видят, что обновление затёрло перевод
+            st = project.stats()
+            project.backup.snapshot({"translator": project.meta.get("translator", ""),
+                                     "date": time.strftime("%Y-%m-%d %H:%M"),
+                                     "translated": st["translated"] + st["approved"], "total": st["total"]})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Снимок состояния не записан: %s", exc)
         return self._finish(result, project, plugin)
 
     # ---------- помощники ----------

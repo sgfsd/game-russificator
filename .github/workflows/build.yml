@@ -30,6 +30,16 @@ jobs:
       - name: Тесты
         run: python -m pytest -q
 
+      - name: Сборка установщика (Установить.exe для архивов «для друзей»)
+        shell: pwsh
+        run: |
+          pyinstaller installer.spec --noconfirm
+          $p = Start-Process -FilePath dist\RussificatorSetup.exe -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content "$env:TEMP\RussificatorSetup\selftest.txt"
+          if ($p.ExitCode -ne 0) { throw "installer selftest failed: $($p.ExitCode)" }
+          New-Item -ItemType Directory -Force russificator\resources\installer | Out-Null
+          Copy-Item dist\RussificatorSetup.exe russificator\resources\installer\RussificatorSetup.exe
+
       - name: Сборка exe
         run: pyinstaller russificator.spec --noconfirm
 

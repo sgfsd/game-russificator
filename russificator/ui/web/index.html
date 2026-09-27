@@ -171,7 +171,8 @@
             <p class="muted" id="runHint">Выберите игру и способ перевода.</p>
           </div>
           <div class="run-actions">
-            <button class="btn ghost" id="restoreBtn" disabled><span class="i" data-icon="undo"></span>Откатить русификацию</button>
+            <button class="btn ghost" id="restoreBtn" disabled title="Вернуть игре оригинальные файлы"><span class="i" data-icon="undo"></span>Откатить</button>
+            <button class="btn" id="exportBtn" disabled title="Архив с установщиком — отправьте другу"><span class="i" data-icon="package"></span>Создать файл русификатора</button>
             <button class="btn primary big" id="startBtn" disabled><span class="i" data-icon="play"></span>Русифицировать</button>
           </div>
         </div>
@@ -221,6 +222,7 @@
         <div class="row gap end">
           <button class="btn ghost" id="resOpen"><span class="i" data-icon="folder-open"></span>Открыть папку игры</button>
           <button class="btn ghost" id="resRestore"><span class="i" data-icon="undo"></span>Откатить</button>
+          <button class="btn" id="resExport"><span class="i" data-icon="package"></span>Создать файл русификатора</button>
           <button class="btn primary" id="resBack">Готово</button>
         </div>
       </div>
@@ -326,6 +328,45 @@
     </div>
     <button class="btn tg big" id="openTg"><span class="i" data-icon="send"></span>Написать в Telegram</button>
     <p class="muted small center">Напишите название игры — обсудим объём, сроки и цену.</p>
+  </div>
+</div>
+
+<!-- ============ архив-русификатор ============ -->
+<div class="modal hidden" id="exportModal">
+  <div class="modal-card export">
+    <button class="modal-x" data-close><span class="i" data-icon="x"></span></button>
+    <div class="export-hero">
+      <div class="export-badge"><span class="i" data-icon="package"></span></div>
+      <h2>Файл русификатора</h2>
+      <p>Архив с установщиком для <b id="exportGame"></b>. Отправьте его другу: он распакует архив, запустит
+        «Установить.exe» — и его копия игры станет русской. Программа ему не нужна.</p>
+    </div>
+    <div class="export-body">
+      <div class="export-field">
+        <span class="muted small">Куда сохранить архив</span>
+        <div class="path-pick">
+          <span class="i" data-icon="folder"></span>
+          <span class="mono small grow" id="exportDir"></span>
+          <button class="btn ghost sm" id="exportPick">Изменить…</button>
+        </div>
+      </div>
+      <label class="switch"><input type="checkbox" id="exportCredit" checked><span></span>
+        <div><b>Надпись о программе в игре</b>
+          <div class="muted small">Небольшая полупрозрачная строка в главном меню: «Автоперевод: Русификатор игр ·
+            ручной перевод — tg @<span class="tgName"></span>». Во время игры её нет.</div></div>
+      </label>
+      <div class="dl hidden" id="exportProgress"><div class="bar"><div class="bar-fill"></div></div><div class="dl-text muted"></div></div>
+      <div class="export-done hidden" id="exportDone">
+        <span class="i" data-icon="check-circle"></span>
+        <div class="grow"><b id="exportName"></b><div class="muted small" id="exportMeta"></div></div>
+        <button class="btn ghost sm" id="exportReveal"><span class="i" data-icon="folder-open"></span>Показать</button>
+      </div>
+      <div class="msgs" id="exportMsgs"></div>
+    </div>
+    <div class="row gap end export-foot">
+      <button class="btn ghost" data-close id="exportClose">Закрыть</button>
+      <button class="btn primary" id="exportGo"><span class="i" data-icon="package"></span>Создать архив</button>
+    </div>
   </div>
 </div>
 

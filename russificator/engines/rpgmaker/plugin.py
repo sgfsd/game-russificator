@@ -21,7 +21,7 @@ import zlib
 from pathlib import Path
 from typing import List, Optional
 
-from ...core.plugin_api import Detection, EnginePlugin
+from ...core.plugin_api import Detection, EnginePlugin, ExportPlan
 from ...core.universal import ExtractionResult, TranslationProject
 from ...fonts.cmap import codepoints
 from . import detect as _detect
@@ -74,13 +74,16 @@ class RPGMakerPlugin(EnginePlugin):
 
     def inject(self, game_dir: Path, project: TranslationProject) -> None:
         game_dir = Path(game_dir)
+        credit = project.meta.get("credit") or ""
         if self.version in ("mv", "mz"):
             count, warnings = mv_mz.inject(game_dir, project, self.version)
-            if not mv_mz.install_runtime(game_dir, project.backup):
+            if not mv_mz.install_runtime(game_dir, project.backup, credit=credit):
                 warnings.append("Плагин переноса слов не подключён (нет js/plugins.js) — длинные строки "
                                 "перенесены заранее, по ширине окна.")
         elif self.version in ("xp", "vx", "ace"):
             count, warnings = old_marshal.inject(game_dir, project, self.version)
+            if credit:
+                self._credit_rgss(game_dir, credit, project.backup)
         else:
             raise RuntimeError("Внедрение для этой версии RPG Maker не поддерживается.")
         project.warnings.extend(warnings)
@@ -188,8 +191,88 @@ class RPGMakerPlugin(EnginePlugin):
         project.warnings.append("Шрифт игры без кириллицы — подключён PT Sans (папка Fonts, скрипт перед Main).")
         return True
 
+    def _credit_rgss(self, game_dir: Path, credit: str, backup) -> bool:
+        """Надпись о программе на титульном экране XP/VX/VX Ace (скрипт перед Main)."""
+        ext = old_marshal.EXT[self.version]
+        scripts = game_dir / "Data" / f"Scripts.{ext}"
+        if not scripts.is_file():
+            return False
+        data, utf8 = M.load_with_info(scripts.read_bytes())
+        if not isinstance(data, list) or any(isinstance(s, list) and len(s) > 1 and str(s[1]) == "Russificator Credit"
+                                             for s in data):
+            return False
+        code = credit_script(self.version, credit)
+        packed = M.RubyString(zlib.compress(code.encode("utf-8")).decode("utf-8", "surrogateescape"))
+        main = next((i for i, s in enumerate(data) if isinstance(s, list) and len(s) > 1 and str(s[1]) == "Main"),
+                    len(data))
+        data.insert(main, [90000002, "Russificator Credit", packed])
+        raw = M.dump(data, utf8_strings=utf8 or self.version == "ace")
+        M.load(raw)
+        backup.write_bytes(scripts, raw)
+        return True
+
     def post_inject_instructions(self) -> List[str]:
         return ["Запустите игру — текст будет на русском."]
+
+    def export_plan(self, game_dir: Path, project: TranslationProject, credit: Optional[str]) -> ExportPlan:
+        """Данные RPG Maker — целиком текст игры, поэтому в архив идёт только перевод: у друга текст
+        заново извлекается из его копии игры и перевод внедряется тем же кодом (подходит к любой версии)."""
+        return ExportPlan(method="reinject")
+
+
+def _ruby_str(s: str) -> str:
+    return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def credit_script(version: str, credit: str) -> str:
+    """Ruby-скрипт: полупрозрачная надпись в правом нижнем углу титульного экрана."""
+    text = _ruby_str(credit)
+    if version == "xp":
+        return f"""# Game Russificator: надпись о программе на титульном экране
+class Scene_Title
+  alias_method :rus_credit_main, :main unless method_defined?(:rus_credit_main)
+  def main
+    @rus_credit = Sprite.new
+    @rus_credit.bitmap = Bitmap.new(640, 22)
+    @rus_credit.bitmap.font.size = 15
+    @rus_credit.bitmap.font.color = Color.new(255, 255, 255, 200)
+    @rus_credit.bitmap.draw_text(0, 0, 634, 22, {text}, 2)
+    @rus_credit.y = 458
+    @rus_credit.z = 9999
+    rus_credit_main
+  ensure
+    if @rus_credit
+      @rus_credit.bitmap.dispose
+      @rus_credit.dispose
+      @rus_credit = nil
+    end
+  end
+end
+"""
+    return f"""# Game Russificator: надпись о программе на титульном экране
+class Scene_Title
+  alias_method :rus_credit_start, :start unless method_defined?(:rus_credit_start)
+  def start
+    rus_credit_start
+    @rus_credit = Sprite.new
+    @rus_credit.bitmap = Bitmap.new(Graphics.width, 22)
+    @rus_credit.bitmap.font.size = 15
+    @rus_credit.bitmap.font.color = Color.new(255, 255, 255, 200)
+    @rus_credit.bitmap.draw_text(0, 0, Graphics.width - 6, 22, {text}, 2)
+    @rus_credit.y = Graphics.height - 22
+    @rus_credit.z = 9999
+  end
+  alias_method :rus_credit_terminate, :terminate unless method_defined?(:rus_credit_terminate)
+  def terminate
+    rus_credit_terminate
+    if @rus_credit
+      @rus_credit.bitmap.dispose
+      @rus_credit.dispose
+      @rus_credit = nil
+    end
+  end
+end
+"""
 
 
 from ...core.registry import register  # noqa: E402

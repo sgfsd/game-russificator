@@ -236,10 +236,16 @@ class Api:
             pass
         self._cfg["game_dir"] = str(p)
         settings.save(self._cfg)
+        from ..core.package import can_export
+        exportable, why = can_export(p)
+        backup = GameBackup(p)
+        intact = backup.check()[0] if backup.exists else True
         return {"ok": True, "engine": det.engine_name or plugin.title, "confidence": det.confidence,
                 "details": det.details, "notes": det.notes, "name": p.name,
-                "russified": GameBackup(p).exists, "progress": progress,
-                "engine_id": plugin.engine_id, "live": bool(plugin.supports_live)}
+                "russified": backup.exists, "intact": intact, "progress": progress,
+                "engine_id": plugin.engine_id, "live": bool(plugin.supports_live),
+                "can_export": exportable, "export_reason": why,
+                "from_package": bool((backup.info or {}).get("package"))}
 
     # ---------- загрузки ----------
 
@@ -344,6 +350,54 @@ class Api:
                           "memory": result.from_memory},
             })
         return self._run_task("run", work)
+
+    # ---------- архив-русификатор «для друзей» ----------
+
+    def export_defaults(self) -> Dict[str, Any]:
+        from ..core import launcher
+        d = self._cfg.get("export_dir") or ""
+        if not d or not Path(d).is_dir():
+            desk = launcher.desktop_dir()
+            d = str(desk) if desk else str(Path.home())
+        return {"dir": d, "credit": self._cfg.get("export_credit", True) is not False}
+
+    def pick_export_dir(self) -> Optional[str]:
+        d = self.pick_folder()
+        if d:
+            self._cfg["export_dir"] = d
+            settings.save(self._cfg)
+        return d
+
+    def export_package(self, path: str, out_dir: str, credit: bool = True) -> Dict[str, Any]:
+        from ..core.package import PackageError, export_package
+        game = Path(path or self._cfg.get("game_dir", ""))
+        if not game.is_dir():
+            return {"ok": False, "error": "Сначала выберите папку с игрой."}
+        self._cfg["export_credit"] = bool(credit)
+        if out_dir:
+            self._cfg["export_dir"] = out_dir
+        settings.save(self._cfg)
+        target = Path(out_dir or self.export_defaults()["dir"])
+
+        def work():
+            status = (lambda m, f=None: self._emit({"type": "export", "message": m, "fraction": f}))
+            try:
+                res = export_package(game, target, credit=bool(credit), status=status, cancel=self._cancel)
+                self._emit(dict(res, type="export_done", ok=True, final=True))
+            except PackageError as exc:
+                self._emit({"type": "export_done", "ok": False, "error": str(exc), "final": True})
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Архив не создан")
+                self._emit({"type": "export_done", "ok": False, "error": _err(exc), "final": True})
+        return self._run_task("export", work)
+
+    def reveal(self, path: str) -> None:
+        """Показать файл в проводнике (выделенным)."""
+        p = Path(path)
+        if sys.platform == "win32" and p.exists():
+            subprocess.Popen(["explorer", "/select,", str(p)])
+        elif p.exists():
+            _open_path(p.parent if p.is_file() else p)
 
     # ---------- живой перевод (Unity) ----------
 

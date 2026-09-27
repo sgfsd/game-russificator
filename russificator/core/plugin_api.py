@@ -14,7 +14,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .universal import ExtractionResult, TranslationProject
 
@@ -31,6 +31,31 @@ class Detection:
     @classmethod
     def no(cls) -> "Detection":
         return cls(confidence=0.0)
+
+
+@dataclass
+class ExportPlan:
+    """Как движок упаковывает свою русификацию в архив «для друзей».
+
+    ``method``:
+      * ``"files"``    — у друга копируются файлы, созданные русификатором, а
+        изменённые файлы игры правятся бинарными патчами (см. core/delta.py);
+      * ``"reinject"`` — у друга текст заново извлекается из его копии игры и
+        перевод из архива внедряется тем же кодом, что и у вас (подходит к
+        любой версии игры: новые строки просто останутся английскими).
+    """
+
+    method: str = "files"
+    #: шаблоны путей (fnmatch, от корня игры), которые не кладутся в архив
+    exclude: List[str] = field(default_factory=list)
+    #: путь -> новое содержимое (конфиги «для друзей»: без путей к вашей программе)
+    replace: Dict[str, bytes] = field(default_factory=dict)
+    #: путь в игре -> файл программы, который нужно добавить
+    extra: Dict[str, Path] = field(default_factory=dict)
+    #: изменённые файлы можно пропустить, если у друга другая версия игры
+    optional_patches: bool = False
+    #: особенности установки — попадают в «Прочти.txt»
+    notes: List[str] = field(default_factory=list)
 
 
 class EnginePlugin(ABC):
@@ -95,6 +120,10 @@ class EnginePlugin(ABC):
     def post_inject_instructions(self) -> List[str]:
         """Что пользователь может понадобиться сделать руками после внедрения."""
         return []
+
+    def export_plan(self, game_dir: Path, project: TranslationProject, credit: Optional[str]) -> ExportPlan:
+        """Как упаковать русификацию в архив для друзей (``credit`` — надпись о программе или None)."""
+        return ExportPlan()
 
 
 def run_detection(game_dir: Path, plugins: List[EnginePlugin]) -> tuple[EnginePlugin, Detection]:

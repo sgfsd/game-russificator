@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
-from ...core.plugin_api import Detection, EnginePlugin
+from ...core.plugin_api import Detection, EnginePlugin, ExportPlan
 from ...core.universal import EntryStatus, ExtractionResult, TranslationProject
 from . import detect as _detect
 from . import extract as _extract
@@ -143,6 +143,9 @@ class UnityPlugin(EnginePlugin):
     def install_font(self, game_dir: Path, project: TranslationProject, font_path) -> bool:
         return True  # шрифты — через XUnity (fallback TMP) и системный fallback Unity, см. inject
 
+    def export_plan(self, game_dir: Path, project: TranslationProject, credit: Optional[str]) -> ExportPlan:
+        return _export_plan(self, game_dir, project, credit)
+
     def post_inject_instructions(self) -> List[str]:
         if not getattr(self, "_il2cpp", False):
             first = ("Запускайте игру как обычно (Steam, ярлык, exe): живой перевод текста, который игра "
@@ -162,6 +165,48 @@ class UnityPlugin(EnginePlugin):
         if getattr(self, "_il2cpp", False):
             tips.insert(1, "IL2CPP-игра: первый запуск с BepInEx занимает 1–5 минут и требует интернет — это один раз.")
         return tips
+
+
+def _export_plan(plugin: "UnityPlugin", game_dir: Path, project: TranslationProject,
+                 credit: Optional[str]) -> ExportPlan:
+    """Unity: копируются BepInEx, XUnity, словари и плагин; изменённые ассеты (шрифты, страницы
+    браузера) — патчами. У друга нет программы, поэтому обращение к её серверу выключается,
+    а если его версия игры другая и патч шрифта не встанет — выручит готовый TMP-шрифт XUnity."""
+    from ...core import launcher
+    root = Path(game_dir).resolve()
+    game = _detect.inspect(root)
+    plan = ExportPlan(method="files", optional_patches=True)
+    plan.exclude = [launcher.SHORTCUT_NAME, "BepInEx/cache/*", "BepInEx/interop/*", "BepInEx/unity-libs/*",
+                    "BepInEx/LogOutput.log*", "BepInEx/ErrorLog*", "BepInEx/DumpedAssemblies/*",
+                    "BepInEx/Translation/*/Text/_Preprocessors*.log", "*.tmp", "*.rutmp"]
+    fonts_patched = any(f.get("added") for f in project.meta.get("unity_fonts") or [])
+    fallback = None
+    if game is not None and fonts_patched:
+        name = xunity.tmp_font_bundle(game)
+        if name and (root / name).is_file():
+            fallback = name                    # уже лежит в игре (создан при русификации) — скопируется
+        elif name:
+            try:
+                f = xunity.tmp_font_file(game, plugin.status, plugin.cancel)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("TMP-шрифт XUnity для архива не получен: %s", exc)
+                f = None
+            if f is not None:
+                plan.extra[name] = f
+                fallback = name
+    ini = root / "BepInEx" / "config" / "AutoTranslatorConfig.ini"
+    if ini.is_file():
+        text = ini.read_text(encoding="utf-8", errors="replace")
+        plan.replace["BepInEx/config/AutoTranslatorConfig.ini"] = \
+            xunity.config_for_friends(text, fallback).encode("utf-8")
+    if (root / xunity.PLUGIN_CONFIG).is_file() or (game is not None and xunity.plugin_installed(game)):
+        plan.replace[xunity.PLUGIN_CONFIG] = xunity.plugin_config_text(None, True, credit or "").encode("utf-8")
+    plan.notes.append("Первый запуск игры после установки может быть на 10–30 секунд дольше — "
+                      "загружается модуль перевода (BepInEx). Alt+T в игре переключает перевод и оригинал.")
+    if game is not None and game.backend == "il2cpp":
+        plan.notes.append("Это IL2CPP-игра: при самом первом запуске BepInEx 1–5 минут готовит файлы и "
+                          "скачивает библиотеки Unity — нужен интернет. Это происходит один раз.")
+    return plan
 
 
 def inject_pages(game, backup, pages) -> int:

@@ -36,6 +36,7 @@ const ICONS = {
   pause: '<rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>',
   star: '<path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9Z"/>',
   gamepad: '<rect x="2" y="7" width="20" height="11" rx="5"/><path d="M7 11v3M5.5 12.5h3M15.5 12h.01M18 13.5h.01"/>',
+  package: '<path d="M21 8 12 3 3 8v8l9 5 9-5Z"/><path d="m3 8 9 5 9-5M12 13v8"/><path d="m7.5 5.5 9 5"/>',
 };
 
 const STAGES = [
@@ -174,6 +175,16 @@ function bindUi() {
     const r = await api().desktop_shortcut(S.game ? S.game.path : "");
     toast(r.ok ? "Ярлык «" + r.name + "» создан на рабочем столе" : r.error, !r.ok);
   });
+
+  // архив-русификатор
+  $("#exportBtn").addEventListener("click", () => openExport());
+  $("#resExport").addEventListener("click", () => openExport());
+  $("#exportPick").addEventListener("click", async () => {
+    const d = await api().pick_export_dir();
+    if (d) $("#exportDir").textContent = d;
+  });
+  $("#exportGo").addEventListener("click", runExport);
+  $("#exportReveal").addEventListener("click", () => S.exportPath && api().reveal(S.exportPath));
 
   // заказ
   $("#openTg").addEventListener("click", () => api().open_url(S.init.order.url));
@@ -412,6 +423,10 @@ function updateRunState() {
   $("#runHint").textContent = hint;
   $("#startBtn").disabled = !can;
   $("#restoreBtn").disabled = !(S.game && S.game.russified) || S.busy;
+  const exp = $("#exportBtn");
+  exp.disabled = !(S.game && S.game.can_export) || S.busy;
+  exp.title = S.game && !S.game.can_export && S.game.export_reason ? S.game.export_reason
+    : "Архив с установщиком — отправьте другу";
 }
 
 async function start() {
@@ -508,6 +523,8 @@ window.onBackendEvent = (ev) => {
       break;
     }
     case "download": onDownload(ev); break;
+    case "export": onExportProgress(ev); break;
+    case "export_done": onExportDone(ev); break;
     case "task_error": {
       S.busy = false;
       toast(ev.message, true);
@@ -552,6 +569,8 @@ function finishRun(ev) {
   ];
   $("#resultMsgs").innerHTML = msgs.map(([c, i, m]) => `<div class="msg ${c}">${icon(i)}<span>${esc(m)}</span></div>`).join("");
   $("#resRestore").classList.toggle("hidden", !ev.injected);
+  $("#resExport").classList.toggle("hidden", !ok);
+  if (ok && S.game) { S.game.can_export = true; S.game.russified = true; }
   errs.forEach((e) => log(e, "e"));
   log(ok ? "Готово" : ev.cancelled ? "Остановлено" : "Завершено с ошибкой", ok ? "s" : "e");
   reloadInit();
@@ -698,6 +717,69 @@ function restoreGame(path, fromResult = false) {
     if (fromResult) { S.running = false; showPage("main"); }
     detectGame(path, true);
   });
+}
+
+/* ---------------- архив-русификатор ---------------- */
+
+async function openExport() {
+  if (!S.game) return;
+  if (!S.game.can_export && !S.exportAfterRun) {
+    await detectGame(S.game.path, true);
+    if (!S.game || !S.game.can_export) return toast((S.game && S.game.export_reason) || "Сначала русифицируйте игру.", true);
+  }
+  const d = await api().export_defaults();
+  $("#exportGame").textContent = "«" + S.game.name + "»";
+  $("#exportDir").textContent = d.dir;
+  $("#exportCredit").checked = d.credit;
+  $$(".tgName").forEach((el) => { el.textContent = S.init.order.telegram; });
+  $("#exportProgress").classList.add("hidden");
+  $("#exportDone").classList.add("hidden");
+  $("#exportMsgs").innerHTML = "";
+  $("#exportGo").disabled = false;
+  $("#exportGo").classList.remove("hidden");
+  $("#exportModal").classList.remove("hidden");
+}
+
+async function runExport() {
+  const r = await api().export_package(S.game.path, $("#exportDir").textContent, $("#exportCredit").checked);
+  if (!r.ok) return toast(r.error, true);
+  S.busy = true;
+  updateRunState();
+  $("#exportGo").disabled = true;
+  $("#exportDone").classList.add("hidden");
+  $("#exportMsgs").innerHTML = "";
+  const box = $("#exportProgress");
+  box.classList.remove("hidden");
+  box.querySelector(".bar").classList.add("indeterminate");
+  box.querySelector(".dl-text").textContent = "Подготовка…";
+}
+
+function onExportProgress(ev) {
+  const box = $("#exportProgress");
+  const bar = box.querySelector(".bar");
+  if (ev.fraction != null) {
+    bar.classList.remove("indeterminate");
+    bar.querySelector(".bar-fill").style.width = (ev.fraction * 100).toFixed(1) + "%";
+  } else bar.classList.add("indeterminate");
+  box.querySelector(".dl-text").textContent = ev.message || "";
+}
+
+function onExportDone(ev) {
+  S.busy = false;
+  updateRunState();
+  $("#exportProgress").classList.add("hidden");
+  $("#exportGo").disabled = false;
+  if (!ev.ok) {
+    $("#exportMsgs").innerHTML = `<div class="msg e">${icon("x-circle")}<span>${esc(ev.error)}</span></div>`;
+    return;
+  }
+  S.exportPath = ev.path;
+  $("#exportName").textContent = ev.name;
+  $("#exportMeta").textContent = `${size(ev.size)} · сохранён в ${ev.path.replace(/[\\/][^\\/]*$/, "")}`;
+  $("#exportDone").classList.remove("hidden");
+  $("#exportGo").classList.add("hidden");
+  $("#exportMsgs").innerHTML = (ev.notes || []).map((m) => `<div class="msg w">${icon("alert")}<span>${esc(m)}</span></div>`).join("");
+  toast("Архив-русификатор готов");
 }
 
 /* ---------------- заказ перевода ---------------- */

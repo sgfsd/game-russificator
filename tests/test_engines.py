@@ -554,3 +554,12 @@ def test_ace_description_fits_help_window():
     small = fit_description("Древний клинок, выкованный мастерами исчезнувшего королевства; наносит двойной урон "
                             "нежити и светится в темноте, освещая путь.")
     assert small.startswith("\\}") and small.count("\n") == 1
+
+
+def test_rgssad_xor_without_numpy_matches_reference():
+    """Установщик собирается без numpy: быстрый XOR на длинной арифметике = эталонный побайтовый."""
+    import os
+    from russificator.engines.rpgmaker.rgssad import _decrypt_data, _xor_bigint
+    for n in (0, 1, 5, 4096, (1 << 18) + 3, 700_001):
+        data = os.urandom(n)
+        assert _xor_bigint(data, 0xDEADCAFE ^ n) == _decrypt_data(data, 0xDEADCAFE ^ n)

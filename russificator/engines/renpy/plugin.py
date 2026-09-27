@@ -26,7 +26,7 @@ import re
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ...core.plugin_api import Detection, EnginePlugin
+from ...core.plugin_api import Detection, EnginePlugin, ExportPlan
 from ...core.universal import Entry, EntryStatus, ExtractionResult, TextKind, TranslationProject
 from ...translation.filters import looks_translatable
 from . import detect as _detect
@@ -234,8 +234,31 @@ class RenPyPlugin(EnginePlugin):
     def post_inject_instructions(self) -> List[str]:
         return [
             "Запустите игру — текст будет на русском. Если игра уже была открыта, перезапустите её.",
+            "Alt+T в игре переключает перевод и оригинал.",
             "Перевод можно поправить вручную в файле game/russificator_tl.json (оригинал → перевод).",
         ]
+
+    def export_plan(self, game_dir: Path, project: TranslationProject, credit: Optional[str]) -> ExportPlan:
+        """Всё, что русификатор добавил в игру, — новые файлы: их и копируем (словарь по тексту
+        строк подходит и к другой версии игры). Надпись о программе — отдельным экраном."""
+        plan = ExportPlan(method="files")
+        game_root = _detect.find_game_dir(Path(game_dir))
+        if game_root is None or not credit:
+            return plan
+        rel_root = game_root.relative_to(Path(game_dir).resolve()).as_posix() if game_root.resolve() != \
+            Path(game_dir).resolve() else ""
+        hook = game_root / HOOK_FILE
+        try:
+            text = hook.read_text(encoding="utf-8")
+        except OSError:
+            return plan
+        from ...fonts.library import ensure_font
+        font = ensure_font()
+        prefix = f"{rel_root}/" if rel_root else ""
+        if font is not None:
+            plan.extra[f"{prefix}{FONT_DIR}/{font.name}"] = font
+            plan.replace[f"{prefix}{HOOK_FILE}"] = (text.rstrip("\n") + "\n" + credit_block(credit, font.name)).encode("utf-8")
+        return plan
 
 
 def build_table(entries: List[Entry]) -> Dict[str, str]:
@@ -254,6 +277,31 @@ def build_table(entries: List[Entry]) -> Dict[str, str]:
             if s and d and s != src:
                 table.setdefault(s, d)
     return table
+
+
+def credit_block(credit: str, font_name: str) -> str:
+    """Экран с надписью о программе — только в главном меню (для русификаторов «для друзей»)."""
+    text = credit.replace("\\", "\\\\").replace('"', '\\"').replace("[", "[[").replace("{", "{{")
+    return f'''
+## Надпись о программе в главном меню (русификатор создан для раздачи друзьям).
+screen russificator_credit():
+    zorder 1000
+    if main_menu:
+        text "{text}":
+            font "{FONT_DIR}/{font_name}"
+            size max(12, int(config.screen_height / 54))
+            color "#ffffffc8"
+            outlines [(1, "#000000a0", 0, 0)]
+            xalign 0.99
+            yalign 0.995
+
+init 1000 python:
+    if hasattr(config, "always_shown_screens"):
+        if "russificator_credit" not in config.always_shown_screens:
+            config.always_shown_screens.append("russificator_credit")
+    elif "russificator_credit" not in config.overlay_screens:
+        config.overlay_screens.append("russificator_credit")
+'''
 
 
 def hook_script(font_map: Dict[Tuple[str, bool, bool], Tuple[str, bool, bool]]) -> str:
@@ -327,9 +375,27 @@ init 999 python:
         except Exception:
             return s
 
+    # Alt+T — перевод / оригинал (интерфейс сразу, реплика — со следующей)
+    _ru_on = [True]
+
+    def _ru_toggle():
+        _ru_on[0] = not _ru_on[0]
+        try:
+            renpy.notify(u"Перевод: вкл" if _ru_on[0] else u"Перевод: выкл (оригинал)")
+        except Exception:
+            pass
+        renpy.restart_interaction()
+
+    try:
+        config.underlay.append(renpy.Keymap(alt_K_t=_ru_toggle))
+    except Exception:
+        pass
+
     def _ru_say(s):
         if _ru_prev_say is not None:
             s = _ru_prev_say(s)
+        if not _ru_on[0]:
+            return s
         t = _ru_tl.get(s, s)
         if t is not s:
             t = _ru_fit(s, t)
@@ -343,6 +409,8 @@ init 999 python:
         def _ru_replace(s):
             if _ru_prev_replace is not None:
                 s = _ru_prev_replace(s)
+            if not _ru_on[0]:
+                return s
             return _ru_tl.get(s, s)
 
         config.replace_text = _ru_replace

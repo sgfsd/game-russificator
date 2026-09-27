@@ -15,14 +15,15 @@
 //    Пока текст помещается, ничего не меняется. Работает для любых элементов, в том
 //    числе созданных игрой по ходу дела.
 //
-// Все типы Unity и TextMeshPro берутся через отражение: плагин ссылается только на
-// mscorlib, System, BepInEx и 0Harmony и одинаково работает на Unity 5–6.
+// 4. Надпись о программе (только в русификаторах «для друзей», параметр credit в
+//    Russificator.cfg): полупрозрачная строка в правом нижнем углу первые секунды игры.
 //
-// Сборка (csc из .NET Framework 4 — есть в Windows 10/11; ссылки из любой Mono-игры
-// с BepInEx 5.4 — нужны только для компиляции):
-//   csc -nologo -target:library -optimize -nostdlib -out:Russificator.Unity.dll
-//       -r:mscorlib.dll -r:System.dll -r:UnityEngine.dll -r:UnityEngine.CoreModule.dll
-//       -r:BepInEx.dll -r:0Harmony.dll RussificatorUnity.cs
+// Типы TextMeshPro и UGUI берутся через отражение; из UnityEngine напрямую — только то, что
+// есть во всех версиях 5–6 (IMGUI для надписи). Плагин ссылается на mscorlib 2.0, System,
+// BepInEx, 0Harmony и UnityEngine (в новых Unity — фасад, перенаправляющий в модули).
+//
+// Сборка: python tools/build_unity_plugins.py  (mcs из Mono или csc из .NET Framework 4;
+// UnityEngine для компиляции — заглушка tools/unity_stubs/UnityEngine.cs).
 
 using System;
 using System.Collections.Generic;
@@ -34,15 +35,21 @@ using System.Text;
 using System.Threading;
 using BepInEx;
 using HarmonyLib;
+using UnityEngine;
 
-[BepInPlugin("russificator.unity", "Russificator", "2.0.0")]
+[BepInPlugin("russificator.unity", "Russificator", "2.1.0")]
 public class RussificatorUnity : BaseUnityPlugin
 {
     const BindingFlags Inst = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
     const float MinScale = 0.6f;
 
-    static RussificatorUnity _self;
     static bool _fitEnabled = true;
+
+    // надпись о программе (русификатор «для друзей»)
+    const float CreditSeconds = 14f;
+    static string _credit;
+    float _creditStart = -1f;
+    GUIStyle _creditStyle, _creditShadow;
 
     // ---------- состояние элементов текста ----------
 
@@ -86,10 +93,10 @@ public class RussificatorUnity : BaseUnityPlugin
 
     void Awake()
     {
-        _self = this;
         Dictionary<string, string> cfg = ReadConfig();
         string v;
         if (cfg.TryGetValue("fit", out v) && v.Trim().ToLowerInvariant() == "false") _fitEnabled = false;
+        if (cfg.TryGetValue("credit", out v) && v.Trim().Length > 0) _credit = v.Trim();
         try { StartLiveServer(cfg); }
         catch (Exception ex) { Logger.LogWarning("Live translation autostart failed: " + ex.Message); }
 
@@ -178,6 +185,47 @@ public class RussificatorUnity : BaseUnityPlugin
         catch
         {
             return false;
+        }
+    }
+
+    // ======================= 4. надпись о программе =======================
+
+    void OnGUI()
+    {
+        if (_credit == null) return;
+        try
+        {
+            float now = Time.realtimeSinceStartup;
+            if (_creditStart < 0f) _creditStart = now;
+            float t = now - _creditStart;
+            if (t > CreditSeconds)
+            {
+                _credit = null;
+                return;
+            }
+            float alpha = t > CreditSeconds - 2f ? (CreditSeconds - t) / 2f : 1f;
+            if (_creditStyle == null)
+            {
+                int size = Math.Max(12, Screen.height / 46);
+                _creditStyle = new GUIStyle();
+                _creditShadow = new GUIStyle();
+                foreach (GUIStyle st in new GUIStyle[] { _creditStyle, _creditShadow })
+                {
+                    st.fontSize = size;
+                    st.alignment = TextAnchor.LowerRight;
+                    st.wordWrap = false;
+                }
+            }
+            _creditStyle.normal.textColor = new Color(1f, 1f, 1f, 0.85f * alpha);
+            _creditShadow.normal.textColor = new Color(0f, 0f, 0f, 0.65f * alpha);
+            float w = Screen.width, h = Screen.height, pad = Math.Max(10f, h / 70f);
+            GUI.Label(new Rect(0f, 0f, w - pad + 1.5f, h - pad + 1.5f), _credit, _creditShadow);
+            GUI.Label(new Rect(0f, 0f, w - pad, h - pad), _credit, _creditStyle);
+        }
+        catch (Exception ex)
+        {
+            _credit = null;
+            Logger.LogDebug("credit: " + ex.Message);
         }
     }
 
