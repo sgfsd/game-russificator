@@ -103,6 +103,8 @@ def steam(tmp_path, monkeypatch):
     _acf(lib2, "999", "Some Game Soundtrack", "Some Game OST")
     (lib2 / "steamapps" / "common" / "Some Game OST").mkdir(parents=True)
     monkeypatch.setattr(library, "steam_root", lambda: root)
+    # остальные источники (реестр, GOG, Epic…) читали бы настоящий компьютер
+    monkeypatch.setattr(library, "SOURCES", [("steam", library.steam_games)])
     return root
 
 
@@ -211,3 +213,27 @@ def test_find_root_from_inner_or_outer_folder(tmp_path):
     _unity(lone / "Some Game")
     assert library.find_root(lone) == lone / "Some Game"      # одна игра внутри — берём её
     assert library.find_root(tmp_path) is None                 # игр несколько — пусть выберет сам
+
+
+def test_find_root_does_not_climb_into_a_game_holding_other_games(tmp_path):
+    """Unity-игра распакована прямо в папку с другими играми (так было в «D:\game test»): выбор любой
+    игры внутри не должен подменяться этой папкой."""
+    games = tmp_path / "game test"
+    games.mkdir()
+    _unity(games, "EverybodyMustDie")
+    mv = games / "Click Me"
+    mv.mkdir()
+    _mv(mv)
+    vn = games / "Resident Lover"
+    vn.mkdir()
+    _renpy(vn)
+    other = games / "Happy Cat"
+    other.mkdir()
+    _unity(other, "Happy Cat Tavern")
+    assert library.find_root(mv) == mv
+    assert library.find_root(mv / "www") == mv
+    assert library.find_root(mv / "www" / "data") == mv
+    assert library.find_root(vn / "game") == vn
+    assert library.find_root(other) == other
+    assert library.find_root(other / "Happy Cat Tavern_Data" / "Managed") == other
+    assert library.find_root(games) == games                  # сама папка — тоже игра (EverybodyMustDie)

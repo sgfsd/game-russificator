@@ -357,6 +357,8 @@ input.num { width: 90px; text-align: center; }
 .live-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--faint); flex: none; }
 .live-dot.on { background: #5eead4; box-shadow: 0 0 0 4px rgba(94, 234, 212, .18); animation: pulse 1.6s ease-in-out infinite; }
 .live-dot.wait { background: var(--warn); }
+.warn-text { color: var(--warn); }
+#liveInfo { margin-top: 10px; }
 @keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(94, 234, 212, .05); } }
 
 /* ---------- архив-русификатор ---------- */

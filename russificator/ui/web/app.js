@@ -247,6 +247,10 @@ function bindUi() {
   });
   liveRange("#liveScale", "live_font_scale");
   liveRange("#liveOpacity", "live_opacity");
+  $("#liveDeep").addEventListener("change", async (e) => {
+    await api().overlay_settings({ live_deep: e.target.checked });
+    if (S.liveSt && S.liveSt.settings) S.liveSt.settings.live_deep = e.target.checked;
+  });
   $("#liveAutostart").addEventListener("change", async (e) => {
     const r = await api().overlay_autostart(e.target.checked);
     if (!r.ok) { toast(r.error, true); e.target.checked = !e.target.checked; }
@@ -1021,6 +1025,20 @@ async function refreshLive() {
     $("#liveReason").textContent = (g.reason || "") + (g.region ? " · выбрана область текста (Alt+R — выбрать заново)" : "");
     $("#livePauseTxt").textContent = st.paused ? "Показать перевод" : "Скрыть перевод";
     $("#liveRegionClear").classList.toggle("hidden", !g.region);
+    const info = [];
+    if (st.capture === "window") info.push("кадр снимается с окна игры");
+    else if (st.capture === "screen") info.push("кадр снимается с экрана");
+    info.push(st.verify_ru ? "русский текст не трогается (проверка русским распознаванием Windows)"
+      : "русский текст узнаётся по приметам");
+    if (st.deep && st.deep.on) info.push(`надписей на картинках найдено: ${st.deep.found || 0}`);
+    $("#liveInfo").textContent = info.join(" · ");
+  }
+  const busy = on ? (st.busy_hotkeys || []) : [];
+  const keyNames = { toggle: "Alt+T", now: "Alt+Y", region: "Alt+R" };
+  $("#liveKeysBusy").classList.toggle("hidden", !busy.length);
+  if (busy.length) {
+    $("#liveKeysBusy").textContent = `${busy.map((k) => keyNames[k] || k).join(", ")} ${busy.length > 1 ? "заняты" : "занята"} ` +
+      "другой программой (например, оверлеем видеокарты AMD или NVIDIA) — эти действия есть в меню значка в трее.";
   }
   $("#liveHint").classList.toggle("hidden", !(on && st.hint));
   if (on && st.hint) {
@@ -1070,6 +1088,7 @@ function renderLiveSettings() {
   $("#livePlate").style.fontSize = (15 * scale).toFixed(1) + "px";
   $("#livePlate").style.background = `rgba(14,16,24,${op})`;
   $("#liveAutostart").checked = !!st.autostart;
+  $("#liveDeep").checked = cfg.live_deep !== false;
   const list = (items, key) => items.length ? items.map((p) => `<div class="folder-item"><span class="mono small">${esc(p)}</span>
     <button class="icon-btn sm" data-rm-live="${key}" data-path="${esc(p)}" title="Убрать">${icon("x")}</button></div>`).join("")
     : '<span class="muted small">Пусто.</span>';

@@ -42,3 +42,19 @@ def test_library_add_takes_game_root(api, tmp_path):
     vn = _renpy(tmp_path / "Games" / "VN")
     r = api.library_add(str(vn / "game"))
     assert r["ok"] and Path(r["game"]["path"]) == vn
+
+
+def test_webview_cache_reset_after_update(tmp_path, monkeypatch):
+    """Интерфейс открывается по одному адресу — после обновления программы кэш WebView2 сбрасывается,
+    иначе показывалась бы прошлая версия страниц."""
+    from russificator.ui import app
+    storage = tmp_path / "webview"
+    cache = storage / "EBWebView" / "Default" / "Cache"
+    cache.mkdir(parents=True)
+    (cache / "data_0").write_bytes(b"old index.html")
+    app._fresh_webview_cache(storage)
+    assert not cache.exists() and (storage / "ui-version.txt").is_file()
+    cache.mkdir(parents=True)
+    (cache / "data_0").write_bytes(b"same version")
+    app._fresh_webview_cache(storage)                    # версия та же — кэш не трогаем
+    assert (cache / "data_0").is_file()

@@ -400,7 +400,7 @@ class Api:
         st = self._live_call("/status") or {"running": False}
         cfg = settings.read()
         st["settings"] = {k: cfg.get(k) for k in ("live_enabled", "live_autostart", "live_mode", "live_font_scale",
-                                                  "live_opacity", "live_always", "live_never")}
+                                                  "live_opacity", "live_always", "live_never", "live_deep")}
         st["autostart"] = win32.autostart_command() is not None
         st["windows"] = sys.platform == "win32"
         return st
@@ -436,7 +436,7 @@ class Api:
         return self._live_call("/" + cmd) or {"ok": False, "error": "Живой перевод не запущен."}
 
     def overlay_settings(self, partial: Dict[str, Any]) -> Dict[str, Any]:
-        keys = ("live_mode", "live_font_scale", "live_opacity", "live_always", "live_never")
+        keys = ("live_mode", "live_font_scale", "live_opacity", "live_always", "live_never", "live_deep")
         partial = {k: v for k, v in (partial or {}).items() if k in keys}
         self._cfg.update(partial)
         settings.save(self._cfg)
@@ -787,6 +787,25 @@ def _err(exc: Exception) -> str:
     return str(exc) or exc.__class__.__name__
 
 
+def _fresh_webview_cache(storage: Path) -> None:
+    """Интерфейс всегда открывается по одному адресу (pywebview: 127.0.0.1:42001), и WebView2 может
+    показать закэшированные страницы прошлой версии программы. После обновления кэш сбрасывается."""
+    import shutil
+    stamp = storage / "ui-version.txt"
+    current = f"{russificator.__version__} {int((WEB / 'app.js').stat().st_mtime) if (WEB / 'app.js').is_file() else 0}"
+    try:
+        if stamp.read_text(encoding="utf-8") == current:
+            return
+    except OSError:
+        pass
+    for sub in ("Cache", "Code Cache", "GPUCache", "Service Worker"):
+        shutil.rmtree(storage / "EBWebView" / "Default" / sub, ignore_errors=True)
+    try:
+        stamp.write_text(current, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _setup_logging() -> None:
     log_file = paths.logs_dir() / "russificator.log"
     handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
@@ -882,8 +901,10 @@ def run(argv=None) -> int:
     window.events.closing += on_closing
     if api._cfg.get("live_enabled"):            # живой перевод был включён — поднимаем его вместе с программой
         threading.Thread(target=api.overlay_start, kwargs={"quiet": True}, daemon=True).start()
+    storage = paths.sub("webview")
+    _fresh_webview_cache(storage)
     webview.start(debug=bool(os.environ.get("RUSSIFICATOR_DEBUG")), http_server=True,
-                  storage_path=str(paths.sub("webview")), private_mode=False)
+                  storage_path=str(storage), private_mode=False)
     return 0
 
 

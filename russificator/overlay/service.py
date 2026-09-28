@@ -987,6 +987,7 @@ class LiveService:
                             svc._cond.notify_all()
                     svc._decider_at = 0
                     svc._shown_sig = ""
+                    svc._deep_sig = ""
                 elif path == "/quit":
                     svc.stop_event.set()
                 else:

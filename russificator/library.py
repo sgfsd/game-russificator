@@ -427,17 +427,31 @@ def _scan_folder(root: Path, depth: int) -> Iterator[GameEntry]:
         yield GameEntry(path=str(root), title=root.name, source="folder", engine="")
 
 
-SUPPORTED = ("unity", "renpy", "rpgmaker")
+def _inner_folder(child: Path) -> bool:
+    """Папка, которая бывает внутри игры и сама похожа на игру (MV: ``www`` рядом с Game.exe)."""
+    name = child.name.lower()
+    return name in ("www", "game") or name.endswith("_data")
 
 
 def find_root(path: Path) -> Optional[Path]:
     """Корень игры рядом с выбранной папкой: если выбрали внутреннюю папку (``Game_Data``, ``www``,
-    ``game``, ``Binaries/Win64``…) — поднимаемся; если папку с одной игрой внутри — спускаемся."""
+    ``game``, ``Binaries/Win64``…) — поднимаемся; если папку с одной игрой внутри — спускаемся.
+
+    Выше найденной игры поднимаемся, только если это та же игра (``www`` → папка с Game.exe):
+    игра, распакованная прямо в папку с другими играми (``D:\Games\Game.exe`` рядом с
+    ``D:\Games\OtherGame``), не должна «забирать» их себе."""
     p = Path(path)
     found: Optional[Path] = None
+    engine = ""
     for cand in [p, *list(p.parents)[:3]]:
-        if quick_engine(cand) in SUPPORTED:
-            found = cand                    # поднимаемся, пока выше тоже игра (MV: www → папка с Game.exe)
+        e = quick_engine(cand)
+        if e in SUPPORTED:
+            if found is None:
+                found, engine = cand, e
+            elif e == engine and found.parent == cand and _inner_folder(found):
+                found = cand
+            else:
+                break
         elif found is not None:
             break
     if found is not None:
