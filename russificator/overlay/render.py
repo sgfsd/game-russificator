@@ -98,9 +98,21 @@ def layout(item: Item, canvas: Tuple[int, int], style: Style):
         if text_h + pad * 2 <= limit_h or size <= style.min_px:
             break
         size -= 1
-    box_h = int(min(ch, text_h + pad * 2))
+    # плашка закрывает весь абзац оригинала (иначе короткий перевод оставил бы видными его нижние строки)
+    box_h = int(min(ch, max(text_h, h) + pad * 2))
     box_y = max(0, min(int(y - pad), ch - box_h))
     return (box_x, box_y, box_w, box_h), fnt, lines, size, pad
+
+
+def plate_rects(canvas: Tuple[int, int], items: Sequence[Item], style: Optional[Style] = None) -> List[Rect]:
+    """Где будут плашки (x, y, w, h) — чтобы закрасить их в снимке экрана перед распознаванием."""
+    style = style or Style()
+    out: List[Rect] = []
+    for it in items:
+        if it.text:
+            (bx, by, bw, bh), *_ = layout(it, canvas, style)
+            out.append((bx - 2, by - 2, bw + 5, bh + 5))
+    return out
 
 
 def render(canvas: Tuple[int, int], items: Sequence[Item], style: Optional[Style] = None):
@@ -117,7 +129,8 @@ def render(canvas: Tuple[int, int], items: Sequence[Item], style: Optional[Style
         radius = max(4, int(size * 0.35))
         draw.rounded_rectangle((bx, by, bx + bw, by + bh), radius=radius, fill=(14, 16, 24, alpha),
                                outline=(139, 123, 255, min(255, alpha // 2 + 40)), width=1)
-        ty = by + pad
+        text_h = len(lines) * int(size * 1.22)
+        ty = by + max(pad, (bh - text_h) // 2)          # по центру плашки, если она выше перевода
         for ln in lines:
             draw.text((bx + pad + 1, ty + 1), ln, font=fnt, fill=(0, 0, 0, 200))
             draw.text((bx + pad, ty), ln, font=fnt, fill=(245, 246, 250, 255))

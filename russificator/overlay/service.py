@@ -1,8 +1,15 @@
 """Служба живого перевода: главный цикл оверлея, перевод в фоне, трей, состояние.
 
 Цикл (≈2 раза в секунду, только пока на экране игра):
-  окно переднего плана → игра ли (detect) → захват области → распознавание →
-  иностранные строки → блоки → устойчивые блоки на перевод → плашки поверх игры.
+  окно переднего плана → игра ли (detect) → кадр с окна игры → распознавание →
+  иностранные строки (русский текст отсеивается) → блоки → устойчивые блоки на
+  перевод → плашки поверх игры.
+
+Быстрый проход распознаёт каждый новый кадр как есть. Глубокий проход — когда
+экран замер (меню, надпись, диалог ждёт клика) и раз в несколько секунд — ищет
+надписи на картинках и текстурах, особые шрифты и мелкий текст: кадр
+распознаётся в нескольких вариантах (контраст, цветовые каналы, увеличение), а
+найденное принимается по согласию вариантов (:mod:`~russificator.overlay.vision`).
 
 Перевод идёт в отдельном потоке пачками; готовое берётся из памяти переводов
 (общей с программой) и из кэша сессии, поэтому повторяющийся текст (меню,
@@ -31,9 +38,9 @@ from urllib.parse import parse_qs, urlparse
 
 from .. import paths, settings
 from . import STATUS_PORT
-from . import detect, render, text, win32
+from . import detect, render, text, vision, win32
 from .ocr import Ocr, OcrUnavailable
-from .text import Block, Line, Tracker, TranslationCache
+from .text import Block, Line, Rect, Tracker, TranslationCache
 
 log = logging.getLogger("russificator.overlay")
 
@@ -48,6 +55,14 @@ HOTKEYS = {
 }
 # Сколько кадров подряд чёрный экран у полноэкранной игры, чтобы подсказать про режим «окно без рамки».
 BLACK_FRAMES = 25
+# Глубокий проход: не чаще раза в DEEP_INTERVAL с на меняющемся экране и не больше DEEP_SHARE времени.
+DEEP_INTERVAL = 2.5
+DEEP_SHARE = 0.2
+DEEP_BUDGET = 1.2                 # с на один глубокий проход (дальше варианты не распознаются)
+# Доля сетки кадра, сменившая яркость, после которой считаем, что сменилась сцена.
+SCENE_CUT = 0.45
+# Перевод, совпавший с оригиналом (или без русских букв), не показывается.
+SKIP = "\x00"
 
 DEFAULTS = {
     "live_mode": "auto",          # auto — как на вкладке «Русификация» (запасной — машинный), или machine|cloud|local
@@ -57,6 +72,7 @@ DEFAULTS = {
     "live_always": [],
     "live_never": [],
     "live_profiles": {},          # exe -> {"region": [x, y, w, h] доли клиентской области}
+    "live_deep": True,            # глубокий проход: надписи на картинках, особые шрифты, мелкий текст
 }
 
 
@@ -98,8 +114,21 @@ class LiveService:
         self.recent: Deque[Dict[str, str]] = deque(maxlen=40)
         self.count = 0
         self.ocr: Optional[Ocr] = None
+        self.ocr_ru: Optional[Ocr] = None                   # русское распознавание: отличить русский текст
+        self.words = None                                    # английский словарь (исправление ошибок распознавания)
         self.ocr_error: Optional[OcrUnavailable] = None
         self._ocr_failures = 0
+        self._capture_mode = "window"                        # window — кадр с окна игры; screen — область экрана
+        self._window_misses = 0
+        self.captured_by = ""
+        self._plates: List[Rect] = []                        # где наши плашки (в координатах кадра)
+        self._last_lines: List[Line] = []                    # строки быстрого прохода для текущего кадра
+        self._grid: List[int] = []
+        self._deep_sig = ""
+        self._deep_at = 0.0
+        self._deep_cost = 0.0
+        self.deep_found = 0
+        self._frame: Optional[Tuple[bytes, int, int]] = None  # последний кадр (для перечитывания блоков)
         self.translator = None
         self.translator_mode = ""
         self.translator_error = ""
@@ -155,6 +184,8 @@ class LiveService:
             self.gui.stop()
         if self.ocr:
             self.ocr.close()
+        if self.ocr_ru:
+            self.ocr_ru.close()
         if self._http:
             self._http.shutdown()
         try:
@@ -167,6 +198,11 @@ class LiveService:
 
     def _init_ocr(self) -> None:
         from . import ocr as ocr_mod
+        from . import words
+        try:
+            self.words = words.load()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("словарь английских слов: %s", exc)
         try:
             self.ocr = ocr_mod.create("en", paths.sub("tmp"))
             self.ocr_error = None
@@ -175,6 +211,11 @@ class LiveService:
             if exc.code == "no_language":
                 self.gui.balloon("Нужно распознавание английского",
                                  "Откройте «Русификатор игр» → «Живой перевод» и нажмите «Установить».")
+            return
+        try:
+            self.ocr_ru = ocr_mod.create_verifier(paths.sub("tmp"), prefer=getattr(self.ocr, "name", ""))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("русское распознавание: %s", exc)
 
     # ================================================================ главный цикл
 
@@ -216,30 +257,212 @@ class LiveService:
         x, y, w, h = self._region(fg)
         if w < 40 or h < 20:
             return
-        frame = win32.capture(x, y, w, h)
+        frame = self._capture(fg, x, y, w, h)
         if frame is None:
             return
+        self._frame = (frame, w, h)
         sig = self._sample(frame, w, h)
         if (x, y, w, h) == tuple(fg.client):
             self._check_black(fg, frame, w, h)     # в выбранной области чёрный фон — это нормально
-        if sig == self._frame_sig and not self.force_now and self.region == (x, y, w, h):
+        same_region = self.region == (x, y, w, h)
+        if sig == self._frame_sig and not self.force_now and same_region:
             # картинка та же — значит, и текст тот же: это ещё одно подтверждение, что он допечатан
             # (иначе статичный экран — диалог ждёт клика, меню — так и не дождался бы перевода)
             self._same_frame()
+            if self._deep_due(sig, static=True):
+                self._deep_scan(fg, frame, x, y, w, h, sig)
             self._show(x, y, w, h)
             return
+        grid = vision.luma_grid(frame, w, h)
+        scene_cut = same_region and bool(self._grid) and vision.changed_share(self._grid, grid) >= SCENE_CUT
+        self._grid = grid
         self._frame_sig = sig
         self.region = (x, y, w, h)
         lines = self._recognize(w, h, frame)
         if lines is None:
             return
-        lines = [ln for ln in lines if text.is_foreign(ln.text)]
+        self._last_lines = lines
+        lines = self._foreign(lines, fg, frame, x, y, w, h)
         blocks = text.group_lines(lines)
-        self.tracker.need = 1 if self.force_now else 2
+        force = self.force_now
+        self.tracker.need = 1 if force else 2
         self.force_now = False
-        self.tracker.update(blocks)
+        self.tracker.update(blocks, covered=self._covered(), scene_cut=scene_cut)
+        if force or self._deep_due(sig, static=False):
+            self._deep_scan(fg, frame, x, y, w, h, sig)
         self._dispatch_ready()
         self._show(x, y, w, h)
+
+    # ---------------------------------------------------------------- кадр
+
+    def _capture(self, fg: win32.WindowInfo, x: int, y: int, w: int, h: int) -> Optional[bytes]:
+        """Кадр игры: с самого окна (наших плашек и чужих окон в нём нет), а если окно так не
+        снимается — область экрана, где место наших плашек закрашивается."""
+        cx, cy, cw, ch = fg.client
+        win_frame = None
+        if self._capture_mode == "window":
+            win_frame = win32.capture_window(fg.hwnd, cw, ch, (x - cx, y - cy, w, h))
+            if win_frame is not None and len(win_frame) != w * h * 4:
+                win_frame = None
+            if win_frame is not None and not vision.blank(win_frame, w, h):
+                self._window_misses = 0
+                self.captured_by = "window"
+                return win_frame
+        screen = win32.capture(x, y, w, h)
+        if screen is None:
+            return win_frame
+        screen = self._mask_plates(screen, w, h)
+        if self._capture_mode == "window":
+            if win_frame is None or not vision.blank(screen, w, h):
+                # окно снимается пустым (или не снимается), а на экране картинка есть
+                self._window_misses += 1
+                if win_frame is None or self._window_misses >= 3:
+                    self._capture_mode = "screen"
+                    log.info("кадр снимается с экрана: окно игры не отдаёт картинку")
+            else:
+                self.captured_by = "window"
+                return win_frame                    # тёмный экран в самой игре
+        self.captured_by = "screen"
+        return screen
+
+    def _mask_plates(self, frame: bytes, w: int, h: int) -> bytes:
+        """Снимок экрана: закрасить наши плашки (если Windows не прячет их от захвата), иначе
+        распознавание читало бы собственный перевод."""
+        if not self._plates or (self.gui is not None and getattr(self.gui, "excluded_from_capture", False)):
+            return frame
+        buf = bytearray(frame)
+        stride = w * 4
+        for bx, by, bw, bh in self._plates:
+            x0, y0, x1, y1 = max(0, bx), max(0, by), min(w, bx + bw), min(h, by + bh)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            blank_row = bytes((x1 - x0) * 4)
+            for row in range(y0, y1):
+                buf[row * stride + x0 * 4:row * stride + x1 * 4] = blank_row
+        return bytes(buf)
+
+    def _covered(self) -> List[Rect]:
+        """Области кадра, которые сейчас не видны распознаванию (закрашенные плашки)."""
+        if self.captured_by == "screen" and not (self.gui is not None and
+                                                 getattr(self.gui, "excluded_from_capture", False)):
+            return list(self._plates)
+        return []
+
+    # ---------------------------------------------------------------- что переводить
+
+    def _foreign(self, lines: List[Line], fg: win32.WindowInfo, frame: bytes, x: int, y: int, w: int,
+                 h: int) -> List[Line]:
+        """Строки, которые нужно переводить: иностранные, не заголовок окна и не русский текст,
+        прочитанный английским распознаванием как абракадабра."""
+        cands = [ln for ln in lines if text.is_foreign(ln.text) and not self._is_caption(ln, fg, y)
+                 and not text.is_brand(ln.text) and not self._title_fragment(ln, fg, h)]
+        if not cands:
+            return []
+        ru = self._recognize_ru(frame, w, h, cands)
+        ranks = self.words.ranks if self.words is not None else None
+        out: List[Line] = []
+        for ln in cands:
+            if ru is not None:
+                r = text.line_rect(ln)
+                over = [m for m in ru if text.intersect_area(r, text.line_rect(m)) >=
+                        0.3 * min(text.area(r), max(1, text.area(text.line_rect(m))))]
+                if over and text.looks_russian(" ".join(m.text for m in over)):
+                    continue                        # русское распознавание прочитало тут русский текст
+                if not over and text.misread_cyrillic(ln.text, ranks):
+                    continue
+            elif text.misread_cyrillic(ln.text, ranks):
+                continue
+            junk = text.junk_tokens(ln.text)
+            if junk and (ranks is None or text.known_words(ln.text, ranks) < 2 * len(junk)):
+                continue                            # мусор распознавания (узор, логотип) — не переводим
+            out.append(ln)
+        return out
+
+    def _is_caption(self, ln: Line, fg: win32.WindowInfo, y: int) -> bool:
+        """Заголовок окна внутри клиентской области (так рисуют окна NW.js, Electron) — не переводим."""
+        top = y - fg.client[1] + ln.y
+        if top > 48 or not fg.title:
+            return False
+        a, b = text.normalize(ln.text), text.normalize(fg.title)
+        return bool(a) and (text.similar(a, b, 0.7) or (len(a) >= 4 and a in b))
+
+    @staticmethod
+    def _title_fragment(ln: Line, fg: win32.WindowInfo, h: int) -> bool:
+        """Крупная надпись только из слов названия игры (заголовка окна или имени exe) — это логотип:
+        название не переводится, а обрывок стилизованного логотипа тем более."""
+        if ln.h < 0.045 * h:
+            return False
+        name = f"{fg.title} {Path(fg.exe).stem if fg.exe else ''}"
+        title = {t for t in text.normalize(name).split() if len(t) >= 2}
+        words = [t for t in text.normalize(ln.text).split() if len(t) >= 2]
+        # логотип нарисован особым шрифтом — распознавание может ошибиться в букве («SLOODMONEY»)
+        return bool(words) and all(t in title or (len(t) >= 5 and any(text.similar(t, tt, 0.75) for tt in title))
+                                   for t in words)
+
+    def _recognize_ru(self, frame: bytes, w: int, h: int, cands: List[Line]) -> Optional[List[Line]]:
+        """Русское распознавание области со строками-кандидатами (None — его нет или сбой)."""
+        if self.ocr_ru is None:
+            return None
+        x0 = max(0, min(ln.x for ln in cands) - 12)
+        y0 = max(0, min(ln.y for ln in cands) - 12)
+        x1 = min(w, max(ln.x + ln.w for ln in cands) + 12)
+        y1 = min(h, max(ln.y + ln.h for ln in cands) + 12)
+        cw, ch = x1 - x0, y1 - y0
+        if cw < 8 or ch < 8:
+            return None
+        stride = w * 4
+        crop = frame if (cw, ch) == (w, h) else b"".join(
+            frame[row * stride + x0 * 4:row * stride + x1 * 4] for row in range(y0, y1))
+        try:
+            lines = self.ocr_ru.recognize(cw, ch, crop)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("русское распознавание: %s", exc)
+            return None
+        return [Line(ln.text, ln.x + x0, ln.y + y0, ln.w, ln.h) for ln in lines]
+
+    # ---------------------------------------------------------------- глубокий проход
+
+    def _deep_due(self, sig: str, static: bool) -> bool:
+        if self.ocr is None or not _cfg(self.cfg, "live_deep"):
+            return False
+        now = time.monotonic()
+        if static:
+            return sig != self._deep_sig and now - self._deep_at >= 0.5
+        return now - self._deep_at >= max(DEEP_INTERVAL, self._deep_cost / DEEP_SHARE)
+
+    def _deep_scan(self, fg: win32.WindowInfo, frame: bytes, x: int, y: int, w: int, h: int, sig: str) -> None:
+        """Надписи на картинках, особые шрифты, мелкий текст: распознать варианты кадра и взять то,
+        что подтвердили хотя бы два варианта."""
+        started = time.monotonic()
+        results: List[List[Line]] = []
+        try:
+            for name, scale, data, vw, vh in vision.variants(frame, w, h, int(getattr(self.ocr, "max_dim", 4096))):
+                if time.monotonic() - started > DEEP_BUDGET:
+                    break
+                try:
+                    lines = self.ocr.recognize(vw, vh, data)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("глубокий проход (%s): %s", name, exc)
+                    continue
+                if scale != 1:
+                    lines = [Line(ln.text, int(ln.x / scale), int(ln.y / scale), max(1, int(ln.w / scale)),
+                                  max(1, int(ln.h / scale))) for ln in lines]
+                results.append(lines)
+            found = text.merge_deep(self._last_lines, [self._last_lines] + results)
+            found = self._foreign(found, fg, frame, x, y, w, h)
+            # крупная надпись (логотип), прочитанная лишь частично, выглядит хуже непереведённой
+            ranks = self.words.ranks if self.words is not None else None
+            found = [ln for ln in found if ln.h < 0.07 * h or text.known_words(ln.text, ranks) >= 3]
+            if found:
+                hold = max(4.0, DEEP_INTERVAL * 1.6, self._deep_cost / DEEP_SHARE * 1.6)
+                added = self.tracker.add(text.group_lines(found), hold=hold)
+                self.deep_found += len(added)
+                if added:
+                    log.info("глубокий проход: %s", " | ".join(b.text[:40] for b in added))
+        finally:
+            self._deep_at = time.monotonic()
+            self._deep_cost = self._deep_at - started
+            self._deep_sig = sig
 
     def _same_frame(self) -> None:
         now = time.monotonic()
@@ -250,13 +473,56 @@ class LiveService:
         self._dispatch_ready()
 
     def _dispatch_ready(self) -> None:
-        """Устойчивые блоки без перевода: из кэша сессии сразу, остальные — в очередь переводчику."""
+        """Устойчивые блоки без перевода: из кэша сессии сразу, остальные — перечитать крупнее
+        и в очередь переводчику."""
         for b in self.tracker.ready():
             hit = self.cache.get(b.key)
-            if hit:
+            if hit == SKIP:
+                b.skip = True
+            elif hit:
                 b.translation = hit
             else:
+                self._refine(b)
                 self._enqueue(b)
+
+    def _refine(self, b: Block) -> None:
+        """Перечитать блок в увеличенном виде (x2–x3): мелкий и особый шрифт распознаётся заметно
+        точнее («unutd be an qeratbn» → «would be an operation»). Берётся, если прочтение лучше."""
+        if b.refined is not None or self.ocr is None or self._frame is None:
+            return
+        b.refined = ""
+        frame, w, h = self._frame
+        lh = b.line_height
+        if lh >= 34:
+            return                                  # крупный текст и так читается хорошо
+        scale = 3 if lh < 15 else 2
+        bx, by, bw, bh = b.rect
+        m = int(max(6, lh * 0.6))
+        x0, y0, x1, y1 = max(0, bx - m), max(0, by - m), min(w, bx + bw + m), min(h, by + bh + m)
+        cw, ch = x1 - x0, y1 - y0
+        limit = int(getattr(self.ocr, "max_dim", 4096))
+        if cw < 8 or ch < 8 or max(cw, ch) * scale > limit:
+            return
+        try:
+            from PIL import Image
+            stride = w * 4
+            crop = b"".join(frame[row * stride + x0 * 4:row * stride + x1 * 4] for row in range(y0, y1))
+            img = Image.frombuffer("RGBA", (cw, ch), crop, "raw", "BGRA", 0, 1).resize((cw * scale, ch * scale),
+                                                                                         Image.LANCZOS)
+            lines = self.ocr.recognize(cw * scale, ch * scale, img.tobytes("raw", "BGRA"))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("перечитывание блока: %s", exc)
+            return
+        lines = sorted((ln for ln in lines if ln.text.strip()), key=lambda ln: (ln.y, ln.x))
+        if not lines:
+            return
+        refined = text.join_lines([ln.text for ln in lines])
+        if text.cyrillic_share(refined) > 0.3 or not text.is_foreign(refined):
+            return
+        ranks = self.words.ranks if self.words is not None else None
+        old_known, new_known = text.known_words(b.text, ranks), text.known_words(refined, ranks)
+        if new_known > old_known or (new_known == old_known and text.letters(refined) > text.letters(b.text) * 1.1):
+            b.refined = refined
 
     def _recognize(self, w: int, h: int, frame: bytes) -> Optional[List[Line]]:
         try:
@@ -336,7 +602,12 @@ class LiveService:
     def _set_target(self, fg: win32.WindowInfo, reason: str) -> None:
         self.target_reason = reason
         self.tracker = Tracker()
-        self._shown_sig = self._frame_sig = ""
+        self._shown_sig = self._frame_sig = self._deep_sig = ""
+        self._capture_mode = "window"
+        self._window_misses = 0
+        self._plates = []
+        self._grid = []
+        self._last_lines = []
         # в играх, русифицированных файлами, Alt+T уже занят самой игрой (переключает перевод/оригинал) —
         # глобальная клавиша оверлея его бы перехватила
         own = self._russified(fg.exe)
@@ -371,12 +642,13 @@ class LiveService:
         self._hide()
 
     def _hide(self) -> None:
+        self._plates = []
         if self._shown_sig:
             self._shown_sig = ""
             self.gui.hide()
 
     def _show(self, x: int, y: int, w: int, h: int) -> None:
-        visible = [b for b in self.tracker.blocks if b.translation]
+        visible = [b for b in self.tracker.blocks if b.translation and not b.skip]
         if not visible:
             self._hide()
             return
@@ -387,6 +659,7 @@ class LiveService:
                              opacity=float(_cfg(self.cfg, "live_opacity")))
         items = [render.Item(rect=b.rect, text=b.translation or "", line_h=b.line_height) for b in visible]
         img = render.render((w, h), items, style)
+        self._plates = render.plate_rects((w, h), items, style)
         self.gui.show_frame(x, y, w, h, render.to_bgra_premultiplied(img))
         self._shown_sig = sig
 
@@ -445,13 +718,14 @@ class LiveService:
                 continue
             todo: List[Block] = []
             ns = self.translator.cache_id
+            src = {id(b): self._source(b) for b in batch}
             if self.memory is not None:
                 try:
-                    hits = self.memory.get_many(ns, [(b.text, None) for b in batch])
+                    hits = self.memory.get_many(ns, [(src[id(b)], None) for b in batch])
                 except Exception:  # noqa: BLE001
                     hits = {}
                 for b in batch:
-                    tr = hits.get((b.text, None))
+                    tr = hits.get((src[id(b)], None))
                     if tr:
                         self._done(b, tr, from_memory=True)
                     else:
@@ -460,7 +734,7 @@ class LiveService:
                 todo = batch
             if not todo:
                 continue
-            entries = [Entry(id=str(i), source=b.text, kind=TextKind.OTHER) for i, b in enumerate(todo)]
+            entries = [Entry(id=str(i), source=src[id(b)], kind=TextKind.OTHER) for i, b in enumerate(todo)]
             try:
                 out = self.translator.translate(entries, {})
             except Exception as exc:  # noqa: BLE001
@@ -477,7 +751,7 @@ class LiveService:
                 tr = (out.get(str(i)) or "").strip()
                 if tr:
                     self._done(b, tr)
-                    fresh[(b.text, None)] = tr
+                    fresh[(src[id(b)], None)] = tr
                 else:
                     with self._cond:
                         self._pending.discard(b.key)
@@ -487,17 +761,34 @@ class LiveService:
                 except Exception:  # noqa: BLE001
                     pass
 
+    def _source(self, b: Block) -> str:
+        """Текст блока для переводчика: с исправленными ошибками распознавания («sraphic» → «graphic»)."""
+        base = b.refined or b.text
+        src = text.without_junk(base) or base
+        if self.words is None:
+            return src
+        try:
+            return self.words.fix(src)
+        except Exception:  # noqa: BLE001
+            return src
+
     def _done(self, b: Block, tr: str, from_memory: bool = False) -> None:
-        b.translation = tr
-        self.cache.put(b.key, tr)
+        # перевод без русских букв или совпавший с оригиналом (имена, коды, абракадабра) — плашка не нужна
+        useless = not text.cyrillic_share(tr) or text.normalize(tr) == text.normalize(b.text)
+        self.cache.put(b.key, SKIP if useless else tr)
         with self._cond:
             self._pending.discard(b.key)
-        # тот же текст мог появиться новым блоком, пока шёл перевод
-        for other in self.tracker.blocks:
-            if not other.translation and text.similar(other.key, b.key, 0.93):
-                other.translation = tr
+        targets = [b] + [o for o in self.tracker.blocks  # тот же текст мог появиться новым блоком
+                         if o is not b and not o.translation and text.similar(o.key, b.key, 0.93)]
+        for o in targets:
+            if useless:
+                o.skip = True
+            else:
+                o.translation = tr
+        if useless:
+            return
         self.count += 1
-        self.recent.appendleft({"src": b.text[:160], "tr": tr[:160]})
+        self.recent.appendleft({"src": (b.refined or b.text)[:160], "tr": tr[:160]})
         self._shown_sig = ""                    # перерисовать на следующем кадре
 
     # ================================================================ клавиши, трей, область
@@ -635,10 +926,8 @@ class LiveService:
             "game": {"title": t.title or Path(t.exe).stem, "exe": t.exe, "reason": self.target_reason,
                      "region": has_region(t)} if t else None,
             "candidate": {"title": c.title or Path(c.exe).stem, "exe": c.exe} if c else None,
-            "hint": self.hint or ("" if not self.gui or self.gui.excluded_from_capture else
-                                  "Эта версия Windows не умеет прятать перевод от снимков экрана — плашки могут "
-                                  "мигать. Обновите Windows 10 до версии 2004 или новее (или Windows 11)."),
-            "hint_title": "Живой перевод не видит игру" if self.hint else "Перевод может мигать",
+            "hint": self.hint,
+            "hint_title": "Живой перевод не видит игру" if self.hint else "",
             "ocr": {"ok": self.ocr is not None, "name": getattr(self.ocr, "name", ""),
                     "lang": getattr(self.ocr, "lang", ""), "code": err.code if err else "",
                     "error": str(err) if err else "", "starting": self.ocr is None and err is None},
@@ -648,6 +937,11 @@ class LiveService:
                           "region": has_region(last)} if last else None,
             "count": self.count, "recent": list(self.recent)[:12],
             "capture_excluded": bool(self.gui and self.gui.excluded_from_capture),
+            "capture": self.captured_by,
+            "verify_ru": self.ocr_ru is not None,
+            "deep": {"on": bool(_cfg(self.cfg, "live_deep")), "found": self.deep_found,
+                     "ms": int(self._deep_cost * 1000)},
+            "busy_hotkeys": list(getattr(self.gui, "busy_hotkeys", []) or []),
         }
 
     def _start_http(self) -> None:

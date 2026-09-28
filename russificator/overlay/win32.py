@@ -5,8 +5,14 @@
 требует для окон, трея и глобальных горячих клавиш.
 
 Окно оверлея — многослойное (per-pixel alpha), поверх всех, прозрачное для
-мыши и не забирающее фокус. Оно исключено из захвата экрана
-(``WDA_EXCLUDEFROMCAPTURE``): распознавание видит игру, а не наш перевод.
+мыши и не забирающее фокус.
+
+Кадр игры снимается с самого окна игры (:func:`capture_window`, ``PrintWindow``
+с ``PW_RENDERFULLCONTENT``): в него не попадают ни наши плашки, ни окна поверх
+игры. Запасной путь — снимок области экрана (:func:`capture`); в нём плашки
+видны, если Windows не умеет исключать окно из захвата (``WDA_EXCLUDEFROMCAPTURE``
+не работает для per-pixel alpha окон в Windows 10), поэтому служба закрашивает
+их место перед распознаванием.
 """
 
 from __future__ import annotations
@@ -51,6 +57,7 @@ SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE, SWP_SHOWWINDOW = 0x1, 0x2, 0x10, 0x40
 ULW_ALPHA = 0x2
 AC_SRC_OVER, AC_SRC_ALPHA = 0x0, 0x1
 SRCCOPY, CAPTUREBLT = 0x00CC0020, 0x40000000
+PW_CLIENTONLY, PW_RENDERFULLCONTENT = 0x1, 0x2
 DIB_RGB_COLORS, BI_RGB = 0, 0
 WDA_EXCLUDEFROMCAPTURE = 0x11
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x4000
@@ -196,6 +203,7 @@ if IS_WINDOWS:
     SetCapture = _proto(user32, "SetCapture", wintypes.HWND, wintypes.HWND)
     ReleaseCapture = _proto(user32, "ReleaseCapture", wintypes.BOOL)
     RegisterWindowMessageW = _proto(user32, "RegisterWindowMessageW", wintypes.UINT, wintypes.LPCWSTR)
+    PrintWindow = _proto(user32, "PrintWindow", wintypes.BOOL, wintypes.HWND, wintypes.HDC, wintypes.UINT)
     try:
         SetWindowDisplayAffinity = _proto(user32, "SetWindowDisplayAffinity", wintypes.BOOL, wintypes.HWND,
                                           wintypes.DWORD)
@@ -356,6 +364,58 @@ def single_instance(name: str) -> bool:
 
 # ------------------------------------------------------------------ захват экрана
 
+def _read_bitmap(mem, bmp, w: int, h: int) -> Optional[bytes]:
+    bmi = BITMAPINFO()
+    bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.bmiHeader.biWidth = w
+    bmi.bmiHeader.biHeight = -h          # сверху вниз
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    bmi.bmiHeader.biCompression = BI_RGB
+    buf = ctypes.create_string_buffer(w * h * 4)
+    if GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(bmi), DIB_RGB_COLORS) != h:
+        return None
+    return buf.raw
+
+
+def capture_window(hwnd: int, cw: int, ch: int, region: Tuple[int, int, int, int]) -> Optional[bytes]:
+    """Пиксели части клиентской области окна (BGRA, сверху вниз), снятые с самого окна.
+
+    ``region`` — (x, y, w, h) внутри клиентской области размера ``cw`` × ``ch``. Окна поверх
+    (и наш оверлей) в кадр не попадают. None — окно так не снимается (тогда — :func:`capture`)."""
+    if not IS_WINDOWS or cw <= 0 or ch <= 0:
+        return None
+    rx, ry, w, h = region
+    rx, ry = max(0, rx), max(0, ry)
+    w, h = min(w, cw - rx), min(h, ch - ry)
+    if w <= 0 or h <= 0:
+        return None
+    screen = GetDC(None)
+    if not screen:
+        return None
+    mem = CreateCompatibleDC(screen)
+    bmp = CreateCompatibleBitmap(screen, cw, ch)
+    old = SelectObject(mem, bmp)
+    try:
+        if not PrintWindow(hwnd, mem, PW_CLIENTONLY | PW_RENDERFULLCONTENT):
+            return None
+        SelectObject(mem, old)
+        old = None
+        raw = _read_bitmap(mem, bmp, cw, ch)
+    finally:
+        if old is not None:
+            SelectObject(mem, old)
+        DeleteObject(bmp)
+        DeleteDC(mem)
+        ReleaseDC(None, screen)
+    if raw is None:
+        return None
+    if (rx, ry, w, h) == (0, 0, cw, ch):
+        return raw
+    stride = cw * 4
+    return b"".join(raw[(ry + row) * stride + rx * 4:(ry + row) * stride + (rx + w) * 4] for row in range(h))
+
+
 def capture(x: int, y: int, w: int, h: int) -> Optional[bytes]:
     """Пиксели области экрана (BGRA, сверху вниз). Окна, исключённые из захвата, в кадр не попадают."""
     if not IS_WINDOWS or w <= 0 or h <= 0:
@@ -471,6 +531,7 @@ class Gui:
         self._taskbar_created = 0
         self.excluded_from_capture = False
         self.visible = False
+        self.busy_hotkeys: List[str] = []           # клавиши, которые заняты другой программой
 
     # --- запуск/остановка (из любого потока)
 
@@ -563,7 +624,8 @@ class Gui:
         if SetWindowDisplayAffinity is not None:
             self.excluded_from_capture = bool(SetWindowDisplayAffinity(self.overlay, WDA_EXCLUDEFROMCAPTURE))
         if not self.excluded_from_capture:
-            log.warning("окно оверлея не исключено из захвата экрана (нужна Windows 10 2004+)")
+            # для per-pixel alpha окна Windows 10 этого не умеет — кадр снимается с окна игры
+            log.info("окно оверлея не исключено из захвата экрана — кадр снимается с окна игры")
         self._taskbar_created = RegisterWindowMessageW("TaskbarCreated")
         self._tray(NIM_ADD)
 
@@ -602,13 +664,18 @@ class Gui:
                 UnregisterHotKey(self.host, hid)
                 del self._hotkeys[hid]
         have = {(hk.mods, hk.vk) for hk in self._hotkeys.values()}
+        busy = [n for n in self.busy_hotkeys if any(k.name == n for k in self._wanted)]
         for key, hk in wanted.items():
             if key in have:
                 continue
             if RegisterHotKey(self.host, hk.id, hk.mods | MOD_NOREPEAT, hk.vk):
                 self._hotkeys[hk.id] = hk
-            else:
+                if hk.name in busy:
+                    busy.remove(hk.name)
+            elif hk.name not in busy:
+                busy.append(hk.name)
                 log.warning("горячая клавиша %s занята другой программой", hk.name)
+        self.busy_hotkeys = busy
 
     def _render(self) -> None:
         with self._frame_lock:

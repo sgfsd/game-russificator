@@ -8,6 +8,10 @@
 «Оптическое распознавание символов»). Если его нет — :class:`OcrUnavailable` с
 кодом ``no_language``, а окно программы предлагает поставить его одной кнопкой
 (:func:`install_language_command`).
+
+Второе, русское распознавание (:func:`create_verifier`; в русской Windows оно
+обычно уже есть) проверяет найденные строки: английское читает русский текст
+как латинскую абракадабру, а русское — правильно, и такие строки не переводятся.
 """
 
 from __future__ import annotations
@@ -48,6 +52,9 @@ class Ocr:
 
     def close(self) -> None:
         pass
+
+
+_LANG_NAMES = {"en": "английского", "ru": "русского"}
 
 
 # ------------------------------------------------------------------ pythonnet
@@ -133,11 +140,12 @@ class DotNetOcr(Ocr):
                 pick = next((x for x in langs if str(tag_p.GetValue(x, None)).lower().startswith(lang.lower())), None)
             except Exception as exc:  # noqa: BLE001
                 log.warning("список языков распознавания: %s", exc)
+        missing = f"распознавание {_LANG_NAMES.get(lang, lang)} не установлено в Windows"
         if pick is None:
-            raise OcrUnavailable("no_language", "распознавание английского не установлено в Windows")
+            raise OcrUnavailable("no_language", missing)
         self.engine = self.Engine.GetMethod("TryCreateFromLanguage").Invoke(None, Array[Object]([pick]))
         if self.engine is None:
-            raise OcrUnavailable("no_language", "распознавание английского не установлено в Windows")
+            raise OcrUnavailable("no_language", missing)
         self.lang = str(tag_p.GetValue(pick, None))
         try:
             self.max_dim = int(self.Engine.GetProperty("MaxImageDimension").GetValue(None, None))
@@ -307,6 +315,30 @@ def create(lang: str = "en", workdir: Optional[Path] = None) -> Ocr:
             errors.append(OcrUnavailable("failed", str(exc)))
     best = next((e for e in errors if e.code == "no_language"), errors[-1] if errors else OcrUnavailable("failed"))
     raise best
+
+
+def create_verifier(workdir: Optional[Path] = None, prefer: str = "pythonnet") -> Optional[Ocr]:
+    """Русское распознавание для проверки строк (или None, если его нет в Windows)."""
+    if sys.platform != "win32":
+        return None
+    makers = [lambda: DotNetOcr("ru"), lambda: PowerShellOcr("ru", workdir)]
+    if prefer == "powershell":
+        makers.reverse()
+    for make in makers:
+        try:
+            ocr = make()
+            if not ocr.lang.lower().startswith("ru"):
+                ocr.close()
+                return None
+            log.info("проверка русского текста: %s, язык %s", ocr.name, ocr.lang)
+            return ocr
+        except OcrUnavailable as exc:
+            if exc.code == "no_language":
+                log.info("русского распознавания в Windows нет — русский текст узнаётся по приметам")
+                return None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("русское распознавание: %s", exc)
+    return None
 
 
 def install_language_command(tag: str = "en-US") -> str:

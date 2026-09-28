@@ -149,7 +149,7 @@ class _FakeTranslator:
     cache_id = "fake:live"
 
     def translate(self, entries, glossary):
-        return {e.id: "RU " + e.source for e in entries}
+        return {e.id: "РУ " + e.source for e in entries}
 
     def close(self):
         pass
@@ -168,6 +168,7 @@ def test_live_service_pipeline(tmp_path, monkeypatch):
     frame = [bytes(1280 * 720 * 4)]
     monkeypatch.setattr(win32, "foreground", lambda: fg)
     monkeypatch.setattr(win32, "capture", lambda x, y, w, h: frame[0])
+    monkeypatch.setattr(win32, "capture_window", lambda hwnd, cw, ch, region: frame[0])
     svc = service.LiveService(quiet=True)
     svc.gui = _FakeGui()
     svc.ocr = _FakeOcr([text.Line("Press any key to continue", 500, 600, 280, 24), text.Line("100/100", 10, 10, 60, 18)])
@@ -185,7 +186,7 @@ def test_live_service_pipeline(tmp_path, monkeypatch):
                 break
             time.sleep(0.02)
         svc._tick()
-        assert svc.count == 1 and svc.recent[0]["tr"] == "RU Press any key to continue"
+        assert svc.count == 1 and svc.recent[0]["tr"] == "РУ Press any key to continue"
         assert svc.gui.frames and svc.gui.frames[-1][:4] == (0, 0, 1280, 720)
         st = svc.status()
         assert st["game"]["title"] == "Hollow Knight" and st["ocr"]["ok"] and st["count"] == 1
@@ -234,6 +235,7 @@ def test_live_animated_frame_also_translates(tmp_path, monkeypatch):
         return bytes([n[0] % 250]) * (w * h * 4)
     monkeypatch.setattr(win32, "foreground", lambda: fg)
     monkeypatch.setattr(win32, "capture", cap)
+    monkeypatch.setattr(win32, "capture_window", lambda hwnd, cw, ch, region: cap(0, 0, region[2], region[3]))
     svc = service.LiveService(quiet=True)
     svc.gui = _FakeGui()
     svc.ocr = _FakeOcr([text.Line("Welcome back, traveler!", 100, 300, 280, 24)])
@@ -272,6 +274,7 @@ def test_live_black_frame_hint(tmp_path, monkeypatch):
     frame = [bytes(640 * 360 * 4)]
     monkeypatch.setattr(win32, "foreground", lambda: fg)
     monkeypatch.setattr(win32, "capture", lambda x, y, w, h: frame[0])
+    monkeypatch.setattr(win32, "capture_window", lambda hwnd, cw, ch, region: frame[0])
     svc = service.LiveService(quiet=True)
     svc.gui = _FakeGui()
     svc.ocr = _FakeOcr([])
@@ -299,6 +302,7 @@ def test_live_leaves_alt_t_to_russified_games(tmp_path, monkeypatch):
                           monitor=(0, 0, 640, 360), minimized=False)
     monkeypatch.setattr(win32, "foreground", lambda: fg)
     monkeypatch.setattr(win32, "capture", lambda x, y, w, h: bytes(w * h * 4))
+    monkeypatch.setattr(win32, "capture_window", lambda hwnd, cw, ch, region: None)
     svc = service.LiveService(quiet=True)
     svc.gui = _FakeGui()
     svc.ocr = _FakeOcr([])

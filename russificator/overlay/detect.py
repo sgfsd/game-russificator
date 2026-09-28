@@ -7,7 +7,9 @@
      (в том числе ради приватности: их экран не распознаётся вовсе);
   4. exe лежит в папке игры из «Моих игр» — да;
   5. Windows сама считает это игрой (Game Bar, реестр GameConfigStore) — да;
-  6. окно занимает весь монитор (полный экран или «окно без рамки») — да.
+  6. рядом с exe файлы игрового движка (Unity, Ren'Py, RPG Maker, Unreal, Godot…)
+     или папка отката русификатора — да (игры в окне находятся сами);
+  7. окно занимает весь монитор (полный экран или «окно без рамки») — да.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 #: процессы, которые оверлей не трогает никогда (по имени exe, в нижнем регистре)
 DENY = {
@@ -47,6 +49,44 @@ DENY = {
 
 #: причина «не игра», при которой окно можно добавить в «Всегда» (обычное окно, не из запретного списка)
 REASON_WINDOW = "обычное окно"
+
+#: движки, по файлам которых окно считается игрой (Electron/NW.js-программы сюда не входят)
+GAME_ENGINES = {"unity", "renpy", "rpgmaker", "rpgmaker2k", "unreal", "godot", "gamemaker", "kirikiri", "wolf"}
+#: выше этих папок движок не ищем (иначе любая программа в Program Files могла бы сойти за игру)
+_STOP_DIRS = {"program files", "program files (x86)", "programdata", "windows", "users", "appdata", "local",
+              "roaming", "steamapps", "common", "games", "игры"}
+_engine_cache: Dict[str, str] = {}
+
+
+def engine_near(exe: str) -> str:
+    """Движок игры по файлам рядом с exe (папка exe и до двух уровней выше), «russified» —
+    игра, русифицированная программой; пустая строка — не игра. Результат запоминается."""
+    n = _norm(exe)
+    if not n:
+        return ""
+    if n in _engine_cache:
+        return _engine_cache[n]
+    found = ""
+    try:
+        from ..core.backup import BACKUP_DIR
+        from ..library import quick_engine
+        folder = Path(exe).parent
+        for cand in [folder, *list(folder.parents)[:2]]:
+            if cand.parent == cand or cand.name.lower() in _STOP_DIRS:
+                break
+            if (cand / BACKUP_DIR).is_dir():
+                found = "russified"
+                break
+            engine = quick_engine(cand)
+            if engine in GAME_ENGINES:
+                found = engine
+                break
+    except Exception:  # noqa: BLE001
+        found = ""
+    if len(_engine_cache) > 512:
+        _engine_cache.clear()
+    _engine_cache[n] = found
+    return found
 
 
 def gamebar_exes() -> Set[str]:
@@ -85,11 +125,12 @@ _OWN = _norm(sys.executable)      # сама программа (в том чи�
 
 class Decider:
     def __init__(self, game_dirs: Iterable[str] = (), always: Iterable[str] = (), never: Iterable[str] = (),
-                 gamebar: Optional[Set[str]] = None):
+                 gamebar: Optional[Set[str]] = None, by_engine: bool = True):
         self.game_dirs: List[str] = sorted({_norm(d).rstrip("\\/") for d in game_dirs if d}, key=len, reverse=True)
         self.always = {_norm(p) for p in always}
         self.never = {_norm(p) for p in never}
         self.gamebar = gamebar if gamebar is not None else set()
+        self.by_engine = by_engine
 
     def decide(self, exe: str, fullscreen: bool) -> Tuple[bool, str]:
         """(игра ли, почему) для процесса окна переднего плана."""
@@ -108,6 +149,12 @@ class Decider:
                 return True, "игра из «Моих игр»"
         if n in self.gamebar:
             return True, "Windows считает это игрой"
+        engine = engine_near(exe) if self.by_engine else ""
+        if engine == "russified":
+            return True, "игра, русифицированная программой"
+        if engine:
+            from ..library import ENGINE_TITLES
+            return True, f"игра на {ENGINE_TITLES.get(engine, engine)}"
         if fullscreen:
             return True, "полноэкранное окно"
         return False, REASON_WINDOW
