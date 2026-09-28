@@ -815,13 +815,24 @@ def _setup_logging() -> None:
     root.setLevel(logging.INFO)
 
 
-def _selftest() -> int:
+def _message(title: str, text: str) -> None:
+    """Сообщение без окна программы (оно не открылось): стандартное окно Windows."""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, text, title, 0x10)
+    except Exception:  # noqa: BLE001
+        print(f"{title}: {text}", file=sys.stderr)
+
+
+def _selftest(blocked: Optional[str] = None) -> int:
     """Проверка сборки без окна: все компоненты импортируются, ресурсы на месте.
 
-    Результат пишется в logs/selftest.txt (у оконного exe нет консоли).
+    Результат пишется в logs/selftest.txt (у оконного exe нет консоли). ``blocked`` — файлы
+    программы остались помеченными «из интернета» (см. :mod:`russificator.unblock`).
     """
     lines = [f"version {russificator.__version__}"]
-    ok = True
+    ok = blocked is None
+    lines.append("ok   unblock" if ok else f"FAIL unblock: {blocked}")
     for mod in ("webview", "ctranslate2", "sentencepiece", "UnityPy", "numpy", "PIL",
                 "UnityPy.helpers.TypeTreeGenerator", "russificator.engines.unity.plugin",
                 "russificator.engines.renpy.plugin", "russificator.engines.rpgmaker.plugin",
@@ -862,8 +873,11 @@ def run(argv=None) -> int:
     игры (его запускает плагин русификатора внутри игры).
     """
     argv = list(argv or [])
+    # архив скачан из интернета: без этого .NET (окно, распознавание) не загрузится
+    from .. import unblock
+    blocked = unblock.ensure_unblocked()
     if "--selftest" in argv:
-        return _selftest()
+        return _selftest(blocked)
     if "--overlay" in argv:
         from ..overlay.service import run as run_overlay
         return run_overlay(argv)
@@ -887,6 +901,10 @@ def run(argv=None) -> int:
                 win32.activate(hwnd)
             return 0
     _setup_logging()
+    if blocked:
+        logging.getLogger("russificator").error("файлы программы заблокированы Windows: %s", blocked)
+        _message("Русификатор игр", blocked)
+        return 1
     import webview
     api = Api()
     window = webview.create_window(
@@ -903,8 +921,16 @@ def run(argv=None) -> int:
         threading.Thread(target=api.overlay_start, kwargs={"quiet": True}, daemon=True).start()
     storage = paths.sub("webview")
     _fresh_webview_cache(storage)
-    webview.start(debug=bool(os.environ.get("RUSSIFICATOR_DEBUG")), http_server=True,
-                  storage_path=str(storage), private_mode=False)
+    try:
+        webview.start(debug=bool(os.environ.get("RUSSIFICATOR_DEBUG")), http_server=True,
+                      storage_path=str(storage), private_mode=False)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("russificator").exception("окно программы не открылось")
+        _message("Русификатор игр — окно не открылось",
+                 f"{exc}\n\nЧаще всего помогает установить (или обновить) «Microsoft Edge WebView2 Runtime» с "
+                 "сайта Microsoft и .NET Framework 4.8, затем запустить программу снова.\n\n"
+                 f"Подробности — в журнале: {paths.logs_dir() / 'russificator.log'}")
+        return 1
     return 0
 
 

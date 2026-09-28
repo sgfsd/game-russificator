@@ -53,9 +53,14 @@ jobs:
       - name: Сборка exe
         run: pyinstaller russificator.spec --noconfirm
 
-      - name: Самопроверка exe
+      # Как у пользователя: браузер помечает скачанный архив «из интернета», Проводник переносит пометку на
+      # каждый распакованный файл — а .NET помеченные сборки не загружает. Программа должна справиться сама.
+      - name: Самопроверка exe (файлы помечены «из интернета», как после скачивания браузером)
         shell: pwsh
         run: |
+          Get-ChildItem dist\Russificator -Recurse -File | ForEach-Object {
+            Set-Content -LiteralPath $_.FullName -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
+          }
           $p = Start-Process -FilePath dist\Russificator\Russificator.exe -ArgumentList "--selftest" -Wait -PassThru
           Get-Content dist\Russificator\RussificatorData\logs\selftest.txt
           if ($p.ExitCode -ne 0) { throw "selftest failed: $($p.ExitCode)" }

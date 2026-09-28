@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "game-russificator"
-version = "2.1.0"
+version = "2.1.1"
 description = "Универсальный авторусификатор PC-игр: Unity, Ren'Py, RPG Maker"
 readme = "README.md"
 requires-python = ">=3.10"
