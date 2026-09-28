@@ -55,14 +55,22 @@ jobs:
 
       # Как у пользователя: браузер помечает скачанный архив «из интернета», Проводник переносит пометку на
       # каждый распакованный файл — а .NET помеченные сборки не загружает. Программа должна справиться сама.
+      # Сам exe не помечаем: его пользователь запускает через «Выполнить в любом случае» в SmartScreen,
+      # а на сервере сборки нажать некому.
       - name: Самопроверка exe (файлы помечены «из интернета», как после скачивания браузером)
         shell: pwsh
         run: |
-          Get-ChildItem dist\Russificator -Recurse -File | ForEach-Object {
-            Set-Content -LiteralPath $_.FullName -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
+          $files = Get-ChildItem dist\Russificator -Recurse -File | Where-Object { $_.Name -ne "Russificator.exe" }
+          foreach ($f in $files) {
+            Set-Content -LiteralPath $f.FullName -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
           }
+          $probe = "dist\Russificator\_internal\pythonnet\runtime\Python.Runtime.dll"
           $p = Start-Process -FilePath dist\Russificator\Russificator.exe -ArgumentList "--selftest" -Wait -PassThru
-          Get-Content dist\Russificator\RussificatorData\logs\selftest.txt
+          $log = "dist\Russificator\RussificatorData\logs\selftest.txt"
+          $text = if (Test-Path $log) { (Get-Content $log) -join "%0A" } else { "нет $log" }
+          $still = $null -ne (Get-Item -LiteralPath $probe -Stream Zone.Identifier -ErrorAction SilentlyContinue)
+          # аннотации видны на странице сборки без входа в GitHub
+          Write-Host "::notice title=Самопроверка (файлы из интернета)::код $($p.ExitCode), помечено $($files.Count), Python.Runtime.dll после запуска помечен: $still%0A$text"
           if ($p.ExitCode -ne 0) { throw "selftest failed: $($p.ExitCode)" }
           Remove-Item -Recurse -Force dist\Russificator\RussificatorData
 
