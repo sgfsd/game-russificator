@@ -302,13 +302,31 @@ def foreground() -> Optional[WindowInfo]:
     return window_info(GetForegroundWindow())
 
 
+def own_exes() -> List[str]:
+    """Пути exe нашего процесса: запущенный из исходников через .venv Python на самом деле работает
+    как базовый pythonw.exe (venv лишь перенаправляет), поэтому годятся оба."""
+    out = {os.path.normcase(os.path.abspath(sys.executable))}
+    base = getattr(sys, "_base_executable", "")
+    if base:
+        out.add(os.path.normcase(os.path.abspath(base)))
+    if IS_WINDOWS:
+        real = process_exe(os.getpid())
+        if real:
+            out.add(os.path.normcase(os.path.abspath(real)))
+    for p in list(out):                       # python.exe и pythonw.exe — одна и та же программа
+        d, name = os.path.split(p)
+        if name in ("python.exe", "pythonw.exe"):
+            out.update({os.path.join(d, "python.exe"), os.path.join(d, "pythonw.exe")})
+    return sorted(out)
+
+
 def find_program_window(title_prefix: str) -> Optional[int]:
     """Видимое окно нашей же программы (тот же exe) с заголовком, начинающимся с ``title_prefix``.
 
     Проверка exe нужна, чтобы не спутать с папкой «Русификатор игр», открытой в Проводнике."""
     if not IS_WINDOWS:
         return None
-    own = os.path.normcase(os.path.abspath(sys.executable))
+    own = set(own_exes())
     found: List[int] = []
     proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -320,7 +338,7 @@ def find_program_window(title_prefix: str) -> Optional[int]:
                 pid = wintypes.DWORD()
                 GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
                 exe = process_exe(pid.value)
-                if exe and os.path.normcase(os.path.abspath(exe)) == own:
+                if exe and os.path.normcase(os.path.abspath(exe)) in own:
                     found.append(int(hwnd))
                     return False
         except Exception:  # noqa: BLE001

@@ -282,3 +282,19 @@ def test_live_does_not_translate_game_title_logo(tmp_path, monkeypatch):
     kept = svc._foreign([Line("SLOODMONEY!", 250, 150, 700, 90), Line("NEW GAME", 220, 520, 390, 60)], fg2, frame[0],
                         0, 0, 1280, 720)
     assert [ln.text for ln in kept] == ["NEW GAME"]
+
+
+def test_live_skips_whole_title_and_gibberish(tmp_path, monkeypatch):
+    """«RESIDENT LOVER» (логотип обычного размера) — название; «fang:unc bv team avia» — абракадабра."""
+    from russificator.overlay import win32, words
+    frame = [bytes([90]) * (1920 * 1080 * 4)]
+    svc = _svc(tmp_path, monkeypatch, frame, [])
+    svc.words = words.Words({w: i for i, w in enumerate(["team", "game", "by", "press", "start", "new", "load"])})
+    fg = win32.WindowInfo(hwnd=11, pid=1, exe="D:/g/Resident_Lover.exe", title="Resident Lover",
+                          client=(0, 0, 1920, 1080), window=(0, 0, 1920, 1080), monitor=(0, 0, 1920, 1080),
+                          minimized=False)
+    lines = [Line("RESIDENT LOVER", 700, 300, 520, 40), Line("fang:unc bv team avia", 700, 600, 400, 30),
+             Line("Press start", 800, 900, 200, 30), Line("Lover", 100, 100, 80, 20)]
+    kept = svc._foreign(lines, fg, frame[0], 0, 0, 1920, 1080)
+    assert [ln.text for ln in kept] == ["Press start", "Lover"]
+    assert not text.gibberish("Ethan Grimwald and Lucy Vane", svc.words.ranks)     # имена — не мусор

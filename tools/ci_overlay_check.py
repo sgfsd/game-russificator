@@ -167,6 +167,14 @@ def check_live() -> bool:
         print(f"[live] игра: {st['game']}, распознавание: {st['ocr']['name']}, переведено: {st['count']}, "
               f"плашка на экране: {svc.gui.visible}, за {time.monotonic() - started:.1f} с, "
               f"последние: {st['recent'][:2]}")
+        print(f"[live] кадр снят: {st['capture']} (window — с окна игры), глубокий проход: {st['deep']}")
+        try:
+            ru = ocr.create_verifier(Path(tempfile.gettempdir()))
+            print(f"[live] русское распознавание для проверки строк: {ru.lang if ru else 'нет в этой Windows'}")
+            if ru:
+                ru.close()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[live] русское распознавание: {exc}")
         ok = bool(st["game"]) and st["count"] > 0 and svc.gui.visible
         svc.stop_event.set()
         svc.gui.stop()

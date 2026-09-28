@@ -120,7 +120,16 @@ def _norm(p: str) -> str:
     return os.path.normcase(os.path.normpath(str(p))) if p else ""
 
 
-_OWN = _norm(sys.executable)      # сама программа (в том числе запущенная из исходников через pythonw)
+def _own() -> Set[str]:
+    """Сама программа (в том числе запущенная из исходников: .venv перенаправляет на базовый pythonw)."""
+    try:
+        from .win32 import own_exes
+        return {_norm(p) for p in own_exes()}
+    except Exception:  # noqa: BLE001
+        return {_norm(sys.executable)}
+
+
+_OWN = _own()
 
 
 class Decider:
@@ -142,7 +151,7 @@ class Decider:
             return False, "в списке «Никогда»"
         if n in self.always:
             return True, "в списке «Всегда»"
-        if name in DENY or n == _OWN:
+        if name in DENY or n in _OWN:
             return False, "не игра (браузер, мессенджер, система)"
         for d in self.game_dirs:
             if n.startswith(d + os.sep) or n.startswith(d + "/"):

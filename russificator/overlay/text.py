@@ -139,6 +139,18 @@ def known_words(text: str, words: Optional[Set[str]]) -> int:
     return sum(1 for t in _tokens(text) if len(re.findall(r"[A-Za-z]", t)) >= 3 and _in_words(t.lower(), words))
 
 
+def gibberish(text: str, words: Set[str]) -> bool:
+    """Несколько незнакомых слов строчными и почти ни одного словарного — абракадабра распознавания
+    (узор, стилизованная надпись), а не английский текст. Имена (с заглавной) сюда не попадают."""
+    long_tokens = [t for t in _tokens(text) if len(re.findall(r"[A-Za-z]", t)) >= 3]
+    if len(long_tokens) < 3:
+        return False
+    unknown = [t for t in long_tokens if not _in_words(t.lower(), words)]
+    if (len(long_tokens) - len(unknown)) / len(long_tokens) >= 0.34:
+        return False
+    return sum(1 for t in unknown if t.islower()) >= 2
+
+
 def without_junk(text: str) -> str:
     """Строка без мусорных слов (для переводчика): «ABOUT )OOmG» → «ABOUT»."""
     junk = set(junk_tokens(text))

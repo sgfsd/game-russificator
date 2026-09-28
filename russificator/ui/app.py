@@ -826,7 +826,7 @@ def _selftest() -> int:
                 "UnityPy.helpers.TypeTreeGenerator", "russificator.engines.unity.plugin",
                 "russificator.engines.renpy.plugin", "russificator.engines.rpgmaker.plugin",
                 "russificator.core.package", "russificator.library", "russificator.overlay.service",
-                "russificator.overlay.ocr", "clr"):
+                "russificator.overlay.ocr", "russificator.overlay.vision", "russificator.overlay.words", "clr"):
         try:
             __import__(mod)
             lines.append(f"ok   {mod}")

@@ -375,6 +375,8 @@ class LiveService:
             junk = text.junk_tokens(ln.text)
             if junk and (ranks is None or text.known_words(ln.text, ranks) < 2 * len(junk)):
                 continue                            # мусор распознавания (узор, логотип) — не переводим
+            if ranks is not None and text.gibberish(ln.text, ranks):
+                continue
             out.append(ln)
         return out
 
@@ -388,16 +390,16 @@ class LiveService:
 
     @staticmethod
     def _title_fragment(ln: Line, fg: win32.WindowInfo, h: int) -> bool:
-        """Крупная надпись только из слов названия игры (заголовка окна или имени exe) — это логотип:
-        название не переводится, а обрывок стилизованного логотипа тем более."""
-        if ln.h < 0.045 * h:
-            return False
+        """Надпись только из слов названия игры (заголовка окна или имени exe) — это логотип:
+        название не переводится, а обрывок стилизованного логотипа тем более. Одно слово названия
+        считается логотипом, только если оно крупное (иначе это может быть пункт меню)."""
         name = f"{fg.title} {Path(fg.exe).stem if fg.exe else ''}"
         title = {t for t in text.normalize(name).split() if len(t) >= 2}
         words = [t for t in text.normalize(ln.text).split() if len(t) >= 2]
+        if not words or (len(words) < 2 and ln.h < 0.045 * h):
+            return False
         # логотип нарисован особым шрифтом — распознавание может ошибиться в букве («SLOODMONEY»)
-        return bool(words) and all(t in title or (len(t) >= 5 and any(text.similar(t, tt, 0.75) for tt in title))
-                                   for t in words)
+        return all(t in title or (len(t) >= 5 and any(text.similar(t, tt, 0.75) for tt in title)) for t in words)
 
     def _recognize_ru(self, frame: bytes, w: int, h: int, cands: List[Line]) -> Optional[List[Line]]:
         """Русское распознавание области со строками-кандидатами (None — его нет или сбой)."""
