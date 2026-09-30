@@ -144,6 +144,9 @@ def check_live() -> bool:
             fg = win32.foreground()
         print(f"[live] окно игры: {fg.exe if fg else None}, на весь экран: {fg.fullscreen if fg else None}")
         svc = service.LiveService(quiet=True)
+        # «игру» запускает тот же python, что и служба, — а свою программу служба не переводит
+        svc.cfg["live_always"] = [fg.exe] if fg else []
+        svc._decider_at = 0
         icon = Path(__file__).resolve().parents[1] / "russificator" / "resources" / "icon.ico"
         svc.gui = win32.Gui(str(icon), svc._on_hotkey, svc._on_menu, svc._on_region, svc._menu_items)
         svc.gui.start()
