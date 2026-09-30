@@ -840,13 +840,24 @@ def _selftest(blocked: Optional[str] = None) -> int:
                 "UnityPy.helpers.TypeTreeGenerator", "russificator.engines.unity.plugin",
                 "russificator.engines.renpy.plugin", "russificator.engines.rpgmaker.plugin",
                 "russificator.core.package", "russificator.library", "russificator.overlay.service",
-                "russificator.overlay.ocr", "russificator.overlay.vision", "russificator.overlay.words", "clr"):
+                "russificator.overlay.ocr", "russificator.overlay.vision", "russificator.overlay.words",
+                "russificator.overlay.pipeline", "russificator.overlay.paddle", "onnxruntime",
+                "ctranslate2.converters", "yaml", "clr"):
         try:
             __import__(mod)
             lines.append(f"ok   {mod}")
         except Exception as exc:  # noqa: BLE001
             ok = False
             lines.append(f"FAIL {mod}: {exc}")
+    try:                                      # нейросетевое распознавание живого перевода запускается
+        import numpy as np
+        from ..overlay import paddle
+        eng = paddle.PaddleOcr(gpu=False)
+        eng.recognize_array(np.full((64, 256, 4), 255, np.uint8))
+        lines.append("ok   ocr engine (PP-OCRv5)")
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        lines.append(f"FAIL ocr engine: {exc}")
     from ..fonts.library import ensure_font
     from ..translation.glossary import ui_phrases
     resources = Path(__file__).resolve().parents[1] / "resources"

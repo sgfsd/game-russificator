@@ -12,8 +12,11 @@
 
 ## Скачать
 
-1. Откройте [Releases](../../releases) и скачайте `Russificator-win64.zip`.
-2. Распакуйте в любую папку (лучше не в `Program Files`) и запустите `Russificator.exe`.
+### ⬇ [Скачать последнюю версию (Russificator-win64.zip)](https://github.com/sgfsd/game-russificator/releases/latest/download/Russificator-win64.zip)
+
+1. Скачайте архив по ссылке выше (что нового — на странице [последней версии](../../releases/latest)).
+2. Распакуйте в любую папку (лучше не в `Program Files`) и запустите `Russificator.exe`. Если Windows
+   покажет «Система Windows защитила ваш компьютер» — «Подробнее» → «Выполнить в любом случае».
 
 Нужна Windows 10/11 (64-бит). Python не нужен. Все модели и настройки хранятся
 рядом с программой, в папке `RussificatorData`. Чтобы удалить программу, удалите её папку.
