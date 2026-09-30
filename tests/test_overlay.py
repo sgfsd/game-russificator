@@ -375,3 +375,27 @@ def test_shape_cache_ignores_background_but_not_digits():
     cache.put(sh, ("HP: 45 / 100", 0.99, False, ""))
     assert cache.get(crop("HP: 45 / 100", (80, 55, 120)))[0][0] == "HP: 45 / 100"   # фон под строкой другой
     assert cache.get(crop("HP: 46 / 100", (60, 40, 90)))[0] is None                  # другая цифра
+
+
+def test_pipeline_closed_window_over_light_background_is_gone():
+    """Окно выбора закрылось, а под ним светлый пёстрый фон (много «белого»): перевод всё равно
+    убирается — фон между буквами уже не тот."""
+    pytest.importorskip("numpy")
+    import numpy as np
+    from russificator.overlay.pipeline import Pipeline
+    texture = _canvas(640, 360, [], bg=(60, 60, 60))
+    texture[::4, :, :3] = 235
+    texture[:, ::3, :3] = 235
+    shown = texture.copy()
+    shown[90:134, 90:320, :3] = 30                                  # окно выбора
+    shown = np.where(_canvas(640, 360, [(100, 100, 200, 24)], bg=(0, 0, 0)) > 0, 240, shown).astype(np.uint8)
+    shown[..., 3] = 255
+    shown[90:134, 90:320, :3] = np.where(shown[90:134, 90:320, :3] == 240, 240, 30)
+    p = Pipeline({"who are you": "Кто ты?"}.get)
+    job = p.frame(shown, now=0.0)
+    _read(p, job, [Line("Who are you?", 100, 100, 200, 24)], now=0.01)
+    p.frame(shown, now=0.3)
+    assert len(p.visible()) == 1
+    p.frame(texture, now=0.35)
+    p.frame(texture, now=0.55)
+    assert p.visible() == [] and p.blocks == []

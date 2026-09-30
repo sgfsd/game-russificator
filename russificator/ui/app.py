@@ -302,8 +302,11 @@ class Api:
 
     def models_overview(self) -> Dict[str, Any]:
         from ..translation import local_llm, machine
-        items = [{"kind": "machine", "id": "machine", "title": "Машинный переводчик (Argos en→ru)",
-                  "installed": machine.is_installed(), "bytes": _dir_size(machine.model_dir())}]
+        items = [{"kind": "machine", "id": "machine",
+                  "title": "Машинный переводчик (OPUS-MT en→ru)" if machine.big_installed()
+                  else "Машинный переводчик (Argos en→ru)",
+                  "installed": machine.is_installed(),
+                  "bytes": sum(_dir_size(d) for d in machine.model_dirs())}]
         for p in local_llm.PRESETS:
             items.append({"kind": "local", "id": p.id, "title": p.title, "installed": local_llm.model_installed(p),
                           "bytes": _dir_size(local_llm.model_path(p)) if local_llm.model_installed(p) else 0,

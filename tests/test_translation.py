@@ -406,3 +406,13 @@ def test_service_reports_failed_only_after_all_attempts(tmp_path):
     proj = _project(tmp_path, "Nothing works.")
     stats = TranslationService(Broken()).run(proj)
     assert stats.failed == 1 and proj.entries[0].status == EntryStatus.FAILED
+
+
+def test_machine_splits_sentences_for_big_model():
+    """Большая модель теряет часть реплики из нескольких предложений — ей строка даётся по предложениям."""
+    from russificator.translation.machine import MachineTranslator
+    line = "You seem rather lost. Is there anything I can help you with?"
+    assert MachineTranslator._sentences(line) == [line]                     # базовой — целиком (как раньше)
+    parts = MachineTranslator._sentences(line, always=True)
+    assert [p.strip() for p in parts] == ["You seem rather lost.", "Is there anything I can help you with?"]
+    assert "".join(parts) == line                                            # склейка без потерь

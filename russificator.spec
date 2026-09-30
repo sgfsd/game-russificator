@@ -20,7 +20,7 @@ a = Analysis(
     pathex=[],
     binaries=binaries,
     datas=datas,
-    hiddenimports=hiddenimports + ["clr"],
+    hiddenimports=hiddenimports + ["clr", "yaml", "ctranslate2.converters"],
     excludes=["tkinter", "matplotlib", "scipy", "pytest", "IPython"],
     noarchive=False,
 )

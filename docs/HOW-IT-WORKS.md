@@ -34,8 +34,10 @@ engines/<движок>/plugin.py   translation/ (4 способа перевод
 - `markup.py`: теги, плейсхолдеры, коды RPG Maker/Ren'Py/Unity. Перевод обязан
   сохранить весь набор вставок, иначе он отбрасывается и делается заново через
   маскирование (`@0`, `@1`…).
-- `machine.py` (способ 1): модель Argos Translate en→ru, запускается напрямую
-  через CTranslate2 + SentencePiece, построчно, с глоссарием фраз интерфейса.
+- `machine.py` (способ 1): модель OPUS-MT tc-big en→ru (Helsinki-NLP; готовая сборка
+  CTranslate2 с HuggingFace, закреплённая версия, а без неё — официальный архив, конвертируемый
+  `OpusMTConverter`), запасная — Argos Translate en→ru; запускается напрямую через CTranslate2 +
+  SentencePiece, по предложениям, с глоссарием фраз интерфейса.
 - `local_llm.py` (способ 2): llama.cpp (сборка Vulkan) как локальный сервер,
   модели Gemma 4 GGUF, пресет подбирается по ОЗУ/видеопамяти.
 - `cloud.py` (способ 3): любой OpenAI-совместимый API; список моделей берётся

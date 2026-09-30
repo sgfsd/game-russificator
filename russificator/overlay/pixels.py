@@ -103,19 +103,22 @@ def color_distance(a, b) -> float:
 
 
 class Probe:
-    """Отпечаток надписи на кадре: точки её букв (и фона между ними) с цветами, а ещё цвет самих
-    букв и какая доля рамки строк им закрашена.
+    """Отпечаток надписи на кадре: точки её букв и фона между ними с цветами, а ещё цвет самих букв
+    и какая доля рамки строк им закрашена.
 
     Точки сменились (:meth:`changed`) — надпись пропала, сменилась или «шевелится» (дрожь, глитч,
-    волна). Отличить помогает цвет букв (:meth:`present`): у анимированной надписи его в рамке
-    столько же, а у пропавшей — нет. Всё это — доли миллисекунды на кадр, без распознавания.
-    Мигающий значок «дальше» и анимация фона под полупрозрачной рамкой меняют малую долю точек."""
+    волна). Отличить помогает :meth:`still_there`: у анимированной надписи цвета букв в рамке
+    столько же и фон между буквами прежний, а у пропавшей — нет (окно закрылось — под ним другой
+    фон, даже если в нём тоже много светлого). Всё это — доли миллисекунды на кадр, без
+    распознавания. Мигающий значок «дальше» и анимация фона под полупрозрачной рамкой меняют малую
+    долю точек."""
 
-    __slots__ = ("ys", "xs", "colors", "size", "rects", "fg", "ref")
+    __slots__ = ("ys", "xs", "colors", "size", "rects", "fg", "ref", "n_ink")
 
-    def __init__(self, ys, xs, colors, size, rects=(), fg=None, ref=0.0):
+    def __init__(self, ys, xs, colors, size, rects=(), fg=None, ref=0.0, n_ink=None):
         self.ys, self.xs, self.colors, self.size = ys, xs, colors, size
         self.rects, self.fg, self.ref = list(rects), fg, ref
+        self.n_ink = len(ys) if n_ink is None else n_ink
 
     def changed(self, img) -> float:
         """Доля точек, заметно сменивших цвет (1.0 — кадр другого размера)."""
@@ -125,12 +128,19 @@ class Probe:
         cur = img[self.ys, self.xs, :3].astype(np.int16)
         return float((np.abs(cur - self.colors).max(axis=1) > 48).mean())
 
-    def present(self, img) -> float:
-        """Сколько цвета букв осталось в рамке надписи по сравнению с тем, когда её прочитали
-        (1.0 — столько же; судить не по чему — тоже 1.0)."""
-        if self.fg is None or self.ref < 0.02 or img.shape[:2] != self.size:
-            return 1.0 if img.shape[:2] == self.size else 0.0
-        return _ink_share(img, self.rects, self.fg) / self.ref
+    def still_there(self, img) -> bool:
+        """Надпись на месте, хоть её точки и сменились: цвета букв в рамке не меньше половины
+        прежнего, а фон между буквами в основном тот же."""
+        import numpy as np
+        if img.shape[:2] != self.size:
+            return False
+        if self.fg is not None and self.ref >= 0.02 and _ink_share(img, self.rects, self.fg) < 0.5 * self.ref:
+            return False
+        bg = slice(self.n_ink, len(self.ys))
+        if len(self.ys) - self.n_ink < 8:
+            return True
+        cur = img[self.ys[bg], self.xs[bg], :3].astype(np.int16)
+        return float((np.abs(cur - self.colors[bg]).max(axis=1) > 48).mean()) <= 0.4
 
 
 def _ink_share(img, rects, fg) -> float:
@@ -179,7 +189,8 @@ def make_probe(img, boxes, limit: int = 400) -> Optional[Probe]:
     xs = np.concatenate([ix[pick_i], bx[pick_b]])
     fg, _ = _dominant(img[iy[pick_i], ix[pick_i], :3].astype(np.int32))    # цвет букв — самый частый у точек букв
     fg = fg.astype(np.int16)
-    return Probe(ys, xs, img[ys, xs, :3].astype(np.int16), img.shape[:2], rects, fg, _ink_share(img, rects, fg))
+    return Probe(ys, xs, img[ys, xs, :3].astype(np.int16), img.shape[:2], rects, fg, _ink_share(img, rects, fg),
+                 len(pick_i))
 
 
 def _rules(lines) -> List[int]:

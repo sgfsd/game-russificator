@@ -55,9 +55,8 @@ NOISE_MAX_WIDE = 1.0
 SCENE_CUT = 0.45
 #: доля точек отпечатка, сменивших цвет, — надпись пропала, сменилась другой или «шевелится»
 GONE = 0.4
-#: …а пропала она, если цвета букв в её рамке осталось меньше этой доли
-PRESENT = 0.5
-#: и так — не меньше стольких секунд: анимированная надпись (глитч) на кадр-другой почти исчезает
+#: …а пропала она (:meth:`~.pixels.Probe.still_there`: нет цвета букв или фон между ними другой),
+#: если так не меньше стольких секунд: анимированная надпись (глитч) на кадр-другой почти исчезает
 GONE_HOLD = 0.15
 #: перевод предложения, которое переводить не нужно (имя, код): показывается оригинал
 SKIP = "\x00"
@@ -299,7 +298,7 @@ class Pipeline:
         if b.probe is None or b.probe.changed(img) < GONE:
             b.gone_since = None
             return False
-        if b.probe.present(img) >= PRESENT:
+        if b.probe.still_there(img):
             b.restless = True
             b.gone_since = None
             return False
@@ -361,7 +360,7 @@ class Pipeline:
                         taken.add(id(ob))       # обрывок того же места — заменён целой надписью
                 continue
             live = next((ob for ob in over if id(ob) not in taken and not ob.skip and ob.confirmed
-                         and ob.probe is not None and ob.probe.present(job.img) >= PRESENT), None)
+                         and ob.probe is not None and ob.probe.still_there(job.img)), None)
             if nb.skip and live is not None:
                 # «непереводимое» прочтение на месте живой переведённой надписи — это искажённое
                 # прочтение той же надписи (глитч, помеха), а не новый текст
@@ -397,7 +396,7 @@ class Pipeline:
             if id(ob) in taken:
                 continue
             # распознавание её не нашло: пропала — или промах (отпечаток или цвет букв на месте — остаётся)
-            if ob.probe is not None and (ob.probe.changed(job.img) < GONE or ob.probe.present(job.img) >= PRESENT):
+            if ob.probe is not None and (ob.probe.changed(job.img) < GONE or ob.probe.still_there(job.img)):
                 result.append(ob)
             else:
                 log.debug("не найдена и отпечаток сменился: %s", ob.text[:50])

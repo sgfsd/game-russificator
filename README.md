@@ -97,7 +97,7 @@ itch.io, Game Pass, игры из списка программ Windows и из 
 
 | | Способ | Для кого | Что нужно |
 |---|---|---|---|
-| 1 | **Машинный переводчик** (Argos Translate, офлайн) | любой, даже очень старый ПК | ~200 МБ, 2 ГБ ОЗУ |
+| 1 | **Машинный переводчик** (OPUS-MT, офлайн) | любой, даже очень старый ПК | ~245 МБ, 2 ГБ ОЗУ |
 | 2 | **Нейросеть на компьютере** (Gemma 4 через llama.cpp) | ПК с 8+ ГБ ОЗУ или видеокартой | 2,6–7 ГБ на диске |
 | 3 | **Облачная нейросеть** по вашему API-ключу | любой ПК с интернетом | ключ провайдера |
 | 4 | **Заказать перевод у автора** — ручная вычитка | кому нужно качество «как у студии» | Telegram [@TRAPYCHINO](https://t.me/TRAPYCHINO) |
@@ -255,7 +255,8 @@ russificator games                                                   # уста�
 [BepInEx](https://github.com/BepInEx/BepInEx) (LGPL-2.1),
 [XUnity.AutoTranslator](https://github.com/bbepis/XUnity.AutoTranslator) (MIT),
 [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT),
-модели [Argos Translate](https://github.com/argosopentech/argos-translate) и
+модели [OPUS-MT](https://github.com/Helsinki-NLP/Opus-MT) (Helsinki-NLP, CC-BY 4.0),
+[Argos Translate](https://github.com/argosopentech/argos-translate) и
 [Gemma](https://ai.google.dev/gemma) — на условиях их авторов.
 В программу встроен шрифт [PT Sans](https://www.paratype.ru/fonts/pt/pt-sans) (OFL 1.1).
 
