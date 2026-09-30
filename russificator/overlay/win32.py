@@ -45,7 +45,8 @@ WM_DESTROY, WM_CLOSE, WM_HOTKEY, WM_NULL = 0x0002, 0x0010, 0x0312, 0x0000
 WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONUP, WM_CONTEXTMENU = 0x0201, 0x0202, 0x0200, 0x0205, 0x007B
 WM_LBUTTONDBLCLK, WM_KEYDOWN, WM_SETCURSOR = 0x0203, 0x0100, 0x0020
 WM_APP = 0x8000
-MSG_RENDER, MSG_TRAY, MSG_HIDE, MSG_QUIT, MSG_HOTKEYS, MSG_SELECT, MSG_BALLOON, MSG_TIP = range(WM_APP + 1, WM_APP + 9)
+MSG_RENDER, MSG_TRAY, MSG_HIDE, MSG_QUIT, MSG_HOTKEYS, MSG_SELECT, MSG_BALLOON, MSG_TIP, MSG_AFFINITY = \
+    range(WM_APP + 1, WM_APP + 10)
 
 WS_POPUP = 0x80000000
 WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE = \
@@ -59,7 +60,14 @@ AC_SRC_OVER, AC_SRC_ALPHA = 0x0, 0x1
 SRCCOPY, CAPTUREBLT = 0x00CC0020, 0x40000000
 PW_CLIENTONLY, PW_RENDERFULLCONTENT = 0x1, 0x2
 DIB_RGB_COLORS, BI_RGB = 0, 0
-WDA_EXCLUDEFROMCAPTURE = 0x11
+WDA_NONE, WDA_EXCLUDEFROMCAPTURE = 0x0, 0x11
+LWA_COLORKEY, LWA_ALPHA = 0x1, 0x2
+#: прозрачный цвет окна оверлея (COLORREF 0x00BBGGRR): R=254, G=0, B=255 — в картинках почти не
+#: встречается, а совпавший пиксель картинки сдвигается на единицу (render.to_colorkey)
+COLOR_KEY = 0x00FF00FE
+WM_PAINT, WM_ERASEBKGND = 0x000F, 0x0014
+#: непрозрачность затемнения при выборе области (окно с цветовым ключом)
+SELECT_ALPHA = 150
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x4000
 VK_ESCAPE = 0x1B
 IDC_CROSS, IDC_ARROW = 32515, 32512
@@ -204,6 +212,13 @@ if IS_WINDOWS:
     ReleaseCapture = _proto(user32, "ReleaseCapture", wintypes.BOOL)
     RegisterWindowMessageW = _proto(user32, "RegisterWindowMessageW", wintypes.UINT, wintypes.LPCWSTR)
     PrintWindow = _proto(user32, "PrintWindow", wintypes.BOOL, wintypes.HWND, wintypes.HDC, wintypes.UINT)
+    SetLayeredWindowAttributes = _proto(user32, "SetLayeredWindowAttributes", wintypes.BOOL, wintypes.HWND,
+                                        wintypes.COLORREF, ctypes.c_ubyte, wintypes.DWORD)
+    GdiFlush = _proto(gdi32, "GdiFlush", wintypes.BOOL)
+    SetDIBitsToDevice = _proto(gdi32, "SetDIBitsToDevice", ctypes.c_int, wintypes.HDC, ctypes.c_int, ctypes.c_int,
+                               wintypes.DWORD, wintypes.DWORD, ctypes.c_int, ctypes.c_int, wintypes.UINT,
+                               wintypes.UINT, ctypes.c_void_p, ctypes.POINTER(BITMAPINFO), wintypes.UINT)
+    ValidateRect = _proto(user32, "ValidateRect", wintypes.BOOL, wintypes.HWND, ctypes.c_void_p)
     try:
         SetWindowDisplayAffinity = _proto(user32, "SetWindowDisplayAffinity", wintypes.BOOL, wintypes.HWND,
                                           wintypes.DWORD)
@@ -468,6 +483,123 @@ def capture(x: int, y: int, w: int, h: int) -> Optional[bytes]:
         ReleaseDC(None, screen)
 
 
+class Grabber:
+    """Кадры в один и тот же буфер (DIB-секцию) — без выделения памяти и копирования на каждый кадр.
+
+    Результат — массив numpy (высота, ширина, 4) BGRA поверх буфера: он действителен до следующего
+    снимка (кому кадр нужен дольше — копирует). Буфер пересоздаётся при смене размера."""
+
+    def __init__(self) -> None:
+        self._mem = None
+        self._dib = None
+        self._old = None
+        self._bits = None
+        self._size = (0, 0)
+        self._lock = threading.Lock()
+
+    def _ensure(self, w: int, h: int) -> bool:
+        if (w, h) == self._size and self._mem:
+            return True
+        self._free()
+        screen = GetDC(None)
+        if not screen:
+            return False
+        try:
+            mem = CreateCompatibleDC(screen)
+            bmi = BITMAPINFO()
+            bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bmi.bmiHeader.biWidth = w
+            bmi.bmiHeader.biHeight = -h                 # сверху вниз
+            bmi.bmiHeader.biPlanes = 1
+            bmi.bmiHeader.biBitCount = 32
+            bmi.bmiHeader.biCompression = BI_RGB
+            bits = ctypes.c_void_p()
+            dib = CreateDIBSection(screen, ctypes.byref(bmi), DIB_RGB_COLORS, ctypes.byref(bits), None, 0)
+            if not mem or not dib or not bits.value:
+                if dib:
+                    DeleteObject(dib)
+                if mem:
+                    DeleteDC(mem)
+                return False
+            self._mem, self._dib, self._bits, self._size = mem, dib, bits.value, (w, h)
+            self._old = SelectObject(mem, dib)
+            return True
+        finally:
+            ReleaseDC(None, screen)
+
+    def _free(self) -> None:
+        if self._mem:
+            if self._old is not None:
+                SelectObject(self._mem, self._old)
+            DeleteDC(self._mem)
+        if self._dib:
+            DeleteObject(self._dib)
+        self._mem = self._dib = self._old = self._bits = None
+        self._size = (0, 0)
+
+    def _view(self, w: int, h: int):
+        import numpy as np
+        GdiFlush()
+        buf = (ctypes.c_ubyte * (w * h * 4)).from_address(self._bits)
+        return np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
+
+    def window(self, hwnd: int, cw: int, ch: int):
+        """Клиентская область окна (как ``capture_window``) или None."""
+        if not IS_WINDOWS or cw <= 0 or ch <= 0:
+            return None
+        with self._lock:
+            if not self._ensure(cw, ch) or not PrintWindow(hwnd, self._mem, PW_CLIENTONLY | PW_RENDERFULLCONTENT):
+                return None
+            return self._view(cw, ch)
+
+    def screen(self, x: int, y: int, w: int, h: int):
+        """Область экрана (как ``capture``) или None."""
+        if not IS_WINDOWS or w <= 0 or h <= 0:
+            return None
+        with self._lock:
+            if not self._ensure(w, h):
+                return None
+            screen = GetDC(None)
+            if not screen:
+                return None
+            try:
+                if not BitBlt(self._mem, 0, 0, w, h, screen, x, y, SRCCOPY | CAPTUREBLT):
+                    return None
+            finally:
+                ReleaseDC(None, screen)
+            return self._view(w, h)
+
+    def close(self) -> None:
+        with self._lock:
+            self._free()
+
+
+_grabbers: Dict[str, Grabber] = {}
+
+
+def _grabber(kind: str) -> Grabber:
+    g = _grabbers.get(kind)
+    if g is None:
+        g = _grabbers[kind] = Grabber()
+    return g
+
+
+def grab_window(hwnd: int, cw: int, ch: int, region: Tuple[int, int, int, int]):
+    """Часть клиентской области окна массивом numpy (высота, ширина, 4), BGRA; None — не снимается.
+    Массив действителен до следующего снимка."""
+    img = _grabber("window").window(hwnd, cw, ch)
+    if img is None:
+        return None
+    rx, ry, w, h = region
+    rx, ry = max(0, rx), max(0, ry)
+    return img[ry:ry + h, rx:rx + w]
+
+
+def grab_screen(x: int, y: int, w: int, h: int):
+    """Область экрана массивом numpy (высота, ширина, 4), BGRA; None — не снимается."""
+    return _grabber("screen").screen(x, y, w, h)
+
+
 # ------------------------------------------------------------------ автозапуск
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -548,6 +680,10 @@ class Gui:
         self._balloon: Tuple[str, str] = ("", "")
         self._taskbar_created = 0
         self.excluded_from_capture = False
+        #: окно с цветовым ключом (картинка — непрозрачная BGRA, прозрачное — COLOR_KEY), иначе —
+        #: попиксельная альфа (премультиплицированная BGRA для UpdateLayeredWindow)
+        self.colorkey = False
+        self.can_exclude = False                    # Windows умеет исключать окно оверлея из захвата
         self.visible = False
         self.busy_hotkeys: List[str] = []           # клавиши, которые заняты другой программой
 
@@ -565,7 +701,8 @@ class Gui:
             self._thread.join(5)
 
     def show_frame(self, x: int, y: int, w: int, h: int, bgra: bytes) -> None:
-        """Показать картинку (BGRA, премультиплицированная) в области экрана."""
+        """Показать картинку в области экрана: BGRA, премультиплицированная (окно с попиксельной
+        альфой) или непрозрачная с COLOR_KEY на прозрачных местах (``colorkey``)."""
         with self._frame_lock:
             self._frame = (x, y, w, h, bgra)
         if self.overlay:
@@ -574,6 +711,14 @@ class Gui:
     def hide(self) -> None:
         if self.overlay:
             PostMessageW(self.overlay, MSG_HIDE, 0, 0)
+
+    def set_excluded(self, on: bool) -> None:
+        """Исключить окно перевода из захвата экрана (или вернуть в захват)."""
+        if not self.can_exclude or on == self.excluded_from_capture:
+            return
+        self.excluded_from_capture = on             # сразу: следующий кадр уже решает по нему
+        if self.overlay:
+            PostMessageW(self.overlay, MSG_AFFINITY, 1 if on else 0, 0)
 
     def set_hotkeys(self, keys: List[Hotkey]) -> None:
         self._wanted = list(keys)
@@ -639,11 +784,25 @@ class Gui:
                                        0, 0, 1, 1, None, None, hinst, None)
         if not self.host or not self.overlay:
             raise OSError(f"CreateWindowEx: {ctypes.get_last_error()}")
-        if SetWindowDisplayAffinity is not None:
-            self.excluded_from_capture = bool(SetWindowDisplayAffinity(self.overlay, WDA_EXCLUDEFROMCAPTURE))
-        if not self.excluded_from_capture:
-            # для per-pixel alpha окна Windows 10 этого не умеет — кадр снимается с окна игры
-            log.info("окно оверлея не исключено из захвата экрана — кадр снимается с окна игры")
+        # Окно с цветовым ключом Windows 10 (2004+) умеет исключать из захвата экрана, а окно
+        # с попиксельной альфой (UpdateLayeredWindow) — нет. Исключённый оверлей не попадает в
+        # снимок экрана: снимок показывает игру под переводом — так снимаются полноэкранные игры, и
+        # не нужно закрашивать свои плашки. Исключение включается, только пока игру приходится
+        # снимать с экрана (:meth:`set_excluded`): иначе перевода не было бы на скриншотах и в
+        # записи экрана игрока.
+        if SetWindowDisplayAffinity is not None and SetLayeredWindowAttributes(self.overlay, COLOR_KEY, 255,
+                                                                                LWA_COLORKEY):
+            if SetWindowDisplayAffinity(self.overlay, WDA_EXCLUDEFROMCAPTURE):
+                SetWindowDisplayAffinity(self.overlay, WDA_NONE)
+                self.colorkey = self.can_exclude = True
+            else:
+                # старая Windows: цветовой ключ ничего не даёт — обычное окно с попиксельной альфой
+                DestroyWindow(self.overlay)
+                self.overlay = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+                                               | WS_EX_NOACTIVATE, self._class, "Russificator Overlay", WS_POPUP,
+                                               0, 0, 1, 1, None, None, hinst, None)
+        if not self.can_exclude:
+            log.info("окно оверлея нельзя исключить из захвата экрана — при съёмке экрана плашки закрашиваются")
         self._taskbar_created = RegisterWindowMessageW("TaskbarCreated")
         self._tray(NIM_ADD)
 
@@ -703,6 +862,11 @@ class Gui:
         x, y, w, h, data = frame
         if w <= 0 or h <= 0 or len(data) < w * h * 4:
             return
+        if self.colorkey:
+            SetWindowPos(self.overlay, wintypes.HWND(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW)
+            self._paint()
+            self.visible = True
+            return
         screen = GetDC(None)
         mem = CreateCompatibleDC(screen)
         bmi = BITMAPINFO()
@@ -734,6 +898,32 @@ class Gui:
             DeleteDC(mem)
             ReleaseDC(None, screen)
 
+    def _paint(self) -> None:
+        """Окно с цветовым ключом: нарисовать последнюю картинку (при показе и на WM_PAINT)."""
+        with self._frame_lock:
+            frame = self._frame
+        if frame is None or not self.overlay:
+            return
+        _, _, w, h, data = frame
+        if len(data) < w * h * 4:
+            return
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = w
+        bmi.bmiHeader.biHeight = -h
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = BI_RGB
+        dc = GetDC(self.overlay)
+        if not dc:
+            return
+        try:
+            buf = ctypes.create_string_buffer(data, w * h * 4) if isinstance(data, (bytes, bytearray)) else data
+            SetDIBitsToDevice(dc, 0, 0, w, h, 0, 0, 0, h, buf, ctypes.byref(bmi), DIB_RGB_COLORS)
+        finally:
+            ReleaseDC(self.overlay, dc)
+        ValidateRect(self.overlay, None)
+
     def _set_transparent(self, on: bool) -> None:
         style = GetWindowLongW(self.overlay, GWL_EXSTYLE)
         style = (style | WS_EX_TRANSPARENT) if on else (style & ~WS_EX_TRANSPARENT)
@@ -747,21 +937,25 @@ class Gui:
         x, y, w, h = sel["area"]
         try:
             from PIL import Image, ImageDraw
-            from .render import font, to_bgra_premultiplied
-            img = Image.new("RGBA", (w, h), (8, 10, 16, 110))
+            from .render import font, to_bgra_premultiplied, to_colorkey
+            # окно с цветовым ключом полупрозрачно целиком (затемнение), обведённое — ключ (дыра)
+            img = Image.new("RGBA", (w, h), (8, 10, 16, 255 if self.colorkey else 110))
             d = ImageDraw.Draw(img)
             if sel["start"] and sel["cur"]:
                 (ax, ay), (bx, by) = sel["start"], sel["cur"]
                 r = (min(ax, bx), min(ay, by), max(ax, bx), max(ay, by))
-                d.rectangle(r, fill=(0, 0, 0, 1), outline=(139, 123, 255, 255), width=3)
+                d.rectangle(r, fill=(0, 0, 0, 0 if self.colorkey else 1), outline=(139, 123, 255, 255), width=3)
             msg = "Обведите мышью область с текстом игры  ·  Esc — отмена"
             f = font(max(14, h // 40))
             tw = f.getlength(msg)
             d.rounded_rectangle((w / 2 - tw / 2 - 16, 24, w / 2 + tw / 2 + 16, 24 + f.size + 20), radius=10,
                                 fill=(14, 16, 24, 230))
             d.text((w / 2 - tw / 2, 34), msg, font=f, fill=(245, 246, 250, 255))
+            data = to_colorkey(img) if self.colorkey else to_bgra_premultiplied(img)
             with self._frame_lock:
-                self._frame = (x, y, w, h, to_bgra_premultiplied(img))
+                self._frame = (x, y, w, h, data)
+            if self.colorkey:
+                SetLayeredWindowAttributes(self.overlay, COLOR_KEY, SELECT_ALPHA, LWA_COLORKEY | LWA_ALPHA)
             self._render()
         except Exception:  # noqa: BLE001
             log.exception("рамка выбора не нарисована")
@@ -773,6 +967,10 @@ class Gui:
         UnregisterHotKey(self.host, 0xBFF0)
         ShowWindow(self.overlay, SW_HIDE)
         self.visible = False
+        if self.colorkey:
+            SetLayeredWindowAttributes(self.overlay, COLOR_KEY, 255, LWA_COLORKEY)
+        with self._frame_lock:
+            self._frame = None
         try:
             self.on_region(rect)
         except Exception:  # noqa: BLE001
@@ -805,6 +1003,15 @@ class Gui:
                 if not self._select:
                     self._render()
                 return 0
+            if msg == MSG_AFFINITY and hwnd == self.overlay:
+                SetWindowDisplayAffinity(self.overlay, WDA_EXCLUDEFROMCAPTURE if wparam else WDA_NONE)
+                return 0
+            if hwnd == self.overlay and self.colorkey:
+                if msg == WM_ERASEBKGND:
+                    return 1                        # фон не стирать — картинка рисуется целиком
+                if msg == WM_PAINT:
+                    self._paint()
+                    return 0
             if msg == MSG_HIDE and hwnd == self.overlay:
                 if not self._select:
                     ShowWindow(self.overlay, SW_HIDE)

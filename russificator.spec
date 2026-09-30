@@ -6,7 +6,7 @@ datas = [("russificator/resources", "russificator/resources"), ("russificator/ui
 binaries = []
 hiddenimports = collect_submodules("russificator")
 for pkg in ("webview", "ctranslate2", "sentencepiece", "UnityPy", "TypeTreeGeneratorAPI", "texture2ddecoder",
-            "etcpak", "astc_encoder", "fmod_toolkit", "archspec", "clr_loader", "pythonnet", "tpk_ar"):
+            "etcpak", "astc_encoder", "fmod_toolkit", "archspec", "clr_loader", "pythonnet", "tpk_ar", "onnxruntime"):
     try:
         d, b, h = collect_all(pkg)
         datas += d

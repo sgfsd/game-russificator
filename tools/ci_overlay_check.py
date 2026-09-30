@@ -79,11 +79,13 @@ def check_windows() -> bool:
     gui = win32.Gui(str(icon), events.append, events.append, events.append, lambda: [("quit", "Выход", False)])
     gui.start()
     ok = bool(gui.host and gui.overlay)
-    print(f"[win32] окна оверлея созданы: {ok}, исключено из захвата: {gui.excluded_from_capture}")
+    print(f"[win32] окна оверлея созданы: {ok}, исключено из захвата: {gui.excluded_from_capture}, "
+          f"цветовой ключ: {gui.colorkey}")
     if ok:
         img = render.render((400, 120), [render.Item(rect=(10, 10, 300, 30), text="Нажмите любую клавишу",
                                                      line_h=30)])
-        gui.show_frame(100, 100, 400, 120, render.to_bgra_premultiplied(img))
+        data = render.to_colorkey(img) if gui.colorkey else render.to_bgra_premultiplied(img)
+        gui.show_frame(100, 100, 400, 120, data)
         time.sleep(0.5)
         print(f"[win32] оверлей показан: {gui.visible}")
         gui.set_hotkeys([win32.Hotkey(1, win32.MOD_ALT, 0x54, "toggle")])
@@ -157,17 +159,19 @@ def check_live() -> bool:
                 pass
         svc.translator, svc._reload_translator = Tr(), False
         threading.Thread(target=svc._translate_loop, daemon=True).start()
+        threading.Thread(target=svc._ocr_loop, daemon=True).start()
         started = time.monotonic()
         while time.monotonic() - started < 20:
             svc._tick()
             if svc.count and svc.gui.visible:
                 break
-            time.sleep(0.4)
+            time.sleep(0.05)
         st = svc.status()
         print(f"[live] игра: {st['game']}, распознавание: {st['ocr']['name']}, переведено: {st['count']}, "
               f"плашка на экране: {svc.gui.visible}, за {time.monotonic() - started:.1f} с, "
               f"последние: {st['recent'][:2]}")
-        print(f"[live] кадр снят: {st['capture']} (window — с окна игры), глубокий проход: {st['deep']}")
+        print(f"[live] кадр снят: {st['capture']} (window — с окна игры), глубокий проход: {st['deep']}, "
+              f"скорость: {st['speed']}")
         try:
             ru = ocr.create_verifier(Path(tempfile.gettempdir()))
             print(f"[live] русское распознавание для проверки строк: {ru.lang if ru else 'нет в этой Windows'}")

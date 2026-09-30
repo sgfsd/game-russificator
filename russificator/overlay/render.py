@@ -138,6 +138,34 @@ def render(canvas: Tuple[int, int], items: Sequence[Item], style: Optional[Style
     return img
 
 
+#: прозрачный цвет окна оверлея (как win32.COLOR_KEY): синий, зелёный, красный
+KEY_BGR = (255, 0, 254)
+
+
+def to_colorkey(img, under=None) -> bytes:
+    """RGBA → непрозрачная BGRA для окна с цветовым ключом: прозрачное — ключевой цвет,
+    полупрозрачное (плашка, сглаженный край, тень) смешивается с кадром игры под ним ``under``
+    (массив высота × ширина × BGRA того же размера) — окно с ключом само смешивать не умеет."""
+    import numpy as np
+    a = np.asarray(img.convert("RGBA"), dtype=np.uint16)
+    alpha = a[..., 3:4]
+    rgb = a[..., :3]
+    if under is not None and under.shape[:2] == a.shape[:2]:
+        base = under[..., 2::-1].astype(np.uint16)
+        rgb = (rgb * alpha + base * (255 - alpha) + 127) // 255
+    out = np.empty(a.shape[:2] + (4,), np.uint8)
+    out[..., 0] = rgb[..., 2]
+    out[..., 1] = rgb[..., 1]
+    out[..., 2] = rgb[..., 0]
+    out[..., 3] = 255
+    kb, kg, kr = KEY_BGR
+    same = (out[..., 0] == kb) & (out[..., 1] == kg) & (out[..., 2] == kr)
+    out[..., 0][same] = kb - 1                          # настоящий пиксель картинки не должен пропасть
+    clear = a[..., 3] < (8 if under is not None else 128)
+    out[clear] = (kb, kg, kr, 0)
+    return out.tobytes()
+
+
 def to_bgra_premultiplied(img) -> bytes:
     """RGBA → BGRA с премультиплицированной альфой (формат UpdateLayeredWindow)."""
     try:

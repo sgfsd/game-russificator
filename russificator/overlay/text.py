@@ -1,13 +1,11 @@
-"""Текст с экрана: строки распознавания → блоки, фильтр иностранного, устойчивость.
+"""Текст с экрана: строки распознавания → абзацы, предложения, фильтр иностранного.
 
 Распознавание возвращает строки с рамками. Соседние строки одного абзаца
-склеиваются в блок — переводится блок целиком (контекст, падежи), и плашка
-перевода ложится поверх всего абзаца.
-
-Распознавание «шумит»: одна и та же строка в соседних кадрах может прийти с
-разницей в букву, а текст «печатной машинки» растёт по буквам. Поэтому блок
-считается готовым к переводу, когда он почти не менялся два прохода подряд, а
-похожие варианты одного текста узнаются нечётким сравнением.
+склеиваются в блок, и перевод ложится поверх всего абзаца. Переводится абзац по
+предложениям (:func:`sentences`): у допечатывающейся реплики готовые предложения
+не переводятся заново. Распознавание «шумит» (одна и та же строка может прийти с
+разницей в букву) — похожие варианты одного текста узнаются нечётким сравнением,
+а значок «дальше» в конце реплики отбрасывается (:func:`strip_marker`).
 
 Английское распознавание читает русский текст как латинскую абракадабру
 («Начать» → «HaqaTb», «Налоговые» → «Hanor0Bble»). Такие строки отсеиваются:
@@ -19,7 +17,6 @@ from __future__ import annotations
 
 import difflib
 import re
-import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -31,6 +28,12 @@ class Line:
     y: int
     w: int
     h: int
+    conf: float = 1.0                # уверенность распознавания
+    ru: bool = False                 # распознавание прочитало тут русский текст
+    #: наклонная строка (табличка, бирка, надпись на предмете): центр x, y, длина, высота, угол
+    #: в радианах; x/y/w/h тогда — описанный вокруг неё прямоугольник
+    rot: Optional[Tuple[float, float, float, float, float]] = None
+    alt: str = ""                    # английское прочтение строки, которую распознали как кириллицу
 
     @property
     def bottom(self) -> int:
@@ -43,16 +46,9 @@ class Line:
 
 @dataclass
 class Block:
+    """Абзац: строки, склеенные :func:`group_lines`."""
     lines: List[Line]
     key: str = ""
-    translation: Optional[str] = None
-    first_seen: float = 0.0
-    last_seen: float = 0.0
-    stable_hits: int = 0
-    skip: bool = False               # переводить нечего (перевод совпал с оригиналом) — плашку не рисуем
-    deep: bool = False               # найден только глубоким проходом (надпись на картинке, особый шрифт)
-    hold_until: float = 0.0          # до какого момента держать блок, даже если быстрый проход его не видит
-    refined: Optional[str] = None    # текст, перечитанный крупнее (None — ещё не перечитывали, "" — не лучше)
 
     @property
     def text(self) -> str:
@@ -170,11 +166,14 @@ _BRANDS = re.compile(r"(?i)^(?:made with|powered by|created with|built with|a ga
                      r"(?:unity(?: technologies)?|unreal(?: engine)?|godot(?: engine)?|gamemaker(?: studio)?|"
                      r"rpg maker(?: m[vz]| vx(?: ace)?| xp)?|ren'?py|fmod(?: studio)?|wwise|havok|nvidia|amd|"
                      r"intel|directx|vulkan|opengl|steam(?:works)?|epic games|xbox|playstation|nintendo(?: switch)?|"
-                     r"physx|bink(?: video)?|speedtree|dolby(?: atmos)?)?\s*[™®©]?$")
+                     r"physx|bink(?: video)?|speedtree|dolby(?: atmos)?|"
+                     # площадки и соцсети — ссылки в меню игр («Patreon», «Discord»): это названия
+                     r"patreon|discord|twitter|youtube|twitch|itch(?:\.io)?|kickstarter|reddit|tiktok|instagram|"
+                     r"facebook|bluesky|ko-?fi|tumblr|github|gog(?:\.com)?|boosty|telegram|vk|x\.com)?\s*[™®©]?$")
 
 
 def is_brand(text: str) -> bool:
-    """Строка — надпись заставки движка («Made with Unity», «Powered by Unreal Engine»)."""
+    """Строка — название движка, площадки или соцсети («Made with Unity», «Discord», «Patreon»)."""
     t = re.sub(r"\s+", " ", (text or "").strip())
     return bool(t) and bool(_BRANDS.match(t)) and bool(re.search(r"[A-Za-z]{3,}", t))
 
@@ -246,6 +245,53 @@ def join_lines(lines: Iterable[str]) -> str:
     return out
 
 
+#: значок «дальше» в конце реплики (▼, ▶, мигающий треугольник): распознавание читает его как «v»/«y»
+#: или символ — он то есть, то нет, и один и тот же текст выглядел бы разным
+_MARKER = re.compile(r"(?:(?<=[.!?…,;:\-–—~\"»”’)\]])\s*[vVyY▼▽▾▶►▸◆◇■□●○>»]"
+                     r"|\s+[▼▽▾▶►▸◆◇■□●○])\s*$")
+
+
+def strip_marker(text: str) -> str:
+    """Строка без значка продолжения в конце («Well—v» → «Well—», «Hi. ▼» → «Hi.»)."""
+    t = (text or "").rstrip()
+    stripped = _MARKER.sub("", t)
+    return stripped.rstrip() if stripped.strip() else t
+
+
+#: сокращения с точкой, после которых предложение не кончается
+_ABBR = {"mr", "mrs", "ms", "dr", "st", "vs", "etc", "e.g", "i.e", "jr", "sr", "no", "vol", "fig", "lt", "sgt",
+         "capt", "prof", "mt", "ft", "approx", "dept", "est", "inc", "ltd", "co", "gen", "gov", "sen", "rep"}
+_SENT_END = re.compile(r"([.!?…]+[\"»”’)\]]*)(\s+)(?=[\"«“‘(\[]?[A-ZА-ЯЁ0-9¡¿])")
+_COMPLETE = re.compile(r"[.!?…][\"»”’)\]]*$")
+
+
+def sentences(text: str) -> List[str]:
+    """Предложения абзаца. Перевод идёт по предложениям: у допечатывающейся реплики уже готовые
+    предложения переведены и больше не меняются — переводится только новое."""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    out: List[str] = []
+    start = 0
+    for m in _SENT_END.finditer(t):
+        end = m.end(1)
+        chunk = t[start:end].strip()
+        if m.group(1) == ".":
+            word = re.search(r"([A-Za-z][A-Za-z.]*)\.$", chunk)
+            if word and (word.group(1).lower() in _ABBR or len(word.group(1)) == 1):
+                continue                    # «Mr. Smith», «J. Smith»
+        if chunk:
+            out.append(chunk)
+        start = m.end()
+    tail = t[start:].strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+def complete(sentence: str) -> bool:
+    """Предложение закончено (точка, !, ?, многоточие в конце)."""
+    return bool(_COMPLETE.search((sentence or "").strip()))
+
+
 def normalize(text: str) -> str:
     """Ключ текста: регистр, пробелы и знаки распознавания не важны."""
     t = (text or "").lower()
@@ -254,36 +300,201 @@ def normalize(text: str) -> str:
     return t.strip()
 
 
-def group_lines(lines: List[Line]) -> List[Block]:
-    """Склеить строки в абзацы: близко по вертикали, похожая высота, общий край или центр."""
+def group_lines(lines: List[Line], apart=None) -> List[Block]:
+    """Склеить строки в абзацы: близко по вертикали, похожая высота, общий край или центр.
+
+    Промежуток между абзацами заметно больше, чем между строками одного абзаца, — граница
+    ищется по промежуткам уже собранного абзаца. Центрированный абзац (заголовок, надпись) не
+    принимает строку, выровненную по левому краю (кнопка под ним), и наоборот."""
     lines = sorted((ln for ln in lines if ln.text.strip() and ln.h > 0), key=lambda ln: (ln.y, ln.x))
-    blocks: List[List[Line]] = []
+    blocks: List[dict] = []
     for ln in lines:
         target = None
         for b in reversed(blocks[-6:]):
-            last = b[-1]
+            last = b["lines"][-1]
+            if ln.rot is not None or last.rot is not None:
+                if tilted_next(last, ln):   # следующая строка той же наклонной надписи
+                    target = b
+                    break
+                continue
             h = (last.h + ln.h) / 2
             gap = ln.y - last.bottom
-            if gap < -h * 0.5 or gap > h * 0.9:
+            if gap < -h * 0.5:
                 continue
-            if max(last.h, ln.h) / max(1, min(last.h, ln.h)) > 1.6:
+            gaps = b["gaps"]
+            limit = min(0.9 * h, 2 * sorted(gaps)[len(gaps) // 2] + 0.1 * h) if gaps else 0.6 * h
+            if gap > limit:
                 continue
-            left_ok = abs(ln.x - last.x) <= h * 1.5
-            center_ok = abs((ln.x + ln.w / 2) - (last.x + last.w / 2)) <= h * 2
-            overlap = min(ln.right, last.right) - max(ln.x, last.x) > 0
-            if left_ok or center_ok or (overlap and abs(ln.x - last.x) <= h * 4):
-                target = b
-                break
+            if max(last.h, ln.h) / max(1, min(last.h, ln.h)) > 1.35:
+                continue
+            if list_break(last, ln):
+                continue                    # пункты меню или списка, а не перенос строки абзаца
+            if apart is not None and apart(last, ln):
+                continue                    # между строками черта рамки или другой цвет — разные надписи
+            left_ok = abs(ln.x - last.x) <= h * 1.0
+            center_ok = abs((ln.x + ln.w / 2) - (last.x + last.w / 2)) <= h * 1.2
+            if b["align"] == "center" and not center_ok:
+                continue
+            if b["align"] == "left" and not left_ok:
+                continue
+            if not (left_ok or center_ok):
+                continue
+            target = b
+            if b["align"] is None and left_ok != center_ok:
+                b["align"] = "left" if left_ok else "center"     # подходят оба — решит следующая строка
+            b["gaps"].append(max(0, gap))
+            break
         if target is None:
-            blocks.append([ln])
+            blocks.append({"lines": [ln], "gaps": [], "align": None})
         else:
-            target.append(ln)
+            target["lines"].append(ln)
     out = []
     for b in blocks:
-        blk = Block(lines=b)
+        blk = Block(lines=b["lines"])
         blk.key = normalize(blk.text)
         out.append(blk)
     return out
+
+
+def list_break(last: Line, ln: Line) -> bool:
+    """``ln`` — следующий пункт меню или списка («Patreon» / «Discord» / «Our Website»), а не
+    продолжение абзаца: обе строки короткие, следующая — с большой буквы, а предыдущая не
+    оборвана на запятой или дефисе. Склеенные пункты перевелись бы одной бессмысленной фразой, а
+    ошибочно разделённые короткие фразы переводятся по отдельности без вреда."""
+    a, b = last.text.strip(), ln.text.strip()
+    if not a or not b or len(a.split()) > 3 or len(b.split()) > 3:
+        return False
+    if not (b[0].isupper() or b[0].isdigit()):
+        return False
+    return not re.search(r"[,;:\-–—&+/]$", a)
+
+
+def _words_of(text: str) -> List[str]:
+    """Слова строки без значков по краям: распознавание приклеивает к слову мусор («^Mohmtan», «"Metiman»)."""
+    out = []
+    for t in _tokens(text):
+        core = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", t)
+        if core:
+            out.append(core)
+    return out
+
+
+def unknown_words(text: str, words: Set[str]) -> List[str]:
+    """Слова строки (от трёх букв), которых нет в английском словаре."""
+    return [t for t in _words_of(text) if len(re.findall(r"[A-Za-z]", t)) >= 3 and not _in_words(t.lower(), words)]
+
+
+def caps_junk(text: str, words: Set[str]) -> bool:
+    """Строка только из незнакомых слов ЗАГЛАВНЫМИ («DMSL», «DYDD»): так распознавание читает
+    логотип или узор. Настоящие надписи заглавными (EXIT, PLAY) — словарные слова, а
+    аббревиатуры (HP, FPS) переводить и не нужно."""
+    tokens = [t for t in _words_of(text) if len(re.findall(r"[A-Za-z]", t)) >= 2]
+    if not tokens or not all(t.isupper() for t in tokens):
+        return False
+    return not any(_in_words(t.lower(), words) for t in tokens)
+
+
+def is_name(text: str, words: Set[str]) -> bool:
+    """Надпись — имя (героя, места): только слова с большой буквы, и ни одного из словаря
+    («Mothman», «Lucy Vane»). Машинный перевод превращает имена в бессмыслицу («Человек-молот»), а
+    имя на табличке понятно и так; внутри фразы имена переводит переводчик вместе с ней."""
+    tokens = [t for t in _words_of(text) if len(re.findall(r"[A-Za-z]", t)) >= 2]
+    if not tokens or len(tokens) > 3:
+        return False
+    if not all(t[0].isupper() and not t.isupper() for t in tokens):
+        return False
+    return not any(_in_words(t.lower(), words) for t in tokens)
+
+
+def merge_rows(lines: List[Line], apart=None) -> List[Line]:
+    """Куски одной строки — в одну строку. Распознавание режет строку на слове другого шрифта или
+    цвета, со «спецэффектом» (дрожь, глитч), на широком пробеле — и кусок фразы переводился бы
+    отдельно, а неуверенно прочитанное слово оставалось бы по-английски. Цвет внутри строки не
+    разделяет (выделенное слово — часть фразы); разделяет черта рамки между кусками (``apart``:
+    соседние кнопки, вкладки, ячейки).
+
+    Кусок, прочитанный как кириллица посреди английской строки, — английское слово с эффектом:
+    берётся его английское прочтение (``Line.alt``)."""
+    lines = sorted((ln for ln in lines if ln.text.strip()), key=lambda ln: (ln.y, ln.x))
+    used = [False] * len(lines)
+    out: List[Line] = []
+    for i, a in enumerate(lines):
+        if used[i]:
+            continue
+        used[i] = True
+        row = [a]
+        grown = a.rot is None
+        while grown:
+            grown = False
+            gx0, gx1 = min(r.x for r in row), max(r.right for r in row)
+            gy0, gy1 = min(r.y for r in row), max(r.bottom for r in row)
+            gh = sum(r.h for r in row) / len(row)
+            for j, b in enumerate(lines):
+                if used[j] or b.rot is not None:
+                    continue
+                hmin, hmax = min(gh, b.h), max(gh, b.h)
+                overlap = min(gy1, b.bottom) - max(gy0, b.y)
+                gap = max(b.x - gx1, gx0 - b.right)
+                if overlap < 0.6 * hmin or hmax > 1.5 * hmin or gap > 0.8 * hmin:
+                    continue
+                near = min(row, key=lambda r: max(b.x - r.right, r.x - b.right))
+                if apart is not None and apart(near, b):
+                    continue
+                row.append(b)
+                used[j] = True
+                grown = True
+        if len(row) == 1:
+            out.append(a)
+            continue
+        row.sort(key=lambda r: r.x)
+        latin = sum(len(r.text) for r in row if not r.ru) >= sum(len(r.text) for r in row if r.ru)
+        parts = [(r.alt if latin and r.ru and r.alt else r.text) for r in row]
+        x0, y0 = min(r.x for r in row), min(r.y for r in row)
+        x1, y1 = max(r.right for r in row), max(r.bottom for r in row)
+        merged = Line(" ".join(p.strip() for p in parts if p.strip()), x0, y0, x1 - x0, y1 - y0)
+        size = sum(max(1, len(p)) for p in parts)
+        merged.conf = sum(r.conf * max(1, len(p)) for r, p in zip(row, parts)) / size
+        merged.ru = not latin
+        out.append(merged)
+    return sorted(out, key=lambda ln: (ln.y, ln.x))
+
+
+def tilted_next(last: Line, ln: Line) -> bool:
+    """``ln`` — следующая строка той же наклонной надписи, что и ``last``: тот же угол, похожая
+    высота, лежит сразу под ней (в повёрнутых осях) и перекрывается с ней вдоль строки."""
+    import math
+    if last.rot is None or ln.rot is None:
+        return False
+    cx, cy, ll, lt, la = last.rot
+    nx, ny, nl, nt, na = ln.rot
+    if abs(la - na) > math.radians(3) or max(lt, nt) / max(1.0, min(lt, nt)) > 1.35:
+        return False
+    c, s = math.cos(la), math.sin(la)
+    along, across = (nx - cx) * c + (ny - cy) * s, -(nx - cx) * s + (ny - cy) * c
+    t = (lt + nt) / 2
+    return 0.4 * t <= across <= 1.3 * t and abs(along) <= (ll + nl) / 2
+
+
+def block_rot(lines: Sequence[Line]) -> Optional[Tuple[float, float, float, float, float]]:
+    """Общая повёрнутая рамка наклонной надписи из нескольких строк (None — строки не наклонные)."""
+    import math
+    rots = [ln.rot for ln in lines]
+    if not rots or any(r is None for r in rots):
+        return None
+    if len(rots) == 1:
+        return rots[0]
+    total = sum(r[2] for r in rots)
+    ang = sum(r[4] * r[2] for r in rots) / total
+    cx = sum(r[0] for r in rots) / len(rots)
+    cy = sum(r[1] for r in rots) / len(rots)
+    c, s = math.cos(ang), math.sin(ang)
+    us, vs = [], []
+    for x, y, length, thick, _ in rots:
+        u, v = (x - cx) * c + (y - cy) * s, -(x - cx) * s + (y - cy) * c
+        us += [u - length / 2, u + length / 2]
+        vs += [v - thick / 2, v + thick / 2]
+    du, dv = (min(us) + max(us)) / 2, (min(vs) + max(vs)) / 2
+    return (cx + du * c - dv * s, cy + du * s + dv * c, max(us) - min(us), max(vs) - min(vs), ang)
 
 
 Rect = Tuple[int, int, int, int]
@@ -377,135 +588,38 @@ def similar(a: str, b: str, cutoff: float = 0.88) -> bool:
     return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() >= cutoff
 
 
-class Tracker:
-    """Какие блоки на экране сейчас и какие из них уже можно переводить.
-
-    ``update`` сопоставляет новые блоки с прошлыми (по близкому тексту и месту),
-    копит «попадания без изменений»; готов к переводу блок, который продержался
-    ``need`` проходов подряд почти без изменений текста.
-    """
-
-    def __init__(self, need: int = 2, forget_after: float = 1.2):
-        self.need = need
-        self.forget_after = forget_after
-        self.blocks: List[Block] = []
-
-    def update(self, fresh: List[Block], now: Optional[float] = None, covered: Sequence[Rect] = (),
-               scene_cut: bool = False) -> List[Block]:
-        """``covered`` — области, которые в этом кадре не видны (закрыты нашими плашками при захвате
-        экрана): блоки под ними не пропадают. ``scene_cut`` — картинка сменилась целиком: пропавшие
-        блоки убираются сразу, без передержки."""
-        now = time.monotonic() if now is None else now
-        kept: List[Block] = []
-        used = set()
-        for nb in fresh:
-            match = None
-            for i, ob in enumerate(self.blocks):
-                if i in used:
-                    continue
-                if _near(ob.rect, nb.rect) and (similar(ob.key, nb.key) or _grows(ob.key, nb.key)):
-                    match = i
-                    break
-            if match is None:
-                nb.first_seen = nb.last_seen = now
-                nb.stable_hits = 1 if nb.key else 0
-                kept.append(nb)
-                continue
-            used.add(match)
-            ob = self.blocks[match]
-            if _same(ob.key, nb.key):
-                nb.stable_hits = ob.stable_hits + 1
-                if similar(ob.key, nb.key, 0.93):
-                    nb.refined = ob.refined
-                if (ob.translation or ob.skip) and similar(ob.key, nb.key, 0.93):
-                    nb.translation = ob.translation     # тот же текст (с поправкой на шум) — перевод остаётся
-                    nb.skip = ob.skip
-                    nb.key = ob.key
-            else:
-                nb.stable_hits = 1                      # текст ещё печатается — ждём
-            nb.first_seen = ob.first_seen
-            nb.last_seen = now
-            nb.deep = nb.deep and ob.deep
-            nb.hold_until = max(nb.hold_until, ob.hold_until)
-            kept.append(nb)
-        for i, ob in enumerate(self.blocks):
-            if i in used:
-                continue
-            if any(intersect_area(ob.rect, c) >= 0.5 * area(ob.rect) for c in covered):
-                ob.last_seen = now                      # под нашей плашкой — не видно, но текст там есть
-                kept.append(ob)
-            elif scene_cut:
-                continue
-            elif now < ob.hold_until:
-                kept.append(ob)                         # надпись с картинки: быстрый проход её не видит
-            elif now - ob.last_seen < self.forget_after and (ob.translation or ob.skip):
-                kept.append(ob)                         # мигнул курсор, сменился кадр — держим недолго
-        self.blocks = kept
-        return kept
-
-    def add(self, fresh: List[Block], now: Optional[float] = None, hold: float = 0.0) -> List[Block]:
-        """Добавить блоки глубокого прохода к тем, что уже на экране (без пропажи остальных)."""
-        now = time.monotonic() if now is None else now
-        added: List[Block] = []
-        for nb in fresh:
-            match = next((ob for ob in self.blocks if _near(ob.rect, nb.rect) and
-                          (similar(ob.key, nb.key) or intersect_area(ob.rect, nb.rect) >= 0.5 * area(nb.rect))),
-                         None)
-            if match is not None:
-                match.hold_until = max(match.hold_until, now + hold)
-                match.last_seen = now
-                continue
-            nb.first_seen = nb.last_seen = now
-            nb.stable_hits = self.need if nb.key else 0     # статичный кадр — устойчивость уже проверена
-            nb.deep = True
-            nb.hold_until = now + hold
-            self.blocks.append(nb)
-            added.append(nb)
-        return added
-
-    def ready(self) -> List[Block]:
-        return [b for b in self.blocks if not b.translation and not b.skip and b.key and b.stable_hits >= self.need]
-
-
-def _same(old: str, new: str) -> bool:
-    """Тот же текст с поправкой на шум распознавания (но не дописанный — печатная машинка)."""
-    if old == new:
-        return True
-    if abs(len(old) - len(new)) > max(2, len(new) // 20):
-        return False
-    return similar(old, new, 0.9)
-
-
-def _near(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> bool:
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    tol = max(ah, bh, 12)
-    return abs(ay - by) <= tol * 1.5 and abs(ax - bx) <= max(aw, bw, 40) * 0.6
-
-
-def _grows(old: str, new: str) -> bool:
-    """Печатная машинка: новый текст продолжает старый."""
-    return bool(old) and len(new) > len(old) and new.startswith(old[: max(1, len(old) - 2)])
-
-
 class TranslationCache:
-    """Переводы этой сессии: точный ключ или очень похожий (шум распознавания)."""
+    """Переводы этой сессии: точный ключ или очень похожий (шум распознавания).
+
+    Спрашивают часто (на каждом кадре — про каждую надпись), поэтому нечёткий поиск делается один
+    раз на ключ: найденное запоминается, как и «не найдено» (до следующего нового перевода)."""
 
     def __init__(self, limit: int = 3000):
         self.limit = limit
         self.items: Dict[str, str] = {}
+        self._alias: Dict[str, str] = {}
+        self._miss: Set[str] = set()
 
     def get(self, key: str) -> Optional[str]:
         if key in self.items:
             return self.items[key]
-        if len(key) < 6:
+        alias = self._alias.get(key)
+        if alias is not None and alias in self.items:
+            return self.items[alias]
+        if len(key) < 6 or key in self._miss:
             return None
         cands = [k for k in self.items if abs(len(k) - len(key)) <= max(3, len(key) // 10)]
         best = difflib.get_close_matches(key, cands, n=1, cutoff=0.92)
-        return self.items[best[0]] if best else None
+        if best:
+            self._alias[key] = best[0]
+            return self.items[best[0]]
+        self._miss.add(key)
+        return None
 
     def put(self, key: str, value: str) -> None:
         if len(self.items) >= self.limit:
             for k in list(self.items)[: self.limit // 4]:
                 del self.items[k]
+            self._alias.clear()
         self.items[key] = value
+        self._miss.clear()

@@ -1027,9 +1027,14 @@ async function refreshLive() {
     $("#liveRegionClear").classList.toggle("hidden", !g.region);
     const info = [];
     if (st.capture === "window") info.push("кадр снимается с окна игры");
-    else if (st.capture === "screen") info.push("кадр снимается с экрана");
-    info.push(st.verify_ru ? "русский текст не трогается (проверка русским распознаванием Windows)"
+    else if (st.capture === "screen") info.push("кадр снимается с экрана" + (st.capture_excluded ? " (перевод в него не попадает)" : ""));
+    if (st.ocr && st.ocr.name === "paddle") info.push(`распознавание — нейросеть (${st.ocr.device || "процессор"})`);
+    else info.push(st.verify_ru ? "русский текст не трогается (проверка русским распознаванием Windows)"
       : "русский текст узнаётся по приметам");
+    const sp = st.speed || {};
+    if (sp.ocr_ms) info.push(`распознавание ~${fmtMs(sp.ocr_ms)}`);
+    if (sp.translate_ms) info.push(`перевод фразы ~${fmtMs(sp.translate_ms)}`);
+    if (sp.shown_ms) info.push(`перевод на экране через ~${fmtMs(sp.shown_ms)} после текста`);
     if (st.deep && st.deep.on) info.push(`надписей на картинках найдено: ${st.deep.found || 0}`);
     $("#liveInfo").textContent = info.join(" · ");
   }
@@ -1068,18 +1073,25 @@ async function refreshLive() {
     : '<span class="muted small">Здесь появятся переведённые фразы.</span>';
 }
 
+function fmtMs(ms) {
+  return ms < 1000 ? `${ms} мс` : `${(ms / 1000).toFixed(1).replace(".", ",")} с`;
+}
+
 function renderLiveSettings() {
   const st = S.liveSt;
   if (!st || !st.settings) return;
   const cfg = st.settings;
   const mode = cfg.live_mode || "auto";
   $$("#liveMode button").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
-  $("#liveModeHint").textContent = {
+  const tr = (st.speed || {}).translate_ms;
+  const measured = tr && st.translator && st.translator.mode === (mode === "auto" ? st.translator.mode : mode)
+    ? ` Сейчас на этом ПК одна новая фраза переводится за ~${fmtMs(tr)}.` : "";
+  $("#liveModeHint").textContent = ({
     auto: "Тот же способ, что выбран на вкладке «Русификация». Если он недоступен — машинный.",
-    machine: "Самый быстрый, офлайн и не занимает видеокарту — лучший выбор для живого перевода.",
-    cloud: "Переводит лучше, но каждая новая фраза появляется через 1–3 секунды. Нужен ключ на вкладке «Русификация».",
-    local: "Качественно и офлайн, но нейросеть делит видеокарту с игрой — на картах до 8 ГБ возможны подтормаживания.",
-  }[mode] || "";
+    machine: "Самый быстрый (доли секунды на фразу), офлайн и не занимает видеокарту — лучший выбор для экшена и онлайн-игр.",
+    cloud: "Переводит лучше машинного; скорость зависит от сервиса и интернета. Нужен ключ на вкладке «Русификация».",
+    local: "Качественнее машинного и офлайн, но медленнее: на слабом ПК новая фраза переводится секунды. Перевод всё равно появляется один раз и не подменяется.",
+  }[mode] || "") + measured;
   const scale = cfg.live_font_scale || 1, op = cfg.live_opacity || 0.86;
   $("#liveScale").value = Math.round(scale * 100);
   $("#liveOpacity").value = Math.round(op * 100);

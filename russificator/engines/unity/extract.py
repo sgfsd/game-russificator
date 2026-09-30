@@ -35,6 +35,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from ...core.universal import Entry, TextKind
 from ...translation.filters import looks_like_sentence, looks_technical, looks_translatable
+from . import unitypy_io
 from .detect import UnityGame
 
 log = logging.getLogger("russificator.unity.extract")
@@ -179,38 +180,41 @@ def extract_assets(game: UnityGame, col: _Collector, warnings: List[str], progre
         except Exception as exc:  # noqa: BLE001
             log.debug("не открыт %s: %s", f.name, exc)
             continue
-        if gen is not None:
-            env.typetree_generator = gen
         has_font = False
-        scene = f.name.lower().startswith("level")
-        trees = _TreeCache()
-        for obj in env.objects:
-            tname = obj.type.name
-            try:
-                if tname == "Font":
-                    has_font = True
-                elif tname == "MonoBehaviour":
-                    try:
-                        tree = obj.read_typetree()
-                    except Exception:  # noqa: BLE001
-                        # typetree не сошёлся с данными — берём строки из сырых байтов
-                        _from_raw(obj, col, f.name)
-                        continue
-                    if "m_glyphInfoList" in tree or "m_GlyphTable" in tree:
+        try:
+            if gen is not None:
+                env.typetree_generator = gen
+            scene = f.name.lower().startswith("level")
+            trees = _TreeCache()
+            for obj in env.objects:
+                tname = obj.type.name
+                try:
+                    if tname == "Font":
                         has_font = True
-                        continue
-                    comp = _from_monobehaviour(tree, col, f.name)
-                    if comp is not None:
-                        _remember_ui(obj, tree, comp, col, trees, scene)
-                elif tname == "TextMesh":
-                    tree = obj.read_typetree()
-                    val = tree.get("m_Text")
-                    if isinstance(val, str) and looks_translatable(val):
-                        col.add(val, TextKind.UI, f.name)
-                elif tname == "TextAsset":
-                    _from_text_asset(obj, col, f.name)
-            except Exception:  # noqa: BLE001
-                continue
+                    elif tname == "MonoBehaviour":
+                        try:
+                            tree = obj.read_typetree()
+                        except Exception:  # noqa: BLE001
+                            # typetree не сошёлся с данными — берём строки из сырых байтов
+                            _from_raw(obj, col, f.name)
+                            continue
+                        if "m_glyphInfoList" in tree or "m_GlyphTable" in tree:
+                            has_font = True
+                            continue
+                        comp = _from_monobehaviour(tree, col, f.name)
+                        if comp is not None:
+                            _remember_ui(obj, tree, comp, col, trees, scene)
+                    elif tname == "TextMesh":
+                        tree = obj.read_typetree()
+                        val = tree.get("m_Text")
+                        if isinstance(val, str) and looks_translatable(val):
+                            col.add(val, TextKind.UI, f.name)
+                    elif tname == "TextAsset":
+                        _from_text_asset(obj, col, f.name)
+                except Exception:  # noqa: BLE001
+                    continue
+        finally:
+            unitypy_io.release(env)   # файлы игры не остаются открытыми
         if has_font:
             col.font_files.append(f)
 

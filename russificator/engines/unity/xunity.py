@@ -311,9 +311,97 @@ EnableConsole=False
 EnableLog=False
 """
     backup.write_text(game.root / "BepInEx" / "config" / "AutoTranslatorConfig.ini", ini)
-    bep_cfg = game.root / "BepInEx" / "config" / "BepInEx.cfg"
-    if not bep_cfg.exists():
-        backup.write_text(bep_cfg, "[Logging.Console]\n\nEnabled = false\n")
+    write_bepinex_config(game, backup)
+
+
+#: точка входа BepInEx 5 по умолчанию: статический конструктор UnityEngine.Application
+DEFAULT_ENTRY_TYPE = "Application"
+
+
+def entrypoint_assembly(game: UnityGame) -> str:
+    """Сборка с MonoBehaviour: в Unity 2017+ — UnityEngine.CoreModule.dll, раньше — UnityEngine.dll."""
+    return "UnityEngine.CoreModule.dll" if (game.data / "Managed" / "UnityEngine.CoreModule.dll").is_file() \
+        else "UnityEngine.dll"
+
+
+def write_bepinex_config(game: UnityGame, backup) -> None:
+    """BepInEx.cfg: консоль выключена, загрузчик плагинов стартует из ``MonoBehaviour..cctor``.
+
+    Точка входа BepInEx 5 по умолчанию — ``Application..cctor`` — в части игр вызывается раньше,
+    чем движок готов создавать компоненты: XUnity добавляет свой компонент прямо при загрузке,
+    и игра падает (Crawl, Unity 5.4: «Crash!!!» в AddComponent сразу после «Loading [XUnity
+    Auto Translator]»), а в других играх у компонентов не вызывается Update. MonoBehaviour..cctor
+    срабатывает позже, когда движок уже готов, — так советует документация BepInEx для таких
+    случаев, и это точка по умолчанию в BepInEx 6. Другую точку входа, выбранную владельцем
+    (для модов), не трогаем — меняется только умолчание."""
+    if game.backend != "mono":
+        return                                     # BepInEx 6 (IL2CPP): своя настройка, и так поздняя
+    path = game.root / "BepInEx" / "config" / "BepInEx.cfg"
+    try:
+        text = path.read_text(encoding="utf-8-sig") if path.is_file() else ""
+    except OSError:
+        text = ""
+    if not text:
+        text = "[Logging.Console]\n\nEnabled = false\n"
+    current = ini_value(text, "Preloader.Entrypoint", "Type")
+    if current not in (None, "", DEFAULT_ENTRY_TYPE):
+        return
+    new = set_ini_values(text, "Preloader.Entrypoint", {"Assembly": entrypoint_assembly(game),
+                                                         "Type": "MonoBehaviour", "Method": ".cctor"})
+    if new != text or not path.is_file():
+        backup.write_text(path, new)
+
+
+def ini_value(text: str, section: str, key: str) -> Optional[str]:
+    """Значение ключа из секции ini/cfg (None — ключа нет)."""
+    cur = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            cur = s[1:-1].strip()
+        elif cur == section and "=" in s and not s.startswith(("#", ";")):
+            k, v = s.split("=", 1)
+            if k.strip() == key:
+                return v.strip()
+    return None
+
+
+def set_ini_values(text: str, section: str, values: Dict[str, str]) -> str:
+    """Проставить ключи в секции ini/cfg (остальное — как было; секции нет — добавляется в конец)."""
+    lines = text.splitlines()
+    out: List[str] = []
+    todo = dict(values)
+    cur = None
+    found = False
+
+    def flush() -> None:
+        while out and not out[-1].strip():
+            out.pop()
+        out.extend(f"{k} = {v}" for k, v in todo.items())
+        todo.clear()
+        out.append("")
+
+    for line in lines:
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            if cur == section and todo:
+                flush()
+            cur = s[1:-1].strip()
+            found = found or cur == section
+        elif cur == section and "=" in s and not s.startswith(("#", ";")):
+            k = s.split("=", 1)[0].strip()
+            if k in values:
+                out.append(f"{k} = {values[k]}")
+                todo.pop(k, None)
+                continue
+        out.append(line)
+    if cur == section and todo:
+        flush()
+    if not found:
+        while out and not out[-1].strip():
+            out.pop()
+        out += ["", f"[{section}]", ""] + [f"{k} = {v}" for k, v in values.items()]
+    return "\n".join(out).rstrip("\n") + "\n"
 
 
 def encode(text: str) -> str:

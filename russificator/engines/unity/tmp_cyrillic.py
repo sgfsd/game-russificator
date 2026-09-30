@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
+from . import unitypy_io
+
 log = logging.getLogger("russificator.unity.tmp")
 
 RUSSIAN = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя"
@@ -477,8 +479,12 @@ def _source_has_cyrillic(font: TmpFont, objects_by_id: Dict[int, object]) -> boo
 def patch_file(path: Path, gen, need: Set[str], renderer: GlyphRenderer, bold: GlyphRenderer,
                write: Callable[[Path, bytes], None]) -> List[FontReport]:
     """Починить все TMP-шрифты в одном файле ассетов. write(path, data) — запись с бэкапом."""
-    import UnityPy
-    env = UnityPy.load(str(path))
+    with unitypy_io.load_assets(str(path)) as env:
+        return _patch_env(env, path, gen, need, renderer, bold, write)
+
+
+def _patch_env(env, path: Path, gen, need: Set[str], renderer: GlyphRenderer, bold: GlyphRenderer,
+               write: Callable[[Path, bytes], None]) -> List[FontReport]:
     if gen is not None:
         env.typetree_generator = gen
     reports: List[FontReport] = []
@@ -561,9 +567,12 @@ def _verify(data: bytes, path: Path, gen, fonts: List[Tuple[int, TmpFont]], repo
     если что-то не читается, файл не записывается (лучше не тронуть игру,
     чем записать непроверенное).
     """
-    import UnityPy
-    env = UnityPy.load(data)
-    env.path = str(path.parent)  # внешние ссылки (скрипты шрифтов) — из папки игры
+    with unitypy_io.load_assets(data) as env:
+        env.path = str(path.parent)  # внешние ссылки (скрипты шрифтов) — из папки игры
+        _verify_env(env, gen, fonts, reports, need)
+
+
+def _verify_env(env, gen, fonts: List[Tuple[int, TmpFont]], reports: List[FontReport], need: Set[str]) -> None:
     if gen is not None:
         env.typetree_generator = gen
     objects = {o.path_id: o for o in env.objects}

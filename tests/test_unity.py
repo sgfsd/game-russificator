@@ -206,6 +206,63 @@ def test_config_has_partial_and_limits(tmp_path):
     assert "MaxCharactersPerTranslation=2500" in ini
 
 
+def test_bepinex_entrypoint_is_monobehaviour(tmp_path):
+    """Загрузчик BepInEx стартует из MonoBehaviour..cctor: из Application..cctor XUnity создаёт свой
+    компонент раньше, чем движок готов, — старые Unity (Crawl, 5.4) падали прямо при запуске."""
+    from russificator.core.backup import GameBackup
+    root = _fake_game(tmp_path)
+    game = detect.inspect(root)
+    cfg = root / "BepInEx" / "config" / "BepInEx.cfg"
+    xunity.write_config(game, GameBackup(root), live=True, tmp_font=None)
+    text = cfg.read_text(encoding="utf-8")
+    assert "Enabled = false" in text
+    assert xunity.ini_value(text, "Preloader.Entrypoint", "Type") == "MonoBehaviour"
+    assert xunity.ini_value(text, "Preloader.Entrypoint", "Assembly") == "UnityEngine.dll"     # Unity 5 и раньше
+    assert xunity.ini_value(text, "Preloader.Entrypoint", "Method") == ".cctor"
+    # BepInEx уже запускался и записал своё умолчание — оно заменяется, остальное остаётся как было
+    cfg.write_text("[Caching]\n\nEnableAssemblyCache = true\n\n[Preloader.Entrypoint]\n\n"
+                   "## Сборка\nAssembly = UnityEngine.dll\n\nType = Application\n\nMethod = .cctor\n\n"
+                   "[Logging]\n\nUnityLogListening = true\n", encoding="utf-8")
+    (game.data / "Managed").mkdir(exist_ok=True)
+    (game.data / "Managed" / "UnityEngine.CoreModule.dll").write_bytes(b"x")    # Unity 2017+
+    xunity.write_config(game, GameBackup(root), live=True, tmp_font=None)
+    text = cfg.read_text(encoding="utf-8")
+    assert xunity.ini_value(text, "Preloader.Entrypoint", "Type") == "MonoBehaviour"
+    assert xunity.ini_value(text, "Preloader.Entrypoint", "Assembly") == "UnityEngine.CoreModule.dll"
+    assert "## Сборка" in text and "EnableAssemblyCache = true" in text and "UnityLogListening = true" in text
+    # точку входа, выбранную владельцем для модов, не трогаем
+    cfg.write_text("[Preloader.Entrypoint]\nAssembly = UnityEngine.dll\nType = Camera\nMethod = .cctor\n",
+                   encoding="utf-8")
+    xunity.write_config(game, GameBackup(root), live=True, tmp_font=None)
+    assert xunity.ini_value(cfg.read_text(encoding="utf-8"), "Preloader.Entrypoint", "Type") == "Camera"
+
+
+def test_unitypy_files_are_closed(tmp_path):
+    """После чтения ассетов файлы игры закрыты: Steam может их проверить и перезаписать, а их
+    можно удалить, не закрывая программу."""
+    from russificator.engines.unity import unitypy_io
+
+    class Reader:
+        def __init__(self, path):
+            self.stream = open(path, "rb")
+
+    class Bundle:
+        def __init__(self, path):
+            self.files = {"inner": type("F", (), {"reader": Reader(path)})()}
+
+    a, b = tmp_path / "level0", tmp_path / "data.unity3d"
+    a.write_bytes(b"x" * 10)
+    b.write_bytes(b"y" * 10)
+    env = type("Env", (), {})()
+    env.files = {"level0": type("F", (), {"reader": Reader(a)})(), "bundle": Bundle(b)}
+    env.cabs = {"cab": env.files["level0"]}
+    streams = [env.files["level0"].reader.stream, env.files["bundle"].files["inner"].reader.stream]
+    unitypy_io.release(env)
+    assert all(s.closed for s in streams) and env.files == {} and env.cabs == {}
+    a.unlink()
+    b.unlink()
+
+
 def test_xunity_install_and_restore(tmp_path, monkeypatch):
     from russificator.core.backup import GameBackup
     from russificator.core.restore import restore_backups
