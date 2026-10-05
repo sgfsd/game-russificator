@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -416,3 +417,59 @@ def test_machine_splits_sentences_for_big_model():
     parts = MachineTranslator._sentences(line, always=True)
     assert [p.strip() for p in parts] == ["You seem rather lost.", "Is there anything I can help you with?"]
     assert "".join(parts) == line                                            # склейка без потерь
+
+
+def test_mask_takes_first_sign_the_model_knows():
+    """Знак маркера выбирает переводчик (из тех, что есть в словаре его модели)."""
+    masked, originals, sign = markup.mask("Hi {0}", signs="&*")
+    assert (masked, sign) == ("Hi &0", "&")
+    masked, _, sign = markup.mask("Press &1 then {0}", signs="&*")
+    assert (masked, sign) == ("Press &1 then *0", "*")
+
+
+def _tiny_spm(tmp_path):
+    """Крошечная модель sentencepiece: в словаре только буквы, цифры, «&», «*» и «,.!?:()» — «=», «+»,
+    «@», «<», «>», «{», «}» вне словаря (как у настоящей модели tc-big)."""
+    spm = pytest.importorskip("sentencepiece")
+    corpus = tmp_path / "corpus.txt"
+    words = "damage speed range warning the door is locked hello where gold of level complete new"
+    line = f"{words} {words.upper()} & * 0 1 2 3 4 5 6 7 8 9 , . ! ? : ( )"
+    corpus.write_text("\n".join([line] * 200), encoding="utf-8")
+    spm.SentencePieceTrainer.train(input=str(corpus), model_prefix=str(tmp_path / "tiny"), vocab_size=200,
+                                   hard_vocab_limit=False, character_coverage=1.0, model_type="char",
+                                   minloglevel=2)
+    # папка пользователя с русскими буквами: sentencepiece сам такой путь на Windows не открывает
+    home = tmp_path / "Игорь"
+    home.mkdir()
+    (home / "source.spm").write_bytes((tmp_path / "tiny.model").read_bytes())
+    return home / "source.spm"
+
+
+def test_machine_keeps_symbols_markers_and_drops_model_additions(tmp_path):
+    """Символы вне словаря модели не превращаются в «⁇», маркеры разметки не теряются (знак — из
+    словаря модели), маркер, приклеенный к слову, не мешает перевести слово, приписки модели в
+    скобках («(англ.)») не попадают в перевод. Модель грузится и из папки с русскими буквами."""
+    from russificator.translation import machine
+    sp = machine.load_spm(_tiny_spm(tmp_path))
+    words = {"damage": "урон", "speed": "скорость", "range": "дальность", "warning": "внимание",
+             "the door is locked": "дверь заперта", "hello": "привет"}
+
+    def model(s: str) -> str:
+        """Как ведёт себя настоящая модель: символ вне словаря — «⁇», слово, слитое с маркером, не
+        переводится, непереводимое — с припиской «(англ.)»."""
+        s = out = "".join(" ⁇ " if machine._unknown(sp, ch) else ch for ch in s)
+        for en, ru in words.items():
+            out = re.sub(rf"\b{en}\b", lambda m, ru=ru: ru.capitalize() if m.group(0)[0].isupper() else ru, out,
+                         flags=re.I)
+        return out if out != s else s + " (англ.)"
+
+    t = machine.MachineTranslator()
+    t._big = type("Big", (), {"src": sp})()
+    t._run = lambda sentences: [model(s) for s in sentences]
+    assert t._signs() == "&*"
+    got = t.translate_texts(["+DAMAGE +SPEED =RANGE", "<b>Warning:</b> the door is locked.", "62CO", "Hello, {0}!"])
+    assert got[0] == "+УРОН +СКОРОСТЬ =ДАЛЬНОСТЬ"
+    assert got[1] == "<b>Внимание:</b> дверь заперта."
+    assert got[2] == "62CO"
+    assert got[3] == "Привет, {0}!"
+    assert all("⁇" not in g for g in got)

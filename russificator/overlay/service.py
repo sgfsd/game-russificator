@@ -664,6 +664,11 @@ class LiveService:
         for i, g in enumerate(groups):
             if ok[i] and ranks is not None and text.is_name(g.text, ranks) and _above_reply(g, groups, ok):
                 ok[i] = False                   # имя героя табличкой над репликой — не переводим
+        # рамки строк всех надписей не делят пиксели между собой (каждая стирает и пишет только своё)
+        split = text.split_overlaps([ln for g in groups for ln in g.lines] + [ln for ls in skip for ln in ls])
+
+        def own(ls: List[Line]) -> List[Line]:
+            return [split.get(id(ln), ln) for ln in ls]
         for g, good in zip(groups, ok):
             if not good:
                 skip.append(g.lines)
@@ -671,13 +676,13 @@ class LiveService:
             body = text.strip_marker(text.join_lines(ln.text for ln in g.lines if getattr(ln, "conf", 1.0) >= 0.4))
             if not self._paddle:
                 body = self._refine(img, g.lines, body, ranks)
-            b = make_block(g.lines, img, read_at, source=self._source(body))
+            b = make_block(own(g.lines), img, read_at, source=self._source(body))
             if b is not None:
                 out.append(b)
         # непереводимое (имена, русский текст, названия, мусор) тоже запоминается: другое прочтение
         # того же места (глитч, анимация) узнаётся как то же место, а не как новая надпись
         for lines_ in skip:
-            b = make_block(lines_, img, read_at)
+            b = make_block(own(lines_), img, read_at)
             if b is not None:
                 b.skip = b.confirmed = True
                 out.append(b)

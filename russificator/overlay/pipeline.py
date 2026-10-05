@@ -41,6 +41,8 @@ SETTLE = 0.07
 MAX_WAIT = 0.45
 #: плавные изменения (анимация фона, текст проявляется постепенно) проверяются не чаще
 WEAK_PERIOD = 1.5
+#: …а плавное изменение, которое закончилось (проявился текст), — столько спустя
+FADE_SETTLE = 0.15
 #: сколько окрестность надписи должна простоять неизменной, чтобы показать перевод
 CONFIRM = 0.18
 #: то же для реплики, которая допечатывается и ещё не дошла до конца предложения
@@ -226,11 +228,14 @@ class Pipeline:
             cause = np.ones(c.shape, bool)
         elif live.any() and (now - self.strong_changed >= SETTLE or now - self.strong_since >= MAX_WAIT):
             cause = live.copy()                 # strong_dirty сейчас обнулится
-        elif self.dirty.any() and now - self.last_job >= WEAK_PERIOD:
+        elif self.dirty.any():
+            # плавное изменение накопилось в заметное (текст проявился, окно выплыло): как только
+            # оно улеглось — распознаём сразу; непрерывная анимация фона не улегается — не чаще WEAK_PERIOD
             drift = np.abs(self.cells - self.cells_at_job) > CELL_STRONG
             if noisy:
                 drift &= ~self.noise
-            if drift.any():
+            if drift.any() and (now - self.last_job >= WEAK_PERIOD
+                                or now - float(self.changed_at[drift].max()) >= FADE_SETTLE):
                 cause = drift
         if cause is None:
             return None

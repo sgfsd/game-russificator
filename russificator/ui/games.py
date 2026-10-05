@@ -29,12 +29,18 @@ def live_count(game: Path) -> int:
         return 0
 
 
+#: все поля состояния — status() отдаёт их всегда, чтобы обновление записи игры (здесь и в окне)
+#: затирало прежние значения, а не оставляло, например, «перевод слетел» после отката
+_NOT_RUSSIFIED: Dict[str, Any] = {"russified": False, "intact": None, "broken": 0, "from_package": False,
+                                  "translator": "", "date": "", "translated": None, "total": None, "live": 0}
+
+
 def status(game: Path) -> Dict[str, Any]:
     """Состояние русификации папки игры (быстро: манифест бэкапа и stat файлов)."""
     from ..core.package import translator_title
     b = GameBackup(Path(game))
     if not b.exists:
-        return {"russified": False}
+        return dict(_NOT_RUSSIFIED)
     ok, broken = b.check()
     info = b.info or {}
     pkg = info.get("package") or {}
@@ -104,15 +110,25 @@ class Library:
         return {"games": games, "scanned_at": self.scanned_at, "scanning": self.scanning}
 
     def refresh_status(self, path: str) -> Optional[Dict[str, Any]]:
-        """Обновить состояние одной игры (после русификации/отката)."""
-        key = library._norm(Path(path))
+        """Перечитать состояние игры с диска — после всего, что меняет её файлы (русификация,
+        архив-русификатор, откат). Окно получает событие ``game_status`` и само обновляет список и
+        открытую карточку игры. Русифицированная игра, которой нет в списке, добавляется в него."""
+        p = Path(path)
+        key = library._norm(p)
+        st = status(p)
         with self._lock:
-            for g in self.games:
-                if library._norm(Path(g["path"])) == key:
-                    g.update(status(Path(g["path"])))
-                    self._save_cache()
-                    return g
-        return None
+            game = next((g for g in self.games if library._norm(Path(g["path"])) == key), None)
+            if game is None and st["russified"]:
+                game = _entry(p, "russified")
+                self.games.append(game)
+                self.games.sort(key=lambda g: str(g.get("title", "")).lower())
+            if game is None:
+                return None
+            game.update(st)
+            self._save_cache()
+            game = dict(game)
+        self.emit({"type": "game_status", "game": game})
+        return game
 
     def scan(self, cfg: Dict[str, Any]) -> bool:
         """Запустить фоновый поиск. False — поиск уже идёт."""
@@ -151,11 +167,7 @@ class Library:
 
     def add(self, path: str) -> Dict[str, Any]:
         p = Path(path)
-        e = library.GameEntry(path=str(p), title=p.name, source="manual", engine=library.quick_engine(p))
-        exe = library.main_exe(p)
-        e.exe = str(exe) if exe else ""
-        e.sources = ["manual"]
-        d = e.to_dict()
+        d = _entry(p, "manual")
         d.update(status(p))
         key = library._norm(p)
         with self._lock:
@@ -163,6 +175,15 @@ class Library:
             self.games.sort(key=lambda g: str(g.get("title", "")).lower())
             self._save_cache()
         return d
+
+
+def _entry(p: Path, source: str) -> Dict[str, Any]:
+    """Запись списка для папки, добавленной не поиском (вручную или русифицированной)."""
+    e = library.GameEntry(path=str(p), title=p.name, source=source, engine=library.quick_engine(p))
+    exe = library.main_exe(p)
+    e.exe = str(exe) if exe else ""
+    e.sources = [source]
+    return e.to_dict()
 
 
 def steam_cover_file(appid: str) -> Optional[Path]:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -56,6 +57,9 @@ class Api:
         self._task_lock = threading.Lock()
         self._task: Optional[threading.Thread] = None
         self._cancel = threading.Event()
+        self._closing = threading.Event()          # окно закрывается: в него больше ничего не пишем
+        self._events: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue()
+        self._stopper: Optional[threading.Thread] = None
         self._last_progress = 0.0
         self._live = None                         # LiveServer живого перевода
         self._live_cancel = threading.Event()
@@ -66,19 +70,53 @@ class Api:
 
     def _bind(self, window) -> None:
         self._window = window
+        threading.Thread(target=self._pump_events, name="ui-events", daemon=True).start()
 
     def _emit(self, event: Dict[str, Any]) -> None:
-        if self._window is None:
+        """Отправить событие в окно, не дожидаясь его. ``evaluate_js`` ждёт ответа от потока окна, и
+        тот, кто вызвал его из потока окна (обработчик закрытия) или пока окно закрывается, ждёт
+        вечно — программа «не отвечает». Поэтому в окно пишет только отдельный поток, по очереди."""
+        if self._window is None or self._closing.is_set():
             return
         if event.get("type") in ("progress", "status", "download") and not event.get("final"):
             now = time.monotonic()
             if now - self._last_progress < 0.1:
                 return
             self._last_progress = now
-        try:
-            self._window.evaluate_js(f"window.onBackendEvent({json.dumps(event, ensure_ascii=False)})")
-        except Exception:  # noqa: BLE001
-            log.debug("окно не приняло событие", exc_info=True)
+        self._events.put(event)
+
+    def _pump_events(self) -> None:
+        while True:
+            batch = [self._events.get()]
+            while True:                            # накопившееся — одним вызовом
+                try:
+                    batch.append(self._events.get_nowait())
+                except queue.Empty:
+                    break
+            if None in batch or self._closing.is_set():
+                return
+            script = ";".join(f"window.onBackendEvent({json.dumps(e, ensure_ascii=False)})" for e in batch)
+            try:
+                self._window.evaluate_js(script)
+            except Exception:  # noqa: BLE001
+                log.debug("окно не приняло событие", exc_info=True)
+
+    def begin_shutdown(self) -> None:
+        """Окно закрывается (вызывается в потоке окна): только подаём сигналы и сразу возвращаемся —
+        ничего не ждём и в окно не пишем."""
+        self._closing.set()
+        self._events.put(None)
+        self.cancel_task()
+        self._stopper = threading.Thread(target=self.stop_live, name="ui-shutdown", daemon=True)
+        self._stopper.start()
+
+    def finish_shutdown(self, timeout: float = 30.0) -> None:
+        """Окно уже закрыто: даём текущей операции остановиться по отмене — запись файлов игры не
+        обрывается на полуслове. Дольше ``timeout`` не ждём."""
+        deadline = time.monotonic() + timeout
+        for t in (self._task, self._stopper):
+            if t is not None and t.is_alive():
+                t.join(max(0.0, deadline - time.monotonic()))
 
     def _run_task(self, name: str, fn) -> Dict[str, Any]:
         with self._task_lock:
@@ -531,13 +569,6 @@ class Api:
         settings.save(self._cfg)
         return {"ok": True, "folders": self._cfg["library_folders"]}
 
-    def game_status(self, path: str) -> Dict[str, Any]:
-        g = self._library.refresh_status(path)
-        if g is not None:
-            return g
-        from .games import status
-        return status(Path(path))
-
     def game_cover(self, appid: str) -> str:
         """Обложка Steam из локального кэша как data-URL (если в сети её не достать)."""
         import base64
@@ -926,11 +957,8 @@ def run(argv=None) -> int:
         width=1180, height=800, min_size=(960, 660), background_color="#0d0f14")
     api._bind(window)
 
-    def on_closing():
-        api.cancel_task()  # остановить перевод/загрузку; локальный сервер нейросети умрёт вместе с программой
-        api.stop_live()
-
-    window.events.closing += on_closing
+    # остановить перевод/загрузку; локальный сервер нейросети умрёт вместе с программой
+    window.events.closing += api.begin_shutdown
     if api._cfg.get("live_enabled"):            # живой перевод был включён — поднимаем его вместе с программой
         threading.Thread(target=api.overlay_start, kwargs={"quiet": True}, daemon=True).start()
     storage = paths.sub("webview")
@@ -945,7 +973,11 @@ def run(argv=None) -> int:
                  "сайта Microsoft и .NET Framework 4.8, затем запустить программу снова.\n\n"
                  f"Подробности — в журнале: {paths.logs_dir() / 'russificator.log'}")
         return 1
-    return 0
+    api.finish_shutdown()
+    # Окно закрыто — процесс должен завершиться, даже если поток какой-нибудь библиотеки (перевод,
+    # распознавание, .NET окна) не отпускает интерпретатор: обычный выход ждал бы его вечно.
+    logging.shutdown()
+    os._exit(0)
 
 
 def main() -> None:

@@ -58,3 +58,31 @@ def test_webview_cache_reset_after_update(tmp_path, monkeypatch):
     (cache / "data_0").write_bytes(b"same version")
     app._fresh_webview_cache(storage)                    # версия та же — кэш не трогаем
     assert (cache / "data_0").is_file()
+
+
+def test_closing_window_never_waits_for_the_window(api):
+    """Обработчик закрытия окна выполняется в потоке окна: если он (или что-то, что он вызывает) ждёт
+    ответа окна (evaluate_js), окно не отвечает никогда — программа «зависала» при закрытии. Теперь
+    события уходят в окно отдельным потоком, а закрытие только подаёт сигналы."""
+    import threading
+    import time
+    calls = []
+    release = threading.Event()
+
+    class FrozenWindow:                     # как окно, чей поток занят обработчиком закрытия
+        def evaluate_js(self, script):
+            calls.append(script)
+            release.wait(10)
+
+    api._bind(FrozenWindow())
+    started = time.monotonic()
+    api._emit({"type": "status", "message": "раз", "final": True})
+    api._emit({"type": "status", "message": "два", "final": True})
+    assert time.monotonic() - started < 0.5                  # отправка события окна не ждёт
+    api.begin_shutdown()                                     # stop_live внутри тоже шлёт событие
+    assert time.monotonic() - started < 0.5
+    api._emit({"type": "status", "message": "после закрытия", "final": True})
+    release.set()
+    api.finish_shutdown(timeout=5)
+    time.sleep(0.2)
+    assert not any("после закрытия" in c or "Живой перевод выключен" in c for c in calls)

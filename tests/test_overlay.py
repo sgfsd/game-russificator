@@ -399,3 +399,100 @@ def test_pipeline_closed_window_over_light_background_is_gone():
     p.frame(texture, now=0.35)
     p.frame(texture, now=0.55)
     assert p.visible() == [] and p.blocks == []
+
+
+def _paragraph(font_file, size, lines, spacing=1.05, pad_frac=0.3):
+    """Кадр с абзацем текста настоящим шрифтом и соседними строками сверху и снизу; рамки строк — с
+    полями, как у распознавания (при плотных строках налезают на соседние)."""
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+    fnt = ImageFont.truetype(font_file, size)
+    img = Image.new("RGB", (1000, 400), (30, 32, 44))
+    d = ImageDraw.Draw(img)
+    step, y, rects = int(size * spacing), 120, []
+    d.text((40, y - step), "Neighbour line above it", font=fnt, fill=(200, 200, 200))
+    for ln in lines:
+        d.text((40, y), ln, font=fnt, fill=(220, 210, 180))
+        b = d.textbbox((40, y), ln, font=fnt)
+        pad = int((b[3] - b[1]) * pad_frac)
+        rects.append((b[0] - 4, b[1] - pad, b[2] - b[0] + 8, b[3] - b[1] + 2 * pad))
+        y += step
+    d.text((40, y), "Another neighbour below", font=fnt, fill=(200, 200, 200))
+    frame = np.ascontiguousarray(np.asarray(img.convert("RGBA"))[..., [2, 1, 0, 3]])
+    return frame, rects, fnt
+
+
+def test_inline_size_matches_original_despite_neighbour_lines():
+    """Размер перевода — по высоте букв самой строки: рамка распознавания с полями задевает соседние
+    строки, но перевод от этого не становится крупнее (было — в полтора-два раза: перевод налезал на
+    соседний текст)."""
+    pytest.importorskip("PIL")
+    from russificator.overlay import inline
+    fonts = [f for f in (inline._font_file(False), inline._pixel_font_file()) if f]
+    if not fonts:
+        pytest.skip("нет шрифтов")
+    for font_file in fonts:
+        for size in (16, 28, 40):
+            for lines in (["For those who favour speed and", "accuracy over range and power."], ["START GAME"]):
+                frame, rects, fnt = _paragraph(font_file, size, lines)
+                x0, y0 = min(r[0] for r in rects), min(r[1] for r in rects)
+                x1, y1 = max(r[0] + r[2] for r in rects), max(r[1] + r[3] for r in rects)
+                src = " ".join(lines)
+                p = inline.render_item(frame.tobytes(), 1000, 400, inline.Item(
+                    rect=(x0, y0, x1 - x0, y1 - y0), lines=rects, text=src.split()[0], source=src))
+                assert p is not None
+                sample = "".join(src.split())[:40]
+                ours = inline.font(inline._font_file(p.style["bold"]), p.style["size"])
+                ratio = (ours.getbbox(sample)[3] - ours.getbbox(sample)[1]) / (fnt.getbbox(sample)[3] - fnt.getbbox(sample)[1])
+                assert 0.8 <= ratio <= 1.2, (font_file, size, lines[0], ratio)
+
+
+def test_inline_patch_is_transparent_outside_changed_pixels():
+    """Заплатка непрозрачна только там, где стёрт оригинал и написан перевод: её поля не закрывают
+    соседнюю надпись прежней картинкой кадра."""
+    pytest.importorskip("PIL")
+    from russificator.overlay import inline
+    if not inline._font_file(False):
+        pytest.skip("нет шрифтов")
+    frame, rects, _ = _paragraph(inline._font_file(False), 28, ["Press any key"])
+    x, y, w, h = rects[0]
+    p = inline.render_item(frame.tobytes(), 1000, 400, inline.Item(rect=rects[0], lines=rects, text="Нажмите",
+                                                                   source="Press any key"))
+    alpha = p.image.getchannel("A")
+    assert alpha.getpixel((0, 0)) == 0                                   # поле — прозрачное
+    assert alpha.crop((x - p.x, y - p.y, x - p.x + w, y - p.y + h)).getextrema()[1] == 255   # стёртое и текст
+
+
+def test_split_overlaps_gives_each_line_its_own_rows():
+    """Рамки соседних строк, налезающие друг на друга, делят общую полосу пополам; одна строка,
+    прочитанная дважды (почти целиком внахлёст), и строки не друг над другом не трогаются."""
+    a = Line("For those who favour", 20, 145, 800, 68)
+    b = Line("accuracy over range", 30, 200, 770, 59)
+    c = Line("16% chance", 20, 240, 580, 71)
+    side = Line("62)", 900, 190, 80, 50)
+    dup = Line("accuracy over rang", 30, 202, 760, 57)
+    got = text.split_overlaps([a, b, c, side])
+    assert got[id(a)].bottom == got[id(b)].y and got[id(b)].bottom == got[id(c)].y
+    assert got[id(a)].y == 145 and got[id(c)].bottom == 311 and id(side) not in got
+    assert text.split_overlaps([b, dup]) == {}
+
+
+def test_pipeline_fading_in_text_is_read_soon_after_it_settles():
+    """Текст, проявившийся плавно (без резкой смены клеток), читается сразу, как проявился, а не
+    раз в WEAK_PERIOD; непрерывная анимация фона по-прежнему не читается на каждом кадре."""
+    pytest.importorskip("numpy")
+    from russificator.overlay import pipeline
+    p = pipeline.Pipeline({}.get)
+    bg = _canvas(640, 360, [])
+    job = p.frame(bg, now=0.0, force=True)
+    p.ocr_done(job, [], now=0.05)
+    final = _canvas(640, 360, [(100, 200, 280, 24)])
+    for i in range(1, 6):                                            # проявляется за 5 кадров
+        mix = (bg.astype(float) * (1 - i / 5) + final.astype(float) * (i / 5)).astype("uint8")
+        assert p.frame(mix, now=0.1 + 0.05 * i) is None             # пока меняется — не читаем
+    t = 0.35
+    job = None
+    while job is None and t < 1.0:
+        t += 0.05
+        job = p.frame(final, now=t)
+    assert job is not None and t - 0.35 <= pipeline.FADE_SETTLE + 0.1 < pipeline.WEAK_PERIOD

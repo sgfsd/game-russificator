@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import difflib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
@@ -404,6 +404,33 @@ def is_name(text: str, words: Set[str]) -> bool:
     if not all(t[0].isupper() and not t.isupper() for t in tokens):
         return False
     return not any(_in_words(t.lower(), words) for t in tokens)
+
+
+def split_overlaps(lines: Sequence[Line]) -> Dict[int, Line]:
+    """Рамки строк, налезающие друг на друга по вертикали (рамка распознавания с полями при плотных
+    строках или пунктах меню), делятся пополам по общей полосе. Иначе две надписи претендуют на
+    одни и те же пиксели: одна стирает и закрывает буквы другой. Возвращает {id(строки): строка
+    с новой рамкой} для изменившихся."""
+    flat = [ln for ln in lines if ln.rot is None and ln.h > 0]
+    top = {id(ln): ln.y for ln in flat}
+    bottom = {id(ln): ln.bottom for ln in flat}
+    for i, a in enumerate(flat):
+        for b in flat[i + 1:]:
+            if min(a.right, b.right) <= max(a.x, b.x):
+                continue                        # не друг над другом
+            up, down = (a, b) if a.y + a.h / 2 <= b.y + b.h / 2 else (b, a)
+            over = up.bottom - down.y
+            if over <= 0 or over > 0.5 * min(up.h, down.h):
+                continue                        # не задевают — или это одна строка, прочитанная дважды
+            mid = down.y + over // 2
+            bottom[id(up)] = min(bottom[id(up)], mid)
+            top[id(down)] = max(top[id(down)], mid)
+    out: Dict[int, Line] = {}
+    for ln in flat:
+        y0, y1 = top[id(ln)], bottom[id(ln)]
+        if (y0, y1) != (ln.y, ln.bottom) and y1 - y0 >= 4:
+            out[id(ln)] = replace(ln, y=y0, h=y1 - y0)
+    return out
 
 
 def merge_rows(lines: List[Line], apart=None) -> List[Line]:

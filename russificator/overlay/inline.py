@@ -287,11 +287,15 @@ def _block_size(runs) -> int:
 
 # ------------------------------------------------------------------ стирание оригинала
 
-def inpaint(img, hole):
-    """Закрасить ``hole`` цветами окружения: пирамида уменьшенных копий с весами."""
+def inpaint(img, hole, avoid=None):
+    """Закрасить ``hole`` цветами окружения: пирамида уменьшенных копий с весами. ``avoid`` — что
+    не брать в образец цвета (буквы соседних надписей: иначе на стёртом месте проступил бы их цвет)."""
     import numpy as np
     img = img.astype(np.float32)
-    known = (~hole).astype(np.float32)
+    known = ~hole
+    if avoid is not None and (known & ~avoid).sum() >= 0.2 * known.sum():
+        known = known & ~avoid
+    known = known.astype(np.float32)
     levels = [(img * known[..., None], known)]
     while True:
         acc, wt = levels[-1]
@@ -359,16 +363,78 @@ def _wrap(text: str, fnt, width: float, squeeze: float) -> List[str]:
     return lines or [""]
 
 
+#: строка пикселей входит в «тело» строки текста, если букв в ней не меньше этой доли от самой
+#: заполненной: у строчных это высота «x», у заглавных — высота букв; редкие хвосты (p, g, d) и
+#: обрывки соседней строки, задетые рамкой распознавания, сюда не попадают
+CORE = 0.35
+
+
+def text_height(mask) -> int:
+    """Высота букв строки текста по маске её пикселей (строки × столбцы) — без полей рамки и без
+    чужих букв, которые рамка задела (хвосты строки выше, верх строки ниже, соседний пункт меню).
+
+    Сначала «тело» строки: сплошная полоса строк пикселей, заполненных не меньше CORE от самой
+    заполненной (несколько полос — та, что посередине, иначе самая заполненная). Потом высота
+    букв: от верха до низа штрихов, проходящих через тело (стержни «h», «d», хвосты «p», «g»). Чужие
+    буквы через тело строки не проходят."""
+    import numpy as np
+    m = np.asarray(mask, dtype=bool)
+    if m.ndim != 2 or not m.any():
+        return 0
+    counts = m.sum(axis=1).astype(np.float64)
+    dense = counts >= CORE * counts.max()
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], dense.astype(np.int8), [0]])))
+    runs = list(zip(edges[::2], edges[1::2]))
+    mid = m.shape[0] / 2
+    own = [r for r in runs if r[0] <= mid < r[1]]
+    a, b = own[0] if own else max(runs, key=lambda r: counts[r[0]:r[1]].sum())
+    through = m[a:b].any(axis=0)                # столбцы, где буквы проходят через тело
+    top = np.full(m.shape[1], a)
+    alive = through & m[a]
+    for r in range(a - 1, -1, -1):              # вверх от тела, пока штрих не прервётся
+        alive &= m[r]
+        if not alive.any():
+            break
+        top[alive] = r
+    bottom = np.full(m.shape[1], b - 1)
+    alive = through & m[b - 1]
+    for r in range(b, m.shape[0]):
+        alive &= m[r]
+        if not alive.any():
+            break
+        bottom[alive] = r
+    # выступы круглых букв за край тела (o, s, c) — не выносные элементы
+    tol = max(1, int(round(0.15 * (b - a))))
+    ups, downs = top[through & (top < a - tol)], bottom[through & (bottom > b - 1 + tol)]
+    # выносные — по длинным штрихам (у тонкого шрифта дуги «O», «S» уходят из столбца раньше), но не
+    # по самому длинному: один случайно касающийся чужой буквы столбец высоту не раздует
+    t = int(np.percentile(ups, 20)) if ups.size else a
+    d = int(np.percentile(downs, 80)) if downs.size else b - 1
+    return d - t + 1
+
+
+@lru_cache(maxsize=512)
+def _sample_height(font_path: Optional[str], sample: str) -> int:
+    """:func:`text_height` строки ``sample`` нашим шрифтом размера 100."""
+    import numpy as np
+    from PIL import Image, ImageDraw
+    fnt = font(font_path, 100)
+    box = fnt.getbbox(sample)
+    img = Image.new("L", (max(1, box[2] - box[0] + 8), max(1, box[3] - box[1] + 8)), 0)
+    ImageDraw.Draw(img).text((4 - box[0], 4 - box[1]), sample, font=fnt, fill=255)
+    return text_height(np.asarray(img) > 127)
+
+
 def ink_size(font_path: Optional[str], sample: str, ink_h: float) -> int:
-    """Размер шрифта, при котором буквы такой же строки (оригинала) были бы высотой ``ink_h``:
-    рамка распознавания у стилизованных шрифтов заметно больше самих букв."""
-    probe = font(font_path, 100)
+    """Размер шрифта, при котором буквы той же строки текста нашим шрифтом были бы высотой
+    ``ink_h``, как у оригинала, — обе высоты меряются одинаково (:func:`text_height`)."""
     sample = "".join(ch for ch in sample if not ch.isspace())[:40] or "Hg"
     try:
-        box = probe.getbbox(sample)
+        height = _sample_height(font_path, sample)
     except Exception:  # noqa: BLE001
         return max(6, int(ink_h))
-    height = max(1, box[3] - box[1])
+    if height <= 0:
+        return max(6, int(ink_h))
     return max(6, int(round(ink_h * 100 / height)))
 
 
@@ -389,8 +455,9 @@ class StyleBook:
         return px
 
 
-#: ступени уменьшения шрифта, если перевод не помещается и с переносом вниз, и с сужением букв
-SHRINK = (1.0, 0.9, 0.8, 0.7, 0.6)
+#: ступени уменьшения шрифта, если перевод не помещается и с переносом вниз, и с сужением букв:
+#: до самой мелкой — лишь бы не вылезти на соседние надписи
+SHRINK = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.42, 0.35)
 
 
 def layout(text: str, font_path: Optional[str], box_w: int, box_h: int, n_lines: int, line_h: float,
@@ -506,7 +573,9 @@ def render_item(frame, fw: int, fh: int, item: Item, book: Optional[StyleBook] =
     keep = np.zeros_like(inner) if in_frame else _rules(st["erase"] | st["mask"], inner)
     hole = _dilate(st["erase"], max(1, int(round(lh * 0.08))) + (st["block"] // 2 if st["block"] > 1 else 0)) & \
         (inner if in_frame else _dilate(inner, 1)) & ~keep
-    clean = inpaint(crop, hole)
+    # буквы соседних надписей рядом (пиксели, далёкие от фона, вне стираемого) — не образец фона
+    far = np.sqrt(((crop.astype(np.int32) - np.array(st["bg"])) ** 2).sum(axis=2)) > max(40.0, st["span"] * 0.5)
+    clean = inpaint(crop, hole, avoid=far & ~hole)
     # следы оригинала остались (обводка, тень, рисованная надпись) — ровно закрашиваем рамку строк
     # цветом фона (размытая заливка на пёстром фоне выглядит грязным пятном)
     whole = (inner if in_frame else _dilate(inner, 1)) & ~keep
@@ -525,15 +594,15 @@ def render_item(frame, fw: int, fh: int, item: Item, book: Optional[StyleBook] =
     text = item.text.strip()
     if letters and all(c.isupper() for c in letters):
         text = text.upper()
-    # высота самих букв оригинала (без полей рамки распознавания)
+    # высота букв оригинала (без полей рамки распознавания и задетых ею соседних строк)
     inks = []
     for lx, ly, lw, lhh in item.lines or [item.rect]:
         sub = st["mask"][max(0, ly - y0):max(0, ly - y0 + lhh), max(0, lx - x0):max(0, lx - x0 + lw)]
         if sub.size == 0:
             continue
-        rows = np.flatnonzero(sub.sum(axis=1) >= max(1, 0.02 * sub.shape[1]))
-        if len(rows):
-            inks.append(rows[-1] - rows[0] + 1)
+        ink = text_height(sub)
+        if ink:
+            inks.append(ink)
     ink_h = float(np.median(inks)) if inks else lh * 0.7
     bold = st["stroke"] >= max(2.0, ink_h * 0.13)
     block = st["block"]
@@ -595,8 +664,23 @@ def render_item(frame, fw: int, fh: int, item: Item, book: Optional[StyleBook] =
     tx = max(0, min(img.width - layer.width, tx))
     ty = max(0, min(img.height - layer.height, ty))
     img.alpha_composite(layer, (tx, ty))
+    _only_changed(img, arr[y0:y0 + img.height, x0:x0 + img.width, 2::-1])
     return Patch(x0, y0, img, {"block": block, "bold": bold, "fg": st["fg"], "bg": st["bg"], "size": size,
                                "centered": centered, "ink": round(ink_h, 1), "outline": st["edge"]})
+
+
+def _only_changed(img, was) -> None:
+    """Заплатка непрозрачна только там, где она что-то изменила (стёртые буквы, новый текст), с
+    мягким краем; поля вокруг — прозрачные. Иначе поле одной заплатки ложилось бы на соседнюю
+    надпись прежней картинкой кадра — с кусками её английских букв поверх перевода."""
+    import numpy as np
+    from PIL import Image, ImageFilter
+    got = np.asarray(img.convert("RGB")).astype(np.int16)
+    if was.shape != got.shape:
+        return
+    changed = np.abs(got - was.astype(np.int16)).max(axis=2) > 6
+    alpha = Image.fromarray((_dilate(changed, 1) * 255).astype(np.uint8), "L").filter(ImageFilter.GaussianBlur(0.8))
+    img.putalpha(alpha)
 
 
 def _render_tilted(frame, fw: int, fh: int, item: Item, book: Optional[StyleBook] = None) -> Optional[Patch]:

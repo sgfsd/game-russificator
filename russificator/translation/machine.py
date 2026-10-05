@@ -30,6 +30,7 @@ import os
 import re
 import shutil
 import threading
+import unicodedata
 import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -137,6 +138,11 @@ def _download_big(dest: Path, status: StatusFn, cancel: Optional[threading.Event
     total_mb = APPROX_SIZE_MB
 
     for name in BIG_FILES:
+        # файл скачан целиком в прошлый раз, а проверка модели тогда не прошла (например, из-за русских
+        # букв в пути) — второй раз не качаем; битый файл отсеет пробный перевод
+        if (dest / name).is_file():
+            continue
+
         def progress(done: int, total: int, name=name) -> None:
             if name == "model.bin":
                 status(f"Скачивание модели перевода: {done >> 20} из {(total >> 20) or total_mb} МБ",
@@ -232,19 +238,26 @@ def install_in_background() -> None:
     threading.Thread(target=work, name="machine-model-download", daemon=True).start()
 
 
+def load_spm(path: Path):
+    """Модель sentencepiece из файла. Читаем байты сами: sentencepiece на Windows открывает файл
+    по пути в кодировке ANSI и не находит его, если в пути есть буквы не из неё (папка
+    пользователя «Игорь» при английской Windows, китайские буквы при русской…)."""
+    import sentencepiece as spm
+    return spm.SentencePieceProcessor(model_proto=Path(path).read_bytes())
+
+
 class _BigModel:
     """OPUS-MT tc-big: своя модель sentencepiece для исходного текста и для перевода, метка языка
     ``>>rus<<`` перед предложением."""
 
     def __init__(self, d: Path, threads: int):
         import ctranslate2
-        import sentencepiece as spm
         types = ctranslate2.get_supported_compute_types("cpu")
         compute = "int8" if "int8" in types else "float32"
         self.tr = ctranslate2.Translator(str(d), device="cpu", compute_type=compute, inter_threads=1,
                                          intra_threads=threads)
-        self.src = spm.SentencePieceProcessor(model_file=str(d / "source.spm"))
-        self.tgt = spm.SentencePieceProcessor(model_file=str(d / "target.spm"))
+        self.src = load_spm(d / "source.spm")
+        self.tgt = load_spm(d / "target.spm")
 
     def run(self, sentences: List[str]) -> List[str]:
         pieces = [[BIG_TARGET] + p + ["</s>"] for p in self.src.encode(sentences, out_type=str)]
@@ -302,7 +315,6 @@ class MachineTranslator(Translator):
                     raise TranslatorError(f"Не удалось загрузить модель перевода: {exc}. "
                                           "Попробуйте удалить модель и скачать заново.")
         import ctranslate2
-        import sentencepiece as spm
         d = model_dir()
         try:
             meta = json.loads((d / "metadata.json").read_text(encoding="utf-8"))
@@ -317,7 +329,7 @@ class MachineTranslator(Translator):
         except Exception as exc:  # noqa: BLE001
             raise TranslatorError(f"Не удалось загрузить модель перевода: {exc}. "
                                   "Попробуйте удалить модель и скачать заново.")
-        self._sp = spm.SentencePieceProcessor(model_file=str(d / "sentencepiece.model"))
+        self._sp = load_spm(d / "sentencepiece.model")
 
     # ---------- перевод ----------
 
@@ -351,9 +363,12 @@ class MachineTranslator(Translator):
                 continue
             lines = []
             for line in text.split("\n"):
-                masked, originals, sign = markup.mask(line)
+                masked, originals, sign = markup.mask(line, self._signs())
+                masked = self._mask_unknown(masked, originals, sign)
                 sentences = []
-                for sent in self._sentences(masked, always=self._big is not None):
+                # маркер, приклеенный к слову («&0Warning:»), мешает модели перевести само слово:
+                # ей он даётся через пробел, а после перевода приклеивается обратно (unmask)
+                for sent in self._sentences(_spaced(masked, sign), always=self._big is not None):
                     lead, core, trail = _strip(sent)
                     caps = _is_caps(core)
                     src = core.lower().capitalize() if caps else core
@@ -372,7 +387,7 @@ class MachineTranslator(Translator):
                 parts = []
                 for lead, src, trail, caps in sentences:
                     if src in index:
-                        tr = done[index[src]]
+                        tr = _no_additions(src, done[index[src]])
                         tr = tr.upper() if caps else match_case(tr, src) if src[:1].isalpha() else tr
                     else:
                         tr = src
@@ -386,13 +401,36 @@ class MachineTranslator(Translator):
                 out[i] = "\n".join(result_lines)
             else:
                 out[i] = self._translate_by_segments(texts[i])
-        return [o if o is not None else t for o, t in zip(out, texts)]
+        return [_no_unknown(o) if o is not None else t for o, t in zip(out, texts)]
+
+    def _signs(self) -> str:
+        """Знаки маркеров разметки, которые модель знает и переносит в перевод как есть: большая
+        модель не знает «@» и «#» (вместо них «⁇» — маркер терялся, и строка переводилась по
+        кускам), а «&N» переносит без искажений; запасная (Argos) лучше всего держит «@N»."""
+        sp = self._big.src if self._big is not None else self._sp
+        if sp is None:
+            return "@#"
+        return "".join(c for c in "@#&*$" if not _unknown(sp, c)) or "@#"
+
+    def _mask_unknown(self, masked: str, originals: List[str], sign: str) -> str:
+        """Значки (``=``, ``~``, ``→``, ``|``, ``♥``…) модель превращает в «⁇» (их нет в её словаре)
+        или теряет — они прячутся маркерами, как разметка, и возвращаются на место."""
+        sp = self._big.src if self._big is not None else self._sp
+        out = []
+        for ch in masked:
+            if _keep(sp, ch):
+                originals.append(ch)
+                out.append(f"{sign}{len(originals) - 1}")
+            else:
+                out.append(ch)
+        return "".join(out)
 
     def _translate_by_segments(self, text: str) -> str:
         """Запасной путь: переводим куски между вставками по отдельности."""
         lines = []
         for line in text.split("\n"):
-            chunks = markup.split_by_markup(line)
+            chunks = [part for is_tag, c in markup.split_by_markup(line)
+                      for part in ([(True, c)] if is_tag else self._split_unknown(c))]
             todo = [c for is_tag, c in chunks if not is_tag and markup.has_words(c)]
             done = dict(zip(todo, self._run([c.strip() for c in todo])))
             rebuilt = []
@@ -404,6 +442,18 @@ class MachineTranslator(Translator):
                     rebuilt.append(c)
             lines.append("".join(rebuilt))
         return "\n".join(lines)
+
+    def _split_unknown(self, text: str) -> List[Tuple[bool, str]]:
+        """Кусок текста → [(это_вставка, текст)]: символы вне словаря модели — как вставки."""
+        sp = self._big.src if self._big is not None else self._sp
+        out: List[Tuple[bool, str]] = []
+        for ch in text:
+            tag = _keep(sp, ch)
+            if out and not tag and not out[-1][0]:
+                out[-1] = (False, out[-1][1] + ch)
+            else:
+                out.append((tag, ch))
+        return out
 
     @staticmethod
     def _sentences(line: str, always: bool = False) -> List[str]:
@@ -441,6 +491,44 @@ class MachineTranslator(Translator):
         self._tr = None
         self._sp = None
         self._big = None
+
+
+_unknown_cache: Dict[Tuple[int, str], bool] = {}
+
+
+def _keep(sp, ch: str) -> bool:
+    """Символ не для перевода — переносится как есть: символ вне словаря модели или значок не из
+    ASCII (категория Unicode «S»: → ★ ♥ ≥ — модели их теряют)."""
+    if ch.isspace():
+        return False
+    return (ord(ch) > 127 and unicodedata.category(ch)[0] == "S") or (sp is not None and _unknown(sp, ch))
+
+
+def _unknown(sp, ch: str) -> bool:
+    key = (id(sp), ch)
+    if key not in _unknown_cache:
+        _unknown_cache[key] = sp.unk_id() in sp.encode(ch, out_type=int)
+    return _unknown_cache[key]
+
+
+def _spaced(masked: str, sign: str) -> str:
+    """Маркеры вставок отделены пробелами от соседних слов (для модели)."""
+    s = re.sub(rf"(?<=\S)({re.escape(sign)}\d+)", r" \1", masked)
+    return re.sub(rf"({re.escape(sign)}\d+)(?=[^\s\d])", r"\1 ", s)
+
+
+def _no_additions(src: str, tr: str) -> str:
+    """Скобки, которых в оригинале нет, — приписки модели к непереводимому («62CO (англ.)»)."""
+    if "(" not in src and "(" in tr:
+        tr = re.sub(r"\s*\([^()]*\)", "", tr).strip() or tr
+    return tr
+
+
+def _no_unknown(text: str) -> str:
+    """Последняя защита: «⁇» (символ вне словаря модели) в перевод не попадает."""
+    if "⁇" not in text:
+        return text
+    return re.sub(r"[ \t]{2,}", " ", text.replace("⁇", " ")).strip()
 
 
 def _strip(s: str) -> Tuple[str, str, str]:

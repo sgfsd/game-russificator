@@ -67,13 +67,14 @@ def has_words(text: str) -> bool:
     return bool(re.search(r"[A-Za-z]{2}", plain_text(text)))
 
 
-def mask(text: str) -> Tuple[str, List[str], str]:
-    """Заменить вставки маркерами ``@N`` (или ``#N``, если ``@цифра`` уже в тексте).
+def mask(text: str, signs: str = "@#") -> Tuple[str, List[str], str]:
+    """Заменить вставки маркерами ``@N`` (или следующим знаком из ``signs``, если ``@цифра`` уже в
+    тексте). Знак маркера должен быть в словаре модели перевода — иначе она его потеряет.
 
     Возвращает (текст_с_маркерами, исходные_вставки, символ_маркера).
     """
     found: List[str] = []
-    sign = "#" if re.search(r"@\d", text) else "@"
+    sign = next((c for c in signs if not re.search(re.escape(c) + r"\d", text)), signs[-1])
 
     def repl(m: re.Match) -> str:
         found.append(m.group(0))

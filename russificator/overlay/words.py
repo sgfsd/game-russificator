@@ -226,18 +226,17 @@ _cached: Optional[Words] = None
 def load(model: Optional[Path] = None) -> Optional[Words]:
     """Словарь из sentencepiece-модели машинного переводчика (None — модели нет)."""
     global _cached
+    from ..translation import machine
     with _lock:
         default = model is None
         if default and _cached is not None:
             return _cached
         if default:
-            from ..translation.machine import model_dir
-            model = model_dir() / "sentencepiece.model"
+            model = machine.model_dir() / "sentencepiece.model"
         if not Path(model).is_file():
             return None
         try:
-            import sentencepiece as spm
-            sp = spm.SentencePieceProcessor(model_file=str(model))
+            sp = machine.load_spm(model)
         except Exception as exc:  # noqa: BLE001
             log.warning("словарь английских слов не загружен: %s", exc)
             return None

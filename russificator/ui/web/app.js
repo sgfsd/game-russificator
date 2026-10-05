@@ -612,6 +612,7 @@ window.onBackendEvent = (ev) => {
     case "run_finished": finishRun(ev); break;
     case "library_progress": if (S.lib.scanning) setLibStatus(ev.message, true); break;
     case "library": onLibrary(ev); break;
+    case "game_status": onGameStatus(ev.game); break;
     case "import": onImportProgress(ev); break;
     case "import_done": onImportDone(ev); break;
     case "download": onDownload(ev); break;
@@ -634,7 +635,6 @@ function finishRun(ev) {
     S.game.russified = true;
     S.game.intact = true;
     S.game.live = !!ev.live;
-    if (S.lib.loaded) api().game_status(S.game.path).then((g) => { if (g && g.path) { upsertGame(g); renderGames(); } });
   }
   if (ok) markStage("__end__", "done"), $$("#stepper li").forEach((li) => li.classList.add("done"));
   else if (S.stage) markStage(S.stage, ev.cancelled ? "active" : "fail");
@@ -812,6 +812,18 @@ function gameKind(g) {
   if (g.russified) return "russified";
   if (g.supported) return "supported";
   return "overlay";
+}
+
+/* Файлы игры изменились (русификация, архив, откат) — программа перечитала её состояние с диска:
+   обновляем и список, и открытую карточку этой игры, чтобы кнопки и статус не остались прежними. */
+function onGameStatus(g) {
+  if (!g || !g.path) return;
+  upsertGame(g);
+  if (S.lib.loaded) renderGames();
+  const cur = S.lib.current;
+  if (cur && cur.path === g.path && !$("#gameModal").classList.contains("hidden")) {
+    openGame(S.lib.games.find((x) => x.path === g.path));
+  }
 }
 
 function upsertGame(g) {
@@ -1171,7 +1183,6 @@ async function onImportDone(ev) {
   $("#imMsgs").innerHTML = [`<div class="msg n">${icon("check-circle")}<span>Готово! Русификатор установлен — запускайте игру.</span></div>`]
     .concat((ev.notes || []).map((m) => `<div class="msg w">${icon("alert")}<span>${esc(m)}</span></div>`)).join("");
   toast("Русификатор установлен");
-  if (S.lib.loaded) { const g = await api().game_status(ev.game); if (g && g.path) { upsertGame(g); renderGames(); } }
   if (S.game && S.game.path === ev.game) detectGame(ev.game, true);
 }
 
