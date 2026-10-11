@@ -27,7 +27,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
 
+      - name: Кэш SDK Ren'Py (сайт Ren'Py бывает недоступен)
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/renpy-sdk
+          key: renpy-sdk-8.3.7-7.4.11
+
       - name: Ren'Py 8 и 7
         env:
           PYTHONUNBUFFERED: "1"
+          RENPY_SDK_CACHE: ${{ runner.temp }}/renpy-sdk
         run: python tools/ci_renpy_check.py 8.3.7 7.4.11

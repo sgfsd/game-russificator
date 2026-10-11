@@ -110,10 +110,43 @@ screen ci_driver():
 '''
 
 
+_SITE_DOWN: list = []
+
+
+class SdkUnavailable(Exception):
+    """SDK Ren'Py не скачать (сайт Ren'Py не отвечает) — проверять нечем, это не ошибка программы."""
+
+
+def _download_sdk(version: str) -> bytes:
+    """SDK из кэша CI (``RENPY_SDK_CACHE``, его сохраняет actions/cache) или с сайта Ren'Py — с
+    повторами: сайт бывает недоступен часами, а скачанный однажды SDK больше не нужен с сайта."""
+    name = f"renpy-{version}-sdk.tar.bz2"
+    cache = Path(os.environ["RENPY_SDK_CACHE"]) if os.environ.get("RENPY_SDK_CACHE") else None
+    if cache is not None and (cache / name).is_file():
+        print(f"[{version}] SDK из кэша", flush=True)
+        return (cache / name).read_bytes()
+    errors = []
+    rounds = 1 if _SITE_DOWN else 2             # сайт уже не ответил для прошлой версии — не ждём долго
+    for attempt in range(rounds):
+        if attempt:
+            time.sleep(30)
+        for url in (f"https://www.renpy.org/dl/{version}/{name}", f"https://renpy.org/dl/{version}/{name}"):
+            print(f"[{version}] скачиваю {url}", flush=True)
+            try:
+                data = urllib.request.urlopen(url, timeout=60).read()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{url}: {exc}")
+                continue
+            if cache is not None:
+                cache.mkdir(parents=True, exist_ok=True)
+                (cache / name).write_bytes(data)
+            return data
+    _SITE_DOWN.append(version)
+    raise SdkUnavailable("; ".join(errors[-2:]))
+
+
 def fetch_sdk(version: str, dest: Path) -> Path:
-    url = f"https://www.renpy.org/dl/{version}/renpy-{version}-sdk.tar.bz2"
-    print(f"[{version}] скачиваю {url}", flush=True)
-    data = urllib.request.urlopen(url, timeout=300).read()
+    data = _download_sdk(version)
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:bz2") as tf:
         try:
             tf.extractall(dest, filter="fully_trusted")
@@ -254,13 +287,23 @@ def main() -> int:
     for v in versions:
         try:
             results[v] = check(v, work)
+        except SdkUnavailable as exc:
+            # сайт Ren'Py лежит — проверить нечем; это видно предупреждением, но не валит сборку
+            results[v] = None
+            if os.environ.get("GITHUB_ACTIONS"):
+                print(f"::warning title=Ren'Py {v}: проверка пропущена::SDK не скачать — renpy.org не отвечает "
+                      f"({str(exc)[:500]})", flush=True)
+            else:
+                print(f"[{v}] ПРОПУЩЕНО: SDK не скачать ({exc})", flush=True)
+            continue
         except Exception:  # noqa: BLE001
             import traceback
             say(v, traceback.format_exc())
             results[v] = False
         annotate(v, results[v])
-    print("ИТОГ:", ", ".join(f"Ren'Py {k}={'OK' if v else 'FAIL'}" for k, v in results.items()))
-    return 0 if all(results.values()) else 1
+    print("ИТОГ:", ", ".join(f"Ren'Py {k}=" + {True: "OK", False: "FAIL", None: "пропущено"}[v]
+                             for k, v in results.items()))
+    return 1 if any(v is False for v in results.values()) else 0
 
 
 if __name__ == "__main__":
