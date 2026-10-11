@@ -143,6 +143,24 @@ def errors_of(game: Path) -> str:
     return "\n".join(out)
 
 
+#: что видела проверка — по версиям; уходит в аннотации GitHub (их видно без входа, а лог задания — нет)
+REPORT: dict = {}
+
+
+def say(version: str, text: str) -> None:
+    print(text, flush=True)
+    REPORT.setdefault(version, []).append(str(text))
+
+
+def annotate(version: str, ok: bool) -> None:
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+    body = "\n".join(REPORT.get(version, []))[-6000:]
+    body = body.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    level = "notice" if ok else "error"
+    print(f"::{level} title=Ren'Py {version}: {'OK' if ok else 'FAIL'}::{body}", flush=True)
+
+
 def check(version: str, work: Path) -> bool:
     from russificator.core.package import export_package, install_package, open_package
     from russificator.core.pipeline import Pipeline, PipelineOptions
@@ -161,10 +179,10 @@ def check(version: str, work: Path) -> bool:
     game = root / "TheQuestion"
     shutil.copytree(sdk / "the_question", game)
     r = renpy(sdk, game, "compile")
-    print(f"[{version}] compile: код {r.returncode}", flush=True)
+    say(version, f"[{version}] compile: код {r.returncode}")
     rpyc = list((game / "game").rglob("*.rpyc"))
     if not rpyc:
-        print(r.stdout[-2000:], r.stderr[-2000:])
+        say(version, r.stdout[-2000:] + r.stderr[-2000:])
         return False
     for f in (game / "game").rglob("*.rpy"):
         f.unlink()                                  # как в выпущенной игре: только .rpyc
@@ -174,7 +192,7 @@ def check(version: str, work: Path) -> bool:
     shutil.copytree(game, friend)
 
     res = Pipeline(Fake(), PipelineOptions(use_memory=False)).run(game)
-    print(f"[{version}] русификация: {res.summary() if hasattr(res, 'summary') else res.success}", flush=True)
+    say(version, f"[{version}] русификация: {res.summary() if hasattr(res, 'summary') else res.success}")
     if not res.success:
         return False
     z = export_package(game, root / "out", credit=True)
@@ -190,41 +208,41 @@ def check(version: str, work: Path) -> bool:
     r = renpy(sdk, friend, "lint", timeout=300)
     lint = (r.stdout or "") + (r.stderr or "")
     lint_errors = [ln for ln in lint.splitlines() if "zz_russificator" in ln or "russificator" in ln.lower()]
-    print(f"[{version}] lint: код {r.returncode}; строки про русификатор: {lint_errors or 'нет'}", flush=True)
+    say(version, f"[{version}] lint: код {r.returncode}; строки про русификатор: {lint_errors or 'нет'}")
     err = errors_of(friend)
     if r.returncode != 0 or err or lint_errors:
-        print(lint[-3000:])
-        print(err)
+        say(version, lint[-3000:])
+        say(version, err)
         ok = False
     for name in ("traceback.txt", "errors.txt"):
         (friend / name).unlink(missing_ok=True)
 
     started = time.monotonic()
     r = renpy(sdk, friend, timeout=120, xvfb=True)
-    print(f"[{version}] запуск: код {r.returncode} за {time.monotonic() - started:.0f} с", flush=True)
+    say(version, f"[{version}] запуск: код {r.returncode} за {time.monotonic() - started:.0f} с")
     err = errors_of(friend)
     said = (friend / "ci_said.txt").read_text(encoding="utf-8") if (friend / "ci_said.txt").is_file() else ""
     state = (friend / "ci_state.txt").read_text(encoding="utf-8") if (friend / "ci_state.txt").is_file() else ""
-    print(f"[{version}] состояние:\n{state}")
-    print(f"[{version}] реплики (первые):\n" + "\n".join(said.splitlines()[:8]))
+    say(version, f"[{version}] состояние:\n{state}")
+    say(version, f"[{version}] реплики (первые):\n" + "\n".join(said.splitlines()[:8]))
     if err:
-        print(err)
+        say(version, err)
         ok = False
     if "Ру:" not in said:
-        print(f"[{version}] ПРОВАЛ: реплики не переведены")
+        say(version, f"[{version}] ПРОВАЛ: реплики не переведены")
         ok = False
     if "main menu seen, credit=True" not in state:
-        print(f"[{version}] ПРОВАЛ: надписи о программе нет в главном меню")
+        say(version, f"[{version}] ПРОВАЛ: надписи о программе нет в главном меню")
         ok = False
     if "after_alt_t ru_on=False" not in state:
-        print(f"[{version}] ПРОВАЛ: Alt+T не переключил перевод")
+        say(version, f"[{version}] ПРОВАЛ: Alt+T не переключил перевод")
         ok = False
     if not ok:
-        print((r.stdout or "")[-2000:], (r.stderr or "")[-2000:])
+        say(version, (r.stdout or "")[-2000:] + (r.stderr or "")[-2000:])
         log = friend / "log.txt"
         if log.is_file():
-            print("--- log.txt\n" + log.read_text(encoding="utf-8", errors="replace")[-4000:])
-    print(f"[{version}] ИТОГ: {'OK' if ok else 'FAIL'}", flush=True)
+            say(version, "--- log.txt\n" + log.read_text(encoding="utf-8", errors="replace")[-4000:])
+    say(version, f"[{version}] ИТОГ: {'OK' if ok else 'FAIL'}")
     return ok
 
 
@@ -238,8 +256,9 @@ def main() -> int:
             results[v] = check(v, work)
         except Exception:  # noqa: BLE001
             import traceback
-            traceback.print_exc()
+            say(v, traceback.format_exc())
             results[v] = False
+        annotate(v, results[v])
     print("ИТОГ:", ", ".join(f"Ren'Py {k}={'OK' if v else 'FAIL'}" for k, v in results.items()))
     return 0 if all(results.values()) else 1
 

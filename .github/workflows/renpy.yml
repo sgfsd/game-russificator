@@ -1,0 +1,33 @@
+# Русификация Ren'Py настоящим движком (8.3 и 7.4) при каждом изменении программы в main —
+# чтобы поломку было видно до выпуска. Итог каждой версии — в аннотациях задания (их видно и без
+# входа в GitHub). То же задание идёт и в build.yml при выпуске.
+name: renpy
+
+on:
+  push:
+    branches: [main]
+    paths: ["russificator/**", "tools/ci_renpy_check.py", ".github/workflows/renpy.yml"]
+  workflow_dispatch:
+
+jobs:
+  renpy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth libgl1 libgl1-mesa-dri libegl1 libglu1-mesa
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Ren'Py 8 и 7
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: python tools/ci_renpy_check.py 8.3.7 7.4.11
