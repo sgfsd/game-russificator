@@ -26,6 +26,7 @@ from typing import Callable, Iterator, Optional
 from ...translation.filters import looks_like_sentence, looks_technical, looks_translatable
 
 AddFn = Callable[[str], None]
+WantFn = Callable[..., bool]
 
 MAX_SIZE = 8 * 1024 * 1024
 #: ключи JSON/атрибуты, в которых короткая строка — скорее всего подпись интерфейса
@@ -34,6 +35,19 @@ _LABEL_KEY_RE = re.compile(r"text|title|label|caption|header|desc|message|msg|hi
                            r"subtitle|tooltip|prompt|body|summary|localiz|english|^en(_|-|$)", re.I)
 _EN_COLUMN_RE = re.compile(r"^(en|eng|english|en[-_](us|gb)|text|value|source|original|default|string)$", re.I)
 _SPEAKER_RE = re.compile(r"^\s*([A-Z][\w .'-]{0,30}):\s+(.+)$")
+#: идентификатор строки в таблице локализации: LBL_CRYO_POD, menu.start, ui/settings/title
+_ID_RE = re.compile(r"^[A-Za-z][\w.\-/:]*$")
+
+
+def _loc_table(pairs) -> bool:
+    """JSON — таблица локализации «идентификатор -> текст»: тогда все её значения — текст для игрока,
+    и короткие подписи («Cryo pod», «Difficulty») берутся при любом имени ключа."""
+    if len(pairs) < 8:
+        return False
+    ids = sum(1 for k, _ in pairs if _ID_RE.match(k) and not k.isdigit())
+    # обычный текст: есть слово со строчной буквы или фраза с точкой — не список «Имя Фамилия» (титры)
+    texty = sum(1 for _, v in pairs if re.search(r"\s[a-z]", v) or v.rstrip()[-1:] in ".!?:…")
+    return ids >= 0.8 * len(pairs) and texty >= 0.4 * len(pairs)
 
 
 def _wanted(value: str, key: str = "") -> bool:
@@ -62,8 +76,15 @@ def decode(raw: bytes) -> Optional[str]:
         return None
 
 
-def extract(text: str, add: AddFn) -> None:
-    """Передать в ``add`` строки для перевода из текста ассета."""
+def extract(text: str, add: AddFn, seen: Optional[AddFn] = None, tables: bool = True) -> None:
+    """Передать в ``add`` строки для перевода из текста ассета. ``seen`` получает все строки-кандидаты
+    до отбора (для проверки полноты перевода: что было в файле, но отброшено). ``tables=False`` — не
+    считать файл таблицей локализации (титры, списки спонсоров: там имена людей)."""
+    def want(value: str, key: str = "") -> bool:
+        if seen is not None:
+            seen(value)
+        return _wanted(value, key)
+
     head = text.lstrip()[:200].lower()
     if head.startswith(("<!doctype html", "<html")) or "<body" in head:
         return                                        # страница браузера: XUnity её не видит
@@ -74,26 +95,30 @@ def extract(text: str, add: AddFn) -> None:
             data = None
         if data is not None:
             ink = isinstance(data, dict) and "inkVersion" in data
-            for key, value in _json_strings(data, ""):
+            pairs = list(_json_strings(data, ""))
+            table = tables and not ink and _loc_table(pairs)
+            for key, value in pairs:
+                if table:
+                    key = "text"                       # таблица локализации: всё — текст интерфейса
                 if ink:
-                    if value.startswith("^") and _wanted(value[1:], "text"):
+                    if value.startswith("^") and want(value[1:], "text"):
                         add(value[1:])
-                elif _wanted(value, key):
+                elif want(value, key):
                     add(value)
             return
     if head.startswith("<"):
-        _xml(text, add)
+        _xml(text, add, want)
         return
-    if _csv(text, add):
+    if _csv(text, add, want):
         return
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith(("//", "#", "<<", "->", "===", "---")):
             continue
         m = _SPEAKER_RE.match(line)
-        if m and _wanted(m.group(2), "text"):
+        if m and want(m.group(2), "text"):
             add(m.group(2).strip())                    # Yarn/скрипты: «Имя: реплика»
-        elif _wanted(line):
+        elif want(line):
             add(line)
 
 
@@ -114,7 +139,7 @@ def _json_strings(node, key: str, depth: int = 0) -> Iterator:
                 yield from _json_strings(v, key, depth + 1)
 
 
-def _csv(text: str, add: AddFn) -> bool:
+def _csv(text: str, add: AddFn, want: WantFn = _wanted) -> bool:
     lines = text.splitlines()
     if len(lines) < 2:
         return False
@@ -136,7 +161,7 @@ def _csv(text: str, add: AddFn) -> bool:
         for i, cell in enumerate(row):
             if cols and i not in cols:
                 continue
-            if _wanted(cell, header[i] if cols and i < len(header) else ""):
+            if want(cell, header[i] if cols and i < len(header) else ""):
                 add(cell)
     return True
 
@@ -145,13 +170,13 @@ _XML_TEXT_RE = re.compile(r">([^<>]+)<")
 _XML_ATTR_RE = re.compile(r"""\s([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 
 
-def _xml(text: str, add: AddFn) -> None:
+def _xml(text: str, add: AddFn, want: WantFn = _wanted) -> None:
     import html
     for m in _XML_TEXT_RE.finditer(text):
         value = html.unescape(m.group(1)).strip()
-        if _wanted(value, "text"):
+        if want(value, "text"):
             add(value)
     for m in _XML_ATTR_RE.finditer(text):
         value = html.unescape(m.group(2) if m.group(2) is not None else m.group(3) or "")
-        if _wanted(value, m.group(1)):
+        if want(value, m.group(1)):
             add(value)

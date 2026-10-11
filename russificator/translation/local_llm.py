@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import os
 import platform
@@ -52,23 +53,34 @@ class ModelPreset:
     min_ram_gb: int      # ОЗУ для работы на процессоре
     good_vram_gb: int    # видеопамять, при которой модель целиком на видеокарте
     description: str
+    size: int = 0        # точный размер файла, байт
+    sha256: str = ""     # контрольная сумма файла (та же на всех зеркалах)
 
     @property
     def url(self) -> str:
         return f"https://huggingface.co/{self.repo}/resolve/main/{self.file}?download=true"
 
+    @property
+    def urls(self) -> List[str]:
+        """Один и тот же файл в двух местах: Hugging Face и его зеркало ModelScope (Alibaba) —
+        у кого-то не открывается или душится один сервер, загрузка идёт с другого."""
+        return [self.url, f"https://www.modelscope.cn/models/{self.repo}/resolve/master/{self.file}"]
+
 
 PRESETS: List[ModelPreset] = [
     ModelPreset("gemma4-e2b", "Gemma 4 E2B — лёгкая", "unsloth/gemma-4-E2B-it-qat-GGUF",
                 "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf", 2.62, 6, 4,
-                "Быстрая, для ноутбуков и ПК с 8 ГБ ОЗУ. Качество — хорошее."),
+                "Быстрая, для ноутбуков и ПК с 8 ГБ ОЗУ. Качество — хорошее.",
+                2620370976, "e531007218dfab990486a5de7676a6932d6ea8dea233d1f698d7c21cf8a16889"),
     ModelPreset("gemma4-e4b", "Gemma 4 E4B — оптимальная", "unsloth/gemma-4-E4B-it-qat-GGUF",
                 "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", 4.22, 10, 6,
-                "Баланс скорости и качества. Для ПК с 16 ГБ ОЗУ или видеокартой 6+ ГБ."),
+                "Баланс скорости и качества. Для ПК с 16 ГБ ОЗУ или видеокартой 6+ ГБ.",
+                4215695776, "df0fd4ee07072c607c29a0a1cb4f98918426cca12f45a2776bdd6ee6d09a4de3"),
     ModelPreset("gemma4-12b", "Gemma 4 12B — лучшая", "google/gemma-4-12B-it-qat-q4_0-gguf",
                 "gemma-4-12b-it-qat-q4_0.gguf", 6.98, 16, 10,
                 "Качество близко к облачным нейросетям. Нужна видеокарта 10+ ГБ "
-                "(или 16+ ГБ ОЗУ и терпение)."),
+                "(или 16+ ГБ ОЗУ и терпение).",
+                6975879296, "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b"),
 ]
 PRESET_BY_ID = {p.id: p for p in PRESETS}
 
@@ -170,7 +182,7 @@ def _release_urls() -> List[str]:
     return list(dict.fromkeys(urls))
 
 
-def install_runtime(status: StatusFn = _noop, cancel: Optional[threading.Event] = None) -> Path:
+def install_runtime(status: StatusFn = _noop, cancel: Optional[threading.Event] = None, notes=None) -> Path:
     if server_exe() is not None:
         return server_exe()
     target = runtime_dir()
@@ -183,7 +195,7 @@ def install_runtime(status: StatusFn = _noop, cancel: Optional[threading.Event] 
                    done / total if total else None)
 
         try:
-            net.download(url, archive, progress=progress, cancel=cancel)
+            net.download(url, archive, progress=progress, cancel=cancel, notes=notes)
         except net.Cancelled:
             raise
         except net.NetError as exc:
@@ -226,33 +238,85 @@ def model_installed(preset: ModelPreset) -> bool:
 
 
 def install_model(preset: ModelPreset, status: StatusFn = _noop,
-                  cancel: Optional[threading.Event] = None) -> Path:
+                  cancel: Optional[threading.Event] = None, notes=None) -> Path:
+    """Скачать модель (с Hugging Face и зеркала ModelScope сразу, с докачкой и проверкой SHA-256).
+    ``notes`` получает сообщения о сбоях сети (что случилось и что программа делает дальше)."""
     dest = model_path(preset)
     if model_installed(preset):
         return dest
-    free = shutil.disk_usage(dest.parent if dest.parent.exists() else paths.models_dir()).free / 1e9
-    part = dest.with_name(dest.name + ".part")
-    have = part.stat().st_size / 1e9 if part.exists() else 0
-    if free + have < preset.size_gb + 0.3:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(dest.parent).free / 1e9
+    started = dest.with_name(dest.name + ".part").exists()   # начатая загрузка место уже заняла
+    if not started and free < preset.size_gb + 0.3:
         raise TranslatorError(f"Недостаточно места на диске для модели: нужно {preset.size_gb:.1f} ГБ, "
                               f"свободно {free:.1f} ГБ. Смените папку данных в настройках.")
-    started = time.monotonic()
+    window: List[tuple] = []
 
     def progress(done: int, total: int) -> None:
         total = total or int(preset.size_gb * 1e9)
-        speed = done / max(1e-3, time.monotonic() - started)
+        now = time.monotonic()
+        window.append((now, done))
+        while len(window) > 2 and now - window[0][0] > 15:
+            window.pop(0)
+        t0, d0 = window[0]
+        speed = (done - d0) / (now - t0) if now - t0 > 1 else 0.0
         eta = (total - done) / speed if speed > 0 else 0
         status(f"Скачивание {preset.title}: {done / 1e9:.2f} из {total / 1e9:.2f} ГБ"
-               + (f", осталось ~{_fmt_eta(eta)}" if done > 50e6 else ""), done / total)
+               + (f" · {speed / 1048576:.1f} МБ/с" if speed > 0 else "")
+               + (f" · осталось ~{_fmt_eta(eta)}" if speed > 0 and done < total else ""), done / total)
 
-    status(f"Скачивание {preset.title}…", 0.0)
-    net.download(preset.url, dest, progress=progress, cancel=cancel,
-                 expected_size=int(preset.size_gb * 1e9))
+    status(f"Скачивание {preset.title}…", None)
+    log.info("модель %s: %s", preset.id, ", ".join(preset.urls))
+    net.download(preset.urls, dest, progress=progress, cancel=cancel, sha256=preset.sha256,
+                 expected_size=preset.size or int(preset.size_gb * 1e9), notes=notes)
+    return dest
+
+
+def import_model(preset: ModelPreset, src: Path, status: StatusFn = _noop,
+                 cancel: Optional[threading.Event] = None) -> Path:
+    """Поставить модель из файла, скачанного вручную (браузером, торрентом, с флешки): файл
+    проверяется (GGUF, размер, SHA-256) и копируется в папку моделей."""
+    src = Path(src)
+    try:
+        size = src.stat().st_size
+        with src.open("rb") as fh:
+            magic = fh.read(4)
+    except OSError as exc:
+        raise TranslatorError(f"Файл не открывается: {exc}") from None
+    if magic != b"GGUF":
+        raise TranslatorError("Это не файл модели GGUF — выберите скачанный .gguf.")
+    if preset.size and size != preset.size:
+        raise TranslatorError(f"Это другой файл или он скачан не до конца: {size / 1e9:.2f} ГБ вместо "
+                              f"{preset.size / 1e9:.2f} ГБ. Нужен {preset.file}.")
+    dest = model_path(preset)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".import")
+    h = hashlib.sha256()
+    done = 0
+    try:
+        with src.open("rb") as fi, tmp.open("wb") as fo:
+            for block in iter(lambda: fi.read(8 << 20), b""):
+                if cancel is not None and cancel.is_set():
+                    raise net.Cancelled()
+                h.update(block)
+                fo.write(block)
+                done += len(block)
+                status(f"Проверяю и копирую модель: {done / 1e9:.2f} из {size / 1e9:.2f} ГБ", done / max(1, size))
+        if preset.sha256 and h.hexdigest() != preset.sha256:
+            raise TranslatorError("Файл повреждён или это другая версия модели (не совпала контрольная сумма). "
+                                  "Скачайте его заново.")
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+    for p in (dest.with_name(dest.name + ".part"), dest.with_name(dest.name + ".part.json")):
+        p.unlink(missing_ok=True)
+    log.info("модель %s поставлена из файла %s", preset.id, src)
     return dest
 
 
 def remove_model(preset: ModelPreset) -> None:
-    for p in (model_path(preset), model_path(preset).with_name(preset.file + ".part")):
+    for p in (model_path(preset), model_path(preset).with_name(preset.file + ".part"),
+              model_path(preset).with_name(preset.file + ".part.json")):
         p.unlink(missing_ok=True)
 
 

@@ -626,3 +626,47 @@ def test_renpy_credit_block_is_valid_and_works_on_old_renpy():
     assert Cfg.start_interact_callbacks and not calls
     Cfg.start_interact_callbacks[0]()
     assert calls == ["russificator_credit"]
+
+
+def test_mv_font_gets_own_cyrillic(mv_game):
+    """В шрифт игры дописываются русские буквы по его меркам — копия подключается для кириллицы."""
+    from russificator.engines.rpgmaker.plugin import RPGMakerPlugin
+    from russificator.fonts import sfnt
+    from tests.test_fonts import _transformed
+    (mv_game / "www/fonts/mplus-1m-regular.ttf").write_bytes(_transformed(0.85, 0.9))
+    plugin = RPGMakerPlugin()
+    plugin.detect(mv_game)
+    proj = _project(mv_game, "rpgmaker")
+    plugin.extract(mv_game, proj)
+    _translate_all(proj)
+    plugin.inject(mv_game, proj)
+    plugin.install_font(mv_game, proj, None)
+    css = (mv_game / "www/fonts/gamefont.css").read_text(encoding="utf-8")
+    assert "mplus-1m-regular-ru.ttf" in css and "PT_Sans" not in css
+    font = sfnt.Font((mv_game / "www/fonts/mplus-1m-regular-ru.ttf").read_bytes())
+    assert font.has("Ж") and font.has("ё")
+    restore_backups(mv_game)
+    assert not (mv_game / "www/fonts/mplus-1m-regular-ru.ttf").exists()
+
+
+def test_renpy_font_gets_own_cyrillic(tmp_path):
+    from russificator.engines.renpy.plugin import HOOK_FILE, RenPyPlugin
+    from tests.test_fonts import _transformed
+    root = tmp_path / "MyGame"
+    (root / "game").mkdir(parents=True)
+    (root / "renpy").mkdir()
+    write_rpa(root / "game" / "archive.rpa", {
+        "script.rpyc": (DATA / "renpy813_script.rpyc").read_bytes(),
+        "fonts/LatinOnly.ttf": _transformed(0.9, 1.0),
+    })
+    plugin = RenPyPlugin()
+    plugin.detect(root)
+    proj = _project(root, "renpy")
+    plugin.extract(root, proj)
+    _translate_all(proj)
+    plugin.inject(root, proj)
+    hook = (root / "game" / HOOK_FILE).read_text(encoding="utf-8")
+    assert "'russificator/LatinOnly-ru.ttf'" in hook
+    assert (root / "game" / "russificator" / "LatinOnly-ru.ttf").is_file()
+    assert not (root / "game" / "russificator" / "PT_Sans-Web-Regular.ttf").exists()
+    restore_backups(root)

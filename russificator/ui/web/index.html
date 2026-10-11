@@ -121,7 +121,7 @@
               </div>
               <button class="btn" id="mtDownload"><span class="i" data-icon="download"></span>Скачать сейчас</button>
             </div>
-            <div class="dl hidden" id="mtProgress"><div class="bar"><div class="bar-fill"></div></div><div class="dl-text muted"></div></div>
+            <div class="dl hidden" id="mtProgress"><div class="bar"><div class="bar-fill"></div></div><div class="dl-text muted"></div><div class="dl-notes"></div></div>
             <p class="hint">Нейросетевой машинный переводчик OPUS-MT (en→ru, большая модель Хельсинкского университета) работает
               на процессоре без видеокарты и без интернета — доли секунды на фразу.
               Кнопки и меню переводятся по встроенному игровому словарю. Для художественных диалогов лучше нейросеть.</p>
@@ -135,9 +135,11 @@
               <label class="switch"><input type="checkbox" id="useGpu" checked><span></span>Использовать видеокарту</label>
               <span class="muted small">Ускоряет перевод в разы (NVIDIA, AMD, Intel — через Vulkan).</span>
             </div>
-            <div class="dl hidden" id="localProgress"><div class="bar"><div class="bar-fill"></div></div><div class="dl-text muted"></div></div>
+            <div class="dl hidden" id="localProgress"><div class="bar"><div class="bar-fill"></div></div><div class="dl-text muted"></div><div class="dl-notes"></div></div>
+            <div class="dl-fail hidden" id="localFail"></div>
             <p class="hint">Модели Gemma 4 от Google (Apache 2.0) скачиваются один раз и работают полностью офлайн.
-              Первый запуск на CPU может быть неспешным — это нормально.</p>
+              Первый запуск на CPU может быть неспешным — это нормально.
+              Уже скачали файл модели (.gguf) сами? <a href="#" id="localImport">Указать файл</a>.</p>
           </div>
 
           <!-- панель: облако -->
@@ -254,6 +256,7 @@
           <button class="filter" data-filter="supported">Можно русифицировать<span class="cnt" data-cnt="supported"></span></button>
           <button class="filter" data-filter="russified">Русифицированы<span class="cnt" data-cnt="russified"></span></button>
           <button class="filter" data-filter="overlay">Только оверлей<span class="cnt" data-cnt="overlay"></span></button>
+          <button class="filter hidden" data-filter="hidden" id="filterHidden"><span class="i" data-icon="eye-off"></span>Скрытые<span class="cnt" data-cnt="hidden"></span></button>
         </div>
       </div>
       <div class="toolbar-2">
@@ -484,7 +487,7 @@
       </div>
       <div class="card about">
         <b>Русификатор игр <span id="aboutVer"></span></b>
-        <p class="muted small">Открытый некоммерческий проект, лицензия MIT. Всё работает на вашем компьютере, без серверов и аккаунтов.
+        <p class="muted small">Открытый код, бесплатно для некоммерческого использования (PolyForm Noncommercial); коммерческое — по лицензии от автора. Всё работает на вашем компьютере, без серверов и аккаунтов.
           Машинный перевод — модель OPUS-MT (Helsinki-NLP, CC-BY 4.0), нейросеть — Gemma 4 (Apache 2.0) на llama.cpp (MIT),
           шрифт — PT Sans (SIL OFL 1.1).</p>
       </div>
@@ -599,6 +602,29 @@
     <div class="row gap end export-foot">
       <button class="btn ghost" data-close id="exportClose">Закрыть</button>
       <button class="btn primary" id="exportGo"><span class="i" data-icon="package"></span>Создать архив</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ полнота перевода ============ -->
+<div class="modal hidden" id="covModal">
+  <div class="modal-card export cov">
+    <button class="modal-x" data-close><span class="i" data-icon="x"></span></button>
+    <div class="export-hero">
+      <div class="export-badge"><span class="i" data-icon="search"></span></div>
+      <h2>Полнота перевода</h2>
+      <p>Что игра <b id="covGame"></b> показала на экране, а при русификации найдено не было. Такие строки
+        переводятся на лету, входят в архив-русификатор и при следующей русификации — в основной словарь.
+        Проверка находит, где каждая лежит в файлах игры.</p>
+    </div>
+    <div class="export-body">
+      <div class="dl hidden" id="covProgress"><div class="bar indeterminate"><div class="bar-fill"></div></div><div class="dl-text muted"></div></div>
+      <div id="covBody" class="cov-body"></div>
+    </div>
+    <div class="row gap end export-foot">
+      <button class="btn ghost hidden" id="covOpen"><span class="i" data-icon="copy"></span>Открыть отчёт</button>
+      <button class="btn ghost" data-close>Закрыть</button>
+      <button class="btn primary" id="covGo"><span class="i" data-icon="search"></span>Проверить</button>
     </div>
   </div>
 </div>

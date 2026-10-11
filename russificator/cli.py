@@ -61,6 +61,9 @@ def main(argv=None) -> int:
     p = sub.add_parser("restore", help="откатить русификацию")
     p.add_argument("game_dir")
 
+    p = sub.add_parser("coverage", help="полнота перевода Unity-игры: что игра показала, а найдено заранее не было")
+    p.add_argument("game_dir")
+
     p = sub.add_parser("play", help="запустить игру с живым переводом (Unity; способ перевода — из настроек)")
     p.add_argument("game_dir")
 
@@ -104,8 +107,24 @@ def main(argv=None) -> int:
     if args.cmd == "run":
         return _run(args)
 
+    if args.cmd == "coverage":
+        from russificator.core.pipeline import project_dir
+        from russificator.engines.unity import coverage
+        game = Path(args.game_dir)
+        rep = coverage.diagnose(game, project_dir(game), lambda m, f=None: print(m, end=chr(13), flush=True))
+        print(coverage.format_report(rep))
+        if rep.get("file"):
+            print("Отчёт сохранён:", rep["file"])
+        return 0
+
     if args.cmd == "restore":
+        from russificator.core.pipeline import project_dir
         from russificator.core.restore import restore_backups
+        from russificator.engines.unity import coverage
+        try:   # найденное во время игры — в проект: откат удалит его вместе с файлами русификатора
+            coverage.harvest(Path(args.game_dir), project_dir(Path(args.game_dir)))
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("russificator").warning("найденное во время игры не сохранено: %s", exc)
         count, notes = restore_backups(Path(args.game_dir))
         print("\n".join(notes))
         return 0 if count else 1

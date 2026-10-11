@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, urlparse
 from ..core.universal import Entry, TextKind
 from . import markup
 from .base import Translator
-from .filters import looks_technical, looks_translatable
+from .filters import is_brand, looks_technical, looks_translatable
 from .memory import TranslationMemory
 from .service import translate_by_segments
 
@@ -120,7 +120,7 @@ class LiveServer:
 
     def translate(self, text: str) -> Optional[str]:
         # ники, коды, журналы и пути игра показывает как есть — возвращаем без перевода
-        if not looks_translatable(text) or looks_technical(text):
+        if not looks_translatable(text) or looks_technical(text) or is_brand(text):
             return text
         if not self.wait_ready(self.READY_TIMEOUT):   # cache_id уточняется при подготовке переводчика
             return None

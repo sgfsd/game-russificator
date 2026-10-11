@@ -86,3 +86,77 @@ def test_closing_window_never_waits_for_the_window(api):
     api.finish_shutdown(timeout=5)
     time.sleep(0.2)
     assert not any("после закрытия" in c or "Живой перевод выключен" in c for c in calls)
+
+
+def _unity(root: Path) -> Path:
+    (root / "Game_Data" / "Managed").mkdir(parents=True)
+    (root / "Game_Data" / "globalgamemanagers").write_bytes(b"x")
+    (root / "Game.exe").write_bytes(b"MZ")
+    (root / "UnityPlayer.dll").write_bytes(b"MZ")
+    return root
+
+
+def test_library_status_is_read_from_disk_not_cache(api, tmp_path):
+    """«На русском» из кэша не держится: игру переустановили/откатили в обход программы — список
+    показывает правду; папки, которой больше нет, в списке нет."""
+    import shutil
+    from russificator.core.backup import GameBackup
+    game = _unity(tmp_path / "Steam" / "Crawl")
+    gone = _unity(tmp_path / "Steam" / "Gone")
+    api.library_add(str(game))
+    api.library_add(str(gone))
+    b = GameBackup(game)
+    b.write_text(game / "Game_Data" / "ru.txt", "русский")
+    b.snapshot({"translator": "machine"})
+    api._library.refresh_status(str(game))
+    assert next(g for g in api.library()["games"] if g["title"] == "Crawl")["russified"] is True
+    shutil.rmtree(game)                                   # «переустановили» игру — бэкапа больше нет
+    _unity(game)
+    shutil.rmtree(gone)
+    games = api.library()["games"]
+    assert [g["title"] for g in games] == ["Crawl"] and games[0]["russified"] is False
+    assert api._library.games[0]["russified"] is False      # и в кэше тоже
+
+
+def test_library_hidden_games_can_be_returned(api, tmp_path):
+    """Скрытая игра не пропадает: она во вкладке «Скрытые» и возвращается одной кнопкой — даже
+    добавленная вручную (раньше её папку приходилось искать заново)."""
+    game = _unity(tmp_path / "Games" / "Manual")
+    api.library_add(str(game))
+    api.library_hide(str(game).upper())                   # путь в другом регистре — та же папка
+    g = api.library()["games"][0]
+    assert g["hidden"] is True and api._cfg["library_manual"]
+    api.library_unhide(str(game))
+    assert api.library()["games"][0]["hidden"] is False and not api._cfg["library_hidden"]
+    api.library_hide(str(game))
+    api.library_forget(str(game))
+    assert api.library()["games"] == [] and not api._cfg["library_manual"]
+
+
+def test_library_custom_cover(api, tmp_path, monkeypatch):
+    """Своя обложка: картинка кадрируется под карточку, хранится копией и приходит data-URL."""
+    import base64
+    import io
+    import sys
+    import types
+    from PIL import Image
+    game = _unity(tmp_path / "Games" / "G")
+    api.library_add(str(game))
+    pic = tmp_path / "cover.png"
+    Image.new("RGB", (1000, 1000), (200, 30, 30)).save(pic)
+    fake = types.SimpleNamespace(FileDialog=types.SimpleNamespace(OPEN=10))
+    monkeypatch.setitem(sys.modules, "webview", fake)
+    api._window = types.SimpleNamespace(create_file_dialog=lambda *a, **k: [str(pic)])
+    r = api.library_cover(str(game))
+    assert r["ok"] and r["cover"].startswith("data:image/jpeg;base64,")
+    im = Image.open(io.BytesIO(base64.b64decode(r["cover"].split(",", 1)[1])))
+    assert abs(im.width / im.height - 460 / 215) < 0.01 and im.width <= 920
+    g = api.library()["games"][0]
+    assert g["cover_custom"] and g["cover"] == r["cover"]
+    assert api.library_cover(str(game), reset=True)["ok"]
+    g = api.library()["games"][0]
+    assert not g.get("cover_custom") and not g["cover"]
+    (tmp_path / "bad.png").write_bytes(b"not an image")
+    api._window = types.SimpleNamespace(create_file_dialog=lambda *a, **k: [str(tmp_path / "bad.png")])
+    r = api.library_cover(str(game))
+    assert not r["ok"] and "картинку" in r["error"]

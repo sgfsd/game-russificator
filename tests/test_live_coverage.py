@@ -371,6 +371,30 @@ def test_live_fullscreen_window_gives_fill_or_stale_frame(tmp_path, monkeypatch)
     assert out is game and svc2._capture_mode == "screen"
 
 
+def test_live_window_capture_with_black_hole_switches_to_screen(tmp_path, monkeypatch):
+    """Эмулятор: картинку игры рисует OpenGL/Vulkan в дочернем окне — с окна снимаются меню и строка
+    состояния, а на месте игры чёрное. Сцена тёмная (диалог на чёрном), по яркости кадры почти
+    совпадают, но на экране есть буквы, которых нет в кадре окна, — снимаем экран."""
+    pytest.importorskip("numpy")
+    from russificator.overlay import service, win32
+    screen = _canvas(640, 360, [(40, 250, 560, 24), (40, 290, 400, 24)], bg=(0, 0, 0), ink=(230, 230, 230))
+    screen[:20, :, :3] = 235                                              # меню эмулятора
+    screen[4:16, 10:200:6, :3] = 20
+    window = screen.copy()
+    window[20:340, :, :3] = 0                                             # вместо игры — чёрная «дыра»
+    svc = _svc(tmp_path, monkeypatch, [screen], [])
+    monkeypatch.setattr(win32, "grab_window", lambda *a: window)
+    monkeypatch.setattr(win32, "grab_screen", lambda *a: screen)
+    monkeypatch.setattr(service, "CROSSCHECK", 0.0)
+    out = svc._capture(_game(), 0, 0, 640, 360)
+    assert out is screen and svc._capture_mode == "screen"
+    # кадр окна честный (те же буквы) — остаёмся на окне, даже если сцена тёмная
+    svc2 = _svc(tmp_path, monkeypatch, [screen], [])
+    monkeypatch.setattr(win32, "grab_window", lambda *a: screen.copy())
+    for _ in range(3):
+        assert svc2._capture(_game(), 0, 0, 640, 360) is not screen and svc2.captured_by == "window"
+
+
 def test_live_deep_scan_finds_texture_text(tmp_path, monkeypatch):
     """Глубокий проход: надпись, которую видят только варианты кадра (контраст, каналы), добавляется,
     когда экран замер."""
@@ -513,3 +537,72 @@ def test_live_speaker_name_above_reply_is_kept(tmp_path, monkeypatch):
     blocks = svc._analyze(lines, img, _game(w=1280, h=720), 0.0)
     assert sorted(b.text for b in blocks if not b.skip) == ["Start Game", "Unlockables", "You seem rather lost."]
     assert [b.text for b in blocks if b.skip] == ["Mothman"]
+
+
+def test_numbers_change_without_new_translation():
+    """Счётчики, таймеры, «60 FPS»: фраза с другими числами собирается из готового перевода; похожий
+    ключ с другими числами не выдаёт чужой перевод (иначе на экране было бы «ОЗ 100/120» при 99)."""
+    t = text.NumberTemplates()
+    t.learn("60 FPS | Speed: 100% | Slot 1", "60 кадров/с | Скорость: 100% | Слот 1")
+    assert t.fill("59 FPS | Speed: 98% | Slot 1") == "59 кадров/с | Скорость: 98% | Слот 1"
+    t.learn("Time 01:23", "Время 01:23")
+    assert t.fill("Time 01:24") == "Время 01:24"
+    t.learn("Level 1 of 1", "Уровень 1 из 1")                          # одинаковые числа — не понять, где какое
+    assert t.fill("Level 2 of 3") is None
+    t.learn("You have 3 apples", "У вас три яблока")                   # число словом — шаблона нет
+    assert t.fill("You have 4 apples") is None
+    t.learn("Code 777", "\x00", "\x00")
+    assert t.fill("Code 778", "\x00") == "\x00"
+    c = text.TranslationCache()
+    c.put("hp 100120 mana 50", "ОЗ 100/120 мана 50")
+    assert c.get("hp 99120 mana 50") is None
+    c.put("press any key to continue now", "нажмите любую клавишу")
+    assert c.get("press any key to continue nOw".lower()) is not None
+
+
+def test_word_fix_keeps_real_words():
+    """Исправление ошибок распознавания не портит настоящие слова, которых нет среди частых
+    («Hello» → «Hell», «Emulation» → «mutation», «Elm» → «tim»), а ошибки по-прежнему исправляет."""
+    from russificator.overlay.words import Words, lexicon
+    lx = lexicon()
+    assert len(lx) > 30000 and "hello" in lx and "tim" not in lx       # без имён собственных
+    w = Words({k: i for i, k in enumerate(["the", "hell", "mutation", "time", "tim", "play", "graphic", "highly",
+                                           "children", "suitable", "continue", "options", "confine"])}, lx)
+    assert w.fix("Hello there") == "Hello there"
+    assert w.fix("File Emulation") == "File Emulation"
+    assert w.fix("Professor Elm") == "Professor Elm"
+    assert w.fix("violent and sraphic") == "violent and graphic"
+    assert w.fix("is hiShlg advised.") == "is highly advised."
+    assert w.fix("PIAY") == "PLAY" and w.fix("OPTI ONS") == "OPTIONS"
+    assert w.fix("CONTIME", strict=True) == "CONTIME"                  # неуверенное — не трогаем
+
+
+def test_scanlines_do_not_split_paragraphs():
+    """Строки развёртки CRT-шейдера (эмуляторы): тёмные ряды через один — это фон, а не черта рамки
+    между строками; цвет букв — один у всех строк реплики."""
+    import numpy as np
+    from russificator.overlay import pixels
+    img = _canvas(400, 200, [(20, 40, 300, 24), (20, 72, 300, 24)], bg=(16, 16, 72), ink=(255, 255, 255))
+    img[1::2, :, :3] = (img[1::2, :, :3] * 0.45).astype(np.uint8)
+    a, b = Line("Hello there! Welcome to the", 20, 40, 300, 24), Line("world of monsters.", 20, 72, 300, 24)
+    assert pixels.stripes(img[40:96, 20:320, :3]) == 2
+    assert not pixels.rule_between(img[..., :3], a, b)
+    ca, cb = pixels.line_colors(img, (20, 40, 300, 24)), pixels.line_colors(img, (20, 72, 300, 24))
+    assert pixels.color_distance(ca[0], cb[0]) < 30
+    plain = _canvas(400, 200, [(20, 40, 300, 24), (20, 72, 300, 24)], bg=(16, 16, 72))
+    assert pixels.stripes(plain[40:96, 20:320, :3]) == 0
+    ruled = plain.copy()
+    ruled[67, :, :3] = 240                                              # настоящая черта между строками
+    assert pixels.rule_between(ruled[..., :3], a, b)
+
+
+def test_icon_inflated_box_stays_in_paragraph():
+    """Мигающий значок «дальше» раздул рамку последней строки — по высоте букв это та же реплика."""
+    img = _canvas(500, 220, [(20, 40, 300, 20), (20, 66, 300, 20), (20, 92, 300, 20)], bg=(16, 16, 72))
+    img[112:126, 300:316, :3] = 255                                     # значок под концом строки
+    lines = [Line("People call me the monster", 20, 40, 300, 20), Line("PROF! This world is inhabited", 20, 66, 300, 20),
+             Line("by creatures called monsters.", 20, 92, 300, 36)]
+    from russificator.overlay import pixels
+    groups = text.group_lines(lines, same_size=lambda a, b: pixels.same_size(img, a, b))
+    assert len(groups) == 1
+    assert len(text.group_lines(lines)) == 2                             # по одним рамкам — разорвалось бы

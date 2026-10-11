@@ -172,6 +172,12 @@ class Pipeline:
         self.stage("prepare")
         if GameBackup(game_dir).exists:
             from .restore import restore_backups
+            try:   # найденное во время игры — в проект: откат удалит его вместе с файлами русификатора
+                n = plugin.harvest_live(game_dir, work_dir)
+                if n:
+                    self.info(f"Строк, найденных во время игры: {n} — войдут в словарь")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("найденное во время игры не сохранено: %s", exc)
             self.info("Игра уже русифицирована — возвращаю оригинальные файлы перед новым проходом")
             restore_backups(game_dir)
         project = TranslationProject(game_dir, plugin.engine_id, work_dir)

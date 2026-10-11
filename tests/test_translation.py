@@ -473,3 +473,9 @@ def test_machine_keeps_symbols_markers_and_drops_model_additions(tmp_path):
     assert got[2] == "62CO"
     assert got[3] == "Привет, {0}!"
     assert all("⁇" not in g for g in got)
+
+
+def test_brand_names_are_not_translated():
+    from russificator.translation.filters import is_brand
+    assert is_brand("Discord") and is_brand("Made with Unity") and is_brand("Patreon")
+    assert not is_brand("Discord server rules") and not is_brand("Continue")

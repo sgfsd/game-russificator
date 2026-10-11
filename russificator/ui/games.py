@@ -105,9 +105,42 @@ class Library:
             log.warning("кэш списка игр не записан: %s", exc)
 
     def snapshot(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Список для окна. Состояние русификации каждой игры перечитывается с диска (это быстро:
+        манифест бэкапа и stat файлов) — кэш хранит только сам список игр. Иначе игра, которую с тех
+        пор переустановили, обновили или откатили в обход программы, так и висит «На русском».
+        Папки, которых больше нет, не показываются; скрытые игры идут с пометкой ``hidden``."""
         hidden = {library._norm(Path(p)) for p in cfg.get("library_hidden") or []}
-        games = [g for g in self.games if library._norm(Path(g["path"])) not in hidden]
-        return {"games": games, "scanned_at": self.scanned_at, "scanning": self.scanning}
+        covers = {library._norm(Path(p)): f for p, f in (cfg.get("library_covers") or {}).items()}
+        with self._lock:
+            games = [dict(g) for g in self.games]
+        out, fresh = [], {}
+        for g in games:
+            p = Path(g["path"])
+            if not p.is_dir():
+                continue
+            key = library._norm(p)
+            try:
+                st = status(p)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("состояние %s: %s", p, exc)
+                st = {}
+            if any(g.get(k) != v for k, v in st.items()):
+                fresh[key] = st
+            g.update(st)
+            g["hidden"] = key in hidden
+            if key in covers:
+                data = cover_data(covers[key])
+                if data:
+                    g["cover"], g["cover_custom"] = data, True
+            out.append(g)
+        if fresh:
+            with self._lock:
+                for g in self.games:
+                    st = fresh.get(library._norm(Path(g["path"])))
+                    if st:
+                        g.update(st)
+                self._save_cache()
+        return {"games": out, "scanned_at": self.scanned_at, "scanning": self.scanning}
 
     def refresh_status(self, path: str) -> Optional[Dict[str, Any]]:
         """Перечитать состояние игры с диска — после всего, что меняет её файлы (русификация,
@@ -176,6 +209,14 @@ class Library:
             self._save_cache()
         return d
 
+    def forget(self, path: str) -> None:
+        """Убрать запись из списка (вручную добавленную папку, которую забыли)."""
+        key = library._norm(Path(path))
+        with self._lock:
+            self.games = [g for g in self.games if library._norm(Path(g["path"])) != key
+                          or (g.get("sources") or [g.get("source")]) != ["manual"]]
+            self._save_cache()
+
 
 def _entry(p: Path, source: str) -> Dict[str, Any]:
     """Запись списка для папки, добавленной не поиском (вручную или русифицированной)."""
@@ -184,6 +225,47 @@ def _entry(p: Path, source: str) -> Dict[str, Any]:
     e.exe = str(exe) if exe else ""
     e.sources = [source]
     return e.to_dict()
+
+
+#: своя обложка: кадрируется под карточку (460×215) и хранится уменьшенной копией
+COVER_SIZE = (920, 430)
+
+
+def covers_dir() -> Path:
+    return paths.sub("covers")
+
+
+def save_cover(src: Path, game: Path) -> str:
+    """Своя обложка игры из картинки пользователя: кадр по центру под пропорции карточки, JPEG.
+    Возвращает имя файла в папке обложек. Бросает ValueError, если это не картинка."""
+    import hashlib
+    from PIL import Image, ImageOps
+    try:
+        with Image.open(src) as im:
+            im.seek(0)                                   # GIF/WebP с анимацией — первый кадр
+            im = ImageOps.exif_transpose(im).convert("RGB")
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"Не удалось открыть картинку: {exc}") from exc
+    w, h = COVER_SIZE
+    crop_w = min(im.width, im.height * w / h)            # сколько пикселей картинки войдёт в кадр
+    scale = min(1.0, crop_w / w)                         # маленькую не растягиваем
+    im = ImageOps.fit(im, (max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+    name = hashlib.sha1(library._norm(Path(game)).encode("utf-8")).hexdigest()[:16] + ".jpg"
+    tmp = covers_dir() / (name + ".tmp")
+    im.save(tmp, "JPEG", quality=86, optimize=True)
+    tmp.replace(covers_dir() / name)
+    return name
+
+
+def cover_data(name: str) -> str:
+    """Своя обложка как data-URL (окно не читает файлы с диска само)."""
+    import base64
+    if not re.fullmatch(r"[0-9a-f]{16}\.jpg", name or ""):
+        return ""
+    try:
+        return "data:image/jpeg;base64," + base64.b64encode((covers_dir() / name).read_bytes()).decode("ascii")
+    except OSError:
+        return ""
 
 
 def steam_cover_file(appid: str) -> Optional[Path]:

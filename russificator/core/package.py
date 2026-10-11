@@ -325,7 +325,7 @@ def installer_exe() -> Optional[Path]:
 
 def licenses(engine: str) -> List[Path]:
     base = Path(__file__).resolve().parents[1] / "resources" / "licenses"
-    names = ["GameRussificator-MIT.txt"]
+    names = ["GameRussificator-PolyForm-Noncommercial-1.0.0.txt"]
     if engine == "unity":
         names += ["BepInEx-LGPL-2.1.txt", "XUnity.AutoTranslator-MIT.txt"]
     return [base / n for n in names if (base / n).is_file()]

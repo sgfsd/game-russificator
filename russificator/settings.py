@@ -36,7 +36,8 @@ DEFAULTS: Dict[str, Any] = {
     "export_credit": True,           # надпись о программе в игре (в архивах «для друзей»)
     "library_folders": [],           # «Мои игры»: свои папки для поиска (например, D:\\Games)
     "library_manual": [],            # «Мои игры»: игры, добавленные вручную
-    "library_hidden": [],            # «Мои игры»: скрытые из списка
+    "library_hidden": [],            # «Мои игры»: скрытые из списка (вкладка «Скрытые»)
+    "library_covers": {},            # «Мои игры»: папка игры -> своя обложка (файл в covers/)
     "live_enabled": False,           # живой перевод (оверлей) включён — запускать вместе с программой
     "live_autostart": False,         # запускать живой перевод вместе с Windows
     "live_mode": "auto",             # способ перевода в оверлее: auto | machine | cloud | local

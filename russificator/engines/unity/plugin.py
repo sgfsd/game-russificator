@@ -51,6 +51,7 @@ class UnityPlugin(EnginePlugin):
         if game.exe:
             project.meta["game_title"] = game.exe.stem
         entries, warnings, col = _extract.extract_all(game, self.status)
+        entries += self._live_entries(project, {e.source for e in entries})
         project.meta["unity_font_files"] = [str(p) for p in col.font_files]
         project.meta["unity_ui"] = col.ui
         project.meta["unity_prefixes"] = col.prefixes
@@ -59,6 +60,26 @@ class UnityPlugin(EnginePlugin):
         if not entries:
             warnings.append("Заранее текст найти не удалось — вся игра будет переводиться на лету.")
         return ExtractionResult(entries, warnings=warnings)
+
+    def harvest_live(self, game_dir: Path, work_dir: Path) -> int:
+        from . import coverage
+        return coverage.harvest(Path(game_dir), Path(work_dir))
+
+    @staticmethod
+    def _live_entries(project: TranslationProject, known: set) -> List:
+        """Строки, которые игра показала во время прошлых сеансов, а поиск не нашёл: они входят в словарь
+        (и в русификатор «для друзей», где живого перевода нет)."""
+        from ...core.universal import Entry, TextKind
+        from . import coverage
+        out = []
+        for text, rec in coverage.load_found(project.work_dir).items():
+            if text in known or not coverage.worth_translating(text, str(rec.get("translation", ""))):
+                continue
+            key = _extract.text_key(text)
+            out.append(Entry(id=key, source=text, kind=TextKind.OTHER, target_key=key, scene="live", max_length=None))
+        if out:
+            project.meta["unity_live_found"] = len(out)
+        return out
 
     def inject(self, game_dir: Path, project: TranslationProject) -> None:
         game = _detect.inspect(Path(game_dir))
@@ -105,7 +126,8 @@ class UnityPlugin(EnginePlugin):
         if xunity.plugin_installed(game):
             from ...core import launcher
             xunity.write_plugin_config(game, backup, launcher.serve_command(game.root))
-        rules = xunity.prefix_rules(project.meta.get("unity_prefixes") or [], pairs) + xunity.template_rules(pairs)
+        rules = (xunity.prefix_rules(project.meta.get("unity_prefixes") or [], pairs) + xunity.template_rules(pairs)
+                 + xunity.paragraph_rules())
         project.meta["unity_template_rules"] = len(rules)
         n = xunity.write_translations(game, backup, pairs, rules)
         project.meta["unity_static_translations"] = n

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from ..core.universal import Entry, EntryStatus, TranslationProject
-from . import markup
+from . import filters, markup
 from .base import Translator, TranslatorError
 from .glossary import GlossaryBuilder, apply_glossary
 from .length import validate_length
@@ -89,8 +89,8 @@ class TranslationService:
         for e in project.entries:
             if e.status not in (EntryStatus.NEW, EntryStatus.FAILED):
                 continue
-            if not markup.has_words(e.source) or markup.is_cyrillic(e.source):
-                e.status = EntryStatus.SKIPPED
+            if not markup.has_words(e.source) or markup.is_cyrillic(e.source) or filters.is_brand(e.source):
+                e.status = EntryStatus.SKIPPED      # названия («Discord», «Made with Unity») не переводятся
                 stats.skipped += 1
                 continue
             groups.setdefault(self._key(e), []).append(e)

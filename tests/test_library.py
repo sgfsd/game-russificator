@@ -244,7 +244,7 @@ def test_find_root_from_inner_or_outer_folder(tmp_path):
 
 
 def test_find_root_does_not_climb_into_a_game_holding_other_games(tmp_path):
-    """Unity-игра распакована прямо в папку с другими играми (так было в «D:\game test»): выбор любой
+    r"""Unity-игра распакована прямо в папку с другими играми (так было в «D:\game test»): выбор любой
     игры внутри не должен подменяться этой папкой."""
     games = tmp_path / "game test"
     games.mkdir()

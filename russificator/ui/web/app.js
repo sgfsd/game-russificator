@@ -41,6 +41,7 @@ const ICONS = {
   plus: '<path d="M12 5v14M5 12h14"/>',
   live: '<circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2"/>',
   power: '<path d="M12 3v9"/><path d="M6.3 7.3a8 8 0 1 0 11.4 0"/>',
+  image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 16-5-5L5 20"/>',
   "eye-off": '<path d="M3 3l18 18"/><path d="M10.6 5.1A10 10 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-3.2 4.1M6.6 6.6A17 17 0 0 0 2 12s3.5 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
 };
 
@@ -202,6 +203,7 @@ function bindUi() {
     else if (r.error) toast(r.error, true);
   });
   $("#libImport").addEventListener("click", () => openImport(""));
+  $("#localImport").addEventListener("click", (e) => { e.preventDefault(); importLocalModel(S.preset || (S.hw && S.hw.recommended)); });
   $("#setLibAdd").addEventListener("click", async () => {
     const r = await api().library_add_folder();
     if (r.ok) { renderLibFolders(); toast("Папка добавлена — ищу игры"); }
@@ -390,7 +392,8 @@ function renderPresets() {
     const dl = S.downloads["local:" + p.id];
     const status = p.installed
       ? `<span class="chip ok">${icon("check")}Скачана</span>`
-      : `<button class="btn sm" data-dl="${p.id}" ${dl || S.busy ? "disabled" : ""}>${icon("download")}${p.size_gb.toFixed(1)} ГБ</button>`;
+      : `<button class="btn sm" data-dl="${p.id}" ${dl || S.busy ? "disabled" : ""}>${icon("download")}${p.partial
+        ? `Продолжить · ${(p.partial / 1e9).toFixed(1)} из ${p.size_gb.toFixed(1)} ГБ` : p.size_gb.toFixed(1) + " ГБ"}</button>`;
     return `<div class="preset ${S.preset === p.id ? "active" : ""}" data-preset="${p.id}">
       <span class="radio"></span>
       <div class="grow">
@@ -618,6 +621,8 @@ window.onBackendEvent = (ev) => {
     case "download": onDownload(ev); break;
     case "export": onExportProgress(ev); break;
     case "export_done": onExportDone(ev); break;
+    case "coverage": onCoverageProgress(ev); break;
+    case "coverage_done": onCoverageDone(ev); break;
     case "task_error": {
       S.busy = false;
       toast(ev.message, true);
@@ -678,12 +683,23 @@ function startDownloadUi(task) {
   box.classList.remove("hidden");
   box.querySelector(".bar").classList.add("indeterminate");
   box.querySelector(".dl-text").textContent = "Начинаю загрузку…";
+  box.querySelector(".dl-notes").innerHTML = "";
+  if (task !== "machine") $("#localFail").classList.add("hidden");
   renderMachine(); renderPresets(); updateRunState();
   if ($("#page-models").classList.contains("active")) renderModels();
 }
 
+/* Сбой сети во время загрузки: что случилось и что программа делает дальше (последние 4). */
+function addDlNote(box, text) {
+  const notes = box.querySelector(".dl-notes");
+  const time = new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  notes.insertAdjacentHTML("beforeend", `<div>${esc(time)} — ${esc(text)}</div>`);
+  while (notes.children.length > 4) notes.firstElementChild.remove();
+}
+
 function onDownload(ev) {
   const box = ev.task === "machine" ? $("#mtProgress") : $("#localProgress");
+  if (ev.note && !ev.done && !ev.error) { box.classList.remove("hidden"); addDlNote(box, ev.note); return; }
   const bar = box.querySelector(".bar");
   box.classList.remove("hidden");
   if (ev.fraction != null) {
@@ -699,9 +715,53 @@ function onDownload(ev) {
     delete S.downloads[ev.task];
     S.busy = false;
     if (ev.done) { toast(ev.message || "Готово"); setTimeout(() => box.classList.add("hidden"), 1500); }
-    else if (ev.error !== "Отменено.") toast(ev.error, true);
+    else if (!ev.cancelled) toast(ev.error, true);
+    if (ev.error && ev.task.startsWith("local:")) { box.classList.add("hidden"); showDlFail(ev); }
     reloadInit().then(() => { loadHardware(); if ($("#page-models").classList.contains("active")) renderModels(); });
   }
+}
+
+/* Модель не скачалась: причина, сколько уже скачано, и все пути дальше — продолжить, скачать
+   вручную (браузером, по любой из ссылок), указать скачанный файл, открыть журнал загрузки. */
+function showDlFail(ev) {
+  const id = ev.task.slice(6);
+  const p = (S.init.presets || []).find((x) => x.id === id) || { title: "Модель", size_gb: 0 };
+  const box = $("#localFail");
+  const kept = ev.partial && !/сохранено/.test(ev.error || "") ? `Скачано ${size(ev.partial)} из ${p.size_gb.toFixed(2)} ГБ — при повторе загрузка продолжится с этого места.` : "";
+  const urls = ev.urls || [];
+  const hosts = urls.map((u) => { try { return new URL(u).host.replace(/^www\./, ""); } catch (e) { return u; } });
+  box.innerHTML = `<div class="msg ${ev.cancelled ? "w" : "e"}">${icon(ev.cancelled ? "pause" : "x-circle")}<div>
+      <b>${ev.cancelled ? "Загрузка остановлена" : esc(p.title) + " не скачалась"}</b>
+      ${ev.cancelled ? "" : `<span>${esc(ev.error)}</span>`}
+      ${kept ? `<span class="muted small">${esc(kept)}</span>` : ""}</div></div>
+    <div class="row gap">
+      <button class="btn sm" data-fail="retry">${icon("download")}${ev.partial ? "Продолжить загрузку" : "Скачать ещё раз"}</button>
+      ${urls.length ? `<button class="btn ghost sm" data-fail="manual">${icon("globe")}Скачать вручную</button>` : ""}
+      <button class="btn ghost sm" data-fail="file">${icon("folder-open")}Указать скачанный файл</button>
+      ${ev.log ? `<button class="btn ghost sm" data-fail="log">${icon("info")}Журнал загрузки</button>` : ""}
+    </div>
+    <div class="manual hidden"><span>Скачайте файл браузером по любой ссылке (это один и тот же файл), затем нажмите «Указать скачанный файл»:</span>
+      ${urls.map((u, i) => `<a href="#" data-url="${esc(u)}">${esc(hosts[i])}${i ? " (зеркало)" : ""}</a>`).join("")}
+      ${ev.log ? `<span class="muted small">Если пишете автору — приложите журнал: ${esc(ev.log)}</span>` : ""}</div>`;
+  box.classList.remove("hidden");
+  $$("[data-fail]", box).forEach((b) => b.addEventListener("click", async (e) => {
+    const act = b.dataset.fail;
+    if (act === "retry") {
+      const r = await api().download_local(id);
+      if (!r.ok) return toast(r.error, true);
+      startDownloadUi("local:" + id);
+    } else if (act === "manual") box.querySelector(".manual").classList.toggle("hidden");
+    else if (act === "file") importLocalModel(id);
+    else if (act === "log") api().open_download_log();
+  }));
+  $$("[data-url]", box).forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); api().open_url(a.dataset.url); }));
+}
+
+async function importLocalModel(id) {
+  if (!id) return toast("Сначала выберите модель в списке.", true);
+  const r = await api().import_local_model(id);
+  if (!r.ok) { if (r.error) toast(r.error, true); return; }
+  startDownloadUi("local:" + id);
 }
 
 async function reloadInit() {
@@ -776,7 +836,9 @@ function restoreGame(path, fromResult = false) {
 /* ---------------- мои игры ---------------- */
 
 async function loadLibrary(refresh) {
-  if (S.lib.loaded && !refresh) { renderGames(); return; }
+  // список уже есть — показываем сразу, а состояние игр всё равно перечитываем: программа берёт его
+  // с диска (игру могли обновить, переустановить или откатить, пока окно было на другой вкладке)
+  if (S.lib.loaded && !refresh) renderGames();
   const r = await api().library(!!refresh);
   S.lib.games = r.games || [];
   S.lib.scannedAt = r.scanned_at || 0;
@@ -814,33 +876,54 @@ function gameKind(g) {
   return "overlay";
 }
 
+/* Одна и та же папка может прийти записанной по-разному (регистр, слэши, «\» в конце). */
+const pathKey = (p) => String(p || "").replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+const samePath = (a, b) => !!a && !!b && pathKey(a) === pathKey(b);
+
 /* Файлы игры изменились (русификация, архив, откат) — программа перечитала её состояние с диска:
-   обновляем и список, и открытую карточку этой игры, чтобы кнопки и статус не остались прежними. */
+   обновляем список, открытую карточку и главную страницу, если там выбрана эта же игра, — чтобы
+   кнопки («Откатить», «Создать файл…») и статус не остались прежними до перезапуска. */
 function onGameStatus(g) {
   if (!g || !g.path) return;
   upsertGame(g);
   if (S.lib.loaded) renderGames();
   const cur = S.lib.current;
-  if (cur && cur.path === g.path && !$("#gameModal").classList.contains("hidden")) {
-    openGame(S.lib.games.find((x) => x.path === g.path));
+  if (cur && samePath(cur.path, g.path) && !$("#gameModal").classList.contains("hidden")) {
+    openGame(S.lib.games.find((x) => samePath(x.path, g.path)), true);
+  }
+  const sg = S.game;
+  if (sg && samePath(sg.path, g.path) && !S.running && (!!sg.russified !== !!g.russified ||
+      (g.russified && (sg.intact !== false) !== (g.intact !== false)) || !!sg.from_package !== !!g.from_package)) {
+    detectGame(sg.path, true);
   }
 }
 
 function upsertGame(g) {
-  const i = S.lib.games.findIndex((x) => x.path === g.path);
-  if (i >= 0) S.lib.games[i] = { ...S.lib.games[i], ...g };
+  const i = S.lib.games.findIndex((x) => samePath(x.path, g.path));
+  if (i >= 0) S.lib.games[i] = { ...S.lib.games[i], ...g, path: S.lib.games[i].path };
   else S.lib.games.push(g);
 }
 
 function renderGames() {
   const all = S.lib.games;
-  const counts = { all: all.length, supported: 0, russified: 0, overlay: 0 };
-  all.forEach((g) => { counts[gameKind(g)]++; });
+  const counts = { all: 0, supported: 0, russified: 0, overlay: 0, hidden: 0 };
+  all.forEach((g) => {
+    if (g.hidden) { counts.hidden++; return; }
+    counts.all++;
+    counts[gameKind(g)]++;
+  });
   counts.supported += counts.russified;
+  if (S.lib.filter === "hidden" && !counts.hidden) {        // вернули последнюю скрытую — назад ко всем
+    S.lib.filter = "all";
+    $$("#gameFilters .filter").forEach((x) => x.classList.toggle("active", x.dataset.filter === "all"));
+  }
+  $("#filterHidden").classList.toggle("hidden", !counts.hidden);
   $$("[data-cnt]").forEach((el) => { el.textContent = counts[el.dataset.cnt] ? " " + counts[el.dataset.cnt] : ""; });
   const q = S.lib.search;
   const list = all.filter((g) => {
     if (q && !String(g.title).toLowerCase().includes(q) && !String(g.path).toLowerCase().includes(q)) return false;
+    if (S.lib.filter === "hidden") return !!g.hidden;
+    if (g.hidden) return false;
     const k = gameKind(g);
     if (S.lib.filter === "supported") return g.supported || g.russified;
     if (S.lib.filter === "russified") return k === "russified";
@@ -906,9 +989,11 @@ function cardHtml(g) {
   </div>`;
 }
 
-function openGame(g) {
+function openGame(g, fresh = false) {
   if (!g) return;
   S.lib.current = g;
+  // карточку рисуем сразу, а состояние перечитываем с диска — придёт событием game_status
+  if (!fresh) api().library_status(g.path);
   const m = $("#gameModal");
   const cover = $("#gmCover");
   cover.innerHTML = g.cover ? `<img src="${esc(g.cover)}" alt="">` : placeholder(g);
@@ -934,7 +1019,7 @@ function openGame(g) {
     const why = (g.sources || []).includes("xbox") ? "Файлы игр Game Pass / Microsoft Store защищены." : "Этот движок пока не переводится файлами.";
     st.push(["info", "live", "Только живой перевод", why + " Играйте с оверлеем: перевод появится поверх игры."]);
   }
-  if (g.live) st.push(["live", "live", `Допереведено на лету: ${g.live}`, "Столько строк игра собрала кодом — их перевела живая «доводка». Они войдут и в архив-русификатор."]);
+  if (g.live) st.push(["live", "live", `Допереведено на лету: ${g.live}`, "Столько строк не нашлось при русификации — их перевела живая «доводка». Они войдут в архив-русификатор и в словарь при следующей русификации. «Полнота перевода» покажет, где они лежат в игре."]);
   $("#gmState").innerHTML = st.map(([c, i, t, d]) => `<div class="state-box ${c}">${icon(i)}<div><b>${esc(t)}</b><span class="muted">${esc(d)}</span></div></div>`).join("");
 
   const acts = [];
@@ -948,8 +1033,13 @@ function openGame(g) {
   $("#gmActions").innerHTML = acts.map(([k, i, t, a]) => `<button class="btn ${k}" data-act="${a}">${icon(i)}${esc(t)}</button>`).join("");
   const links = [["folder-open", "Открыть папку", "folder"]];
   if (g.russified && g.engine === "unity") links.push(["link", "Ярлык на рабочий стол", "shortcut"]);
-  if ((g.sources || []).includes("manual") || !(g.sources || []).length) links.push(["eye-off", "Убрать из списка", "hide"]);
-  else links.push(["eye-off", "Скрыть", "hide"]);
+  if (g.engine === "unity" && (g.russified || g.live)) links.push(["search", "Полнота перевода", "coverage"]);
+  links.push(["image", "Сменить обложку", "cover"]);
+  if (g.cover_custom) links.push(["undo", "Обычная обложка", "cover_reset"]);
+  if (g.hidden) {
+    links.push(["eye", "Вернуть в список", "unhide"]);
+    if ((g.sources || []).length === 1 && g.sources[0] === "manual") links.push(["trash", "Забыть папку", "forget"]);
+  } else links.push(["eye-off", "Скрыть", "hide"]);
   $("#gmLinks").innerHTML = links.map(([i, t, a]) => `<button class="btn ghost sm" data-act="${a}">${icon(i)}${esc(t)}</button>`).join("");
   $$("#gameModal [data-act]").forEach((b) => b.addEventListener("click", () => gameAction(b.dataset.act, g)));
   m.classList.remove("hidden");
@@ -976,15 +1066,35 @@ async function gameAction(act, g) {
   } else if (act === "shortcut") {
     const r = await api().desktop_shortcut(g.path);
     toast(r.ok ? "Ярлык «" + r.name + "» создан на рабочем столе" : r.error, !r.ok);
+  } else if (act === "coverage") {
+    close();
+    openCoverage(g);
   } else if (act === "live") {
     close();
     showPage("live");
   } else if (act === "hide") {
     await api().library_hide(g.path);
-    S.lib.games = S.lib.games.filter((x) => x.path !== g.path);
+    g.hidden = true;
     close();
     renderGames();
-    toast("Игра убрана из списка");
+    toast("Игра скрыта — вернуть её можно во вкладке «Скрытые»");
+  } else if (act === "unhide") {
+    await api().library_unhide(g.path);
+    g.hidden = false;
+    close();
+    renderGames();
+    toast("«" + g.title + "» снова в списке");
+  } else if (act === "forget") {
+    await api().library_forget(g.path);
+    S.lib.games = S.lib.games.filter((x) => !samePath(x.path, g.path));
+    close();
+    renderGames();
+    toast("Папка убрана из программы");
+  } else if (act === "cover" || act === "cover_reset") {
+    const r = await api().library_cover(g.path, act === "cover_reset");
+    if (!r.ok) { if (r.error) toast(r.error, true); return; }
+    await loadLibrary(false);                       // обычная обложка (Steam или заглушка) — из списка
+    openGame(S.lib.games.find((x) => samePath(x.path, g.path)), true);
   }
 }
 
@@ -1183,7 +1293,8 @@ async function onImportDone(ev) {
   $("#imMsgs").innerHTML = [`<div class="msg n">${icon("check-circle")}<span>Готово! Русификатор установлен — запускайте игру.</span></div>`]
     .concat((ev.notes || []).map((m) => `<div class="msg w">${icon("alert")}<span>${esc(m)}</span></div>`)).join("");
   toast("Русификатор установлен");
-  if (S.game && S.game.path === ev.game) detectGame(ev.game, true);
+  // игра с установленным архивом становится выбранной и на главной — там сразу есть «Откатить»
+  if (!S.game || !samePath(S.game.path, ev.game) || !S.game.russified) detectGame(ev.game, true);
 }
 
 /* ---------------- архив-русификатор ---------------- */
@@ -1287,3 +1398,80 @@ async function copyText(text) {
   }
   toast("Скопировано: " + text);
 }
+
+/* ---------------- полнота перевода (Unity) ---------------- */
+
+async function openCoverage(g) {
+  S.cov = { game: g, file: "" };
+  $("#covGame").textContent = "«" + g.title + "»";
+  $("#covProgress").classList.add("hidden");
+  $("#covGo").disabled = false;
+  $("#covBody").innerHTML = "";
+  $("#covModal").classList.remove("hidden");
+  const r = await api().coverage_last(g.path);
+  renderCoverage(r.report, r.missed);
+}
+
+function renderCoverage(rep, missed) {
+  const box = $("#covBody");
+  $("#covOpen").classList.toggle("hidden", !(rep && rep.file));
+  if (rep && rep.file) S.cov.file = rep.file;
+  if (!rep) {
+    box.innerHTML = missed
+      ? `<div class="msg n">${icon("info")}<span>Во время игры найдено строк, которых не было в словаре: <b>${missed}</b>. Нажмите «Проверить» — программа найдёт, где каждая лежит в файлах игры (займёт столько же, сколько русификация).</span></div>`
+      : `<div class="msg n">${icon("info")}<span>Пока пусто: во время игры живому переводу ещё ничего не досталось. Поиграйте с русификацией (живой перевод включается сам) и зайдите сюда снова — здесь появится всё, что игра показала, а заранее найдено не было.</span></div>`;
+    return;
+  }
+  if (!rep.total) {
+    box.innerHTML = `<div class="msg n">${icon("check-circle")}<span>Всё, что игра показала во время игры, было в словаре — пропусков нет (${esc(rep.date)}).</span></div>`;
+    return;
+  }
+  const items = rep.items || [];
+  const kinds = rep.kinds || {};
+  const sum = Object.keys(kinds).filter((k) => rep.counts[k])
+    .map((k) => `<span class="chip">${esc(kinds[k].title)}: ${rep.counts[k]}</span>`).join("");
+  let html = `<div class="muted small">Проверено ${esc(rep.date)}. Строк, которых не было в словаре: <b>${rep.total}</b>.</div><div class="cov-sum">${sum}</div>`;
+  for (const k of Object.keys(kinds)) {
+    const group = items.filter((m) => m.kind === k);
+    if (!group.length) continue;
+    const shown = group.slice(0, 150);
+    html += `<div class="cov-group ${k}"><h3>${esc(kinds[k].title)}<span class="chip">${group.length}</span></h3>
+      <div class="muted small">${esc(kinds[k].about)}</div>
+      ${shown.map((m) => `<div class="cov-item"><div class="t">${esc(m.text)}</div>${m.where ? `<div class="w">где: ${esc(m.where)}</div>` : ""}${m.note ? `<div class="w">${esc(m.note)}</div>` : ""}</div>`).join("")}
+      ${group.length > shown.length ? `<div class="muted small">…и ещё ${group.length - shown.length} — все в отчёте.</div>` : ""}</div>`;
+  }
+  box.innerHTML = html;
+}
+
+function onCoverageProgress(ev) {
+  const box = $("#covProgress");
+  const bar = box.querySelector(".bar");
+  box.classList.remove("hidden");
+  if (ev.fraction != null) {
+    bar.classList.remove("indeterminate");
+    bar.querySelector(".bar-fill").style.width = (ev.fraction * 100).toFixed(1) + "%";
+  } else bar.classList.add("indeterminate");
+  box.querySelector(".dl-text").textContent = ev.message || "";
+}
+
+function onCoverageDone(ev) {
+  $("#covProgress").classList.add("hidden");
+  $("#covGo").disabled = false;
+  if (!S.cov) return;
+  $("#covModal").classList.remove("hidden");
+  if (!ev.ok) {
+    $("#covBody").innerHTML = `<div class="msg e">${icon("x-circle")}<span>${esc(ev.error)}</span></div>`;
+    return;
+  }
+  renderCoverage(ev.report, ev.report ? ev.report.total : 0);
+}
+
+$("#covGo").addEventListener("click", async () => {
+  if (!S.cov) return;
+  const r = await api().coverage_check(S.cov.game.path);
+  if (!r.ok) return toast(r.error, true);
+  $("#covGo").disabled = true;
+  onCoverageProgress({ message: "Читаю файлы игры…", fraction: null });
+});
+$("#covOpen").addEventListener("click", () => { if (S.cov && S.cov.file) api().open_file(S.cov.file); });
+

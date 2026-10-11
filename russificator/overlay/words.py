@@ -9,6 +9,12 @@ Argos en→ru, он же запасной переводчик оверлея): 
 («graphic» → «sraphic», «highly» → «hiShlg», «children» → «chi Idren»).
 :func:`fix` исправляет такие слова по таблице типичных замен, если в словаре
 находится ровно подходящее слово, — переводчик получает нормальный английский.
+
+Частых слов модели мало (~8 тысяч), а настоящее слово, которого в них нет, нельзя
+«исправлять» («Hello» → «Hell», «Emulation» → «mutation»). Поэтому есть и полный словарь
+английского (SCOWL en_US, ~38 тысяч слов без имён собственных, resources/words): слово из
+него считается верным и не трогается, а исправляются слова только в частые слова (и в
+полный словарь только защищает слова от «исправления»).
 """
 
 from __future__ import annotations
@@ -17,9 +23,13 @@ import logging
 import re
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 log = logging.getLogger("russificator.overlay.words")
+
+#: «место по частоте» слов полного словаря, которых нет среди частых слов модели
+LEXICON_RANK = 1 << 20
+LEXICON_FILE = Path(__file__).resolve().parents[1] / "resources" / "words" / "en-us.txt.gz"
 
 #: типичные ошибки распознавания: (что прочитано, что было на самом деле)
 CONFUSIONS = [
@@ -86,12 +96,16 @@ def weighted_distance(src: str, dst: str, limit: float = 99.0) -> float:
 
 
 class Words:
-    def __init__(self, ranks: Dict[str, int]):
-        self.ranks = ranks                   # слово (нижний регистр) -> место по частоте (меньше — чаще)
+    def __init__(self, ranks: Dict[str, int], lexicon: Iterable[str] = ()):
+        #: слово (нижний регистр) -> место по частоте (меньше — чаще); слова полного словаря — LEXICON_RANK
+        self.ranks = dict(ranks)
+        for w in lexicon:
+            self.ranks.setdefault(w, LEXICON_RANK)
         self._by_len: Dict[int, List[tuple]] = {}
-        for w in ranks:
-            self._by_len.setdefault(len(w), []).append((w, _mask(w)))
-        self._memo: Dict[str, Optional[str]] = {}
+        for w, r in self.ranks.items():              # исправляем «по расстоянию» — только в частые слова
+            if r < LEXICON_RANK:
+                self._by_len.setdefault(len(w), []).append((w, _mask(w)))
+        self._memo: Dict[tuple, Optional[str]] = {}
 
     def __contains__(self, word: str) -> bool:
         return self.known(word)
@@ -121,29 +135,36 @@ class Words:
 
     # ---------------------------------------------------------- исправление
 
-    def correct(self, token: str) -> Optional[str]:
-        """Словарное слово, которое распознавание прочитало как ``token`` (или None)."""
+    def correct(self, token: str, strict: bool = False) -> Optional[str]:
+        """Словарное слово, которое распознавание прочитало как ``token`` (или None). ``strict`` —
+        только уверенные исправления: одна типичная замена буквы (без подбора по расстоянию)."""
         if len(token) < 2 or self.known(token) or (len(token) == 2 and token.lower() in self.ranks):
             return None
-        if token in self._memo:
-            return self._memo[token]
-        best = self._by_substitution(token) or (self._by_distance(token) if len(token) >= 3 else None)
+        memo = (token, strict)
+        if memo in self._memo:
+            return self._memo[memo]
+        if strict:
+            best = self._by_substitution(token, two=False)
+        else:
+            best = self._by_substitution(token) or (self._by_distance(token) if len(token) >= 3 else None)
         fixed = _same_case(token, best) if best else None
         if len(self._memo) > 5000:
             self._memo.clear()
-        self._memo[token] = fixed
+        self._memo[memo] = fixed
         return fixed
 
-    def _by_substitution(self, token: str) -> Optional[str]:
-        """Одна-две типичные замены букв дают словарное слово."""
+    def _by_substitution(self, token: str, two: bool = True) -> Optional[str]:
+        """Одна-две типичные замены букв дают словарное слово. Две замены — только у слов от пяти
+        букв и только в частое слово: в коротком слове две замены — это уже другое слово
+        («Elm» → «tim»)."""
         cands = {}
-        for one in _variants(token):
-            if one != token and self.known(one):
+        for one in _variants(token):                 # только в частые слова: редкое слово полного
+            if one != token and self.known(one) and self.rank(one) < LEXICON_RANK:   # словаря — чаще имя
                 cands[one] = self.rank(one)
-        if not cands:
+        if not cands and two and len(token) >= 5:
             for one in list(_variants(token)):
                 for two in _variants(one):
-                    if two != token and self.known(two):
+                    if two != token and self.known(two) and self.rank(two) < LEXICON_RANK:
                         cands[two] = self.rank(two) + 50000       # две замены — хуже одной
         return min(cands, key=cands.get) if cands else None
 
@@ -170,8 +191,9 @@ class Words:
             return None                                  # два одинаково похожих слова — не угадываем
         return scored[0][2]
 
-    def fix(self, text: str) -> str:
-        """Исправить в строке слова с типичными ошибками распознавания (остальное — как есть)."""
+    def fix(self, text: str, strict: bool = False) -> str:
+        """Исправить в строке слова с типичными ошибками распознавания (остальное — как есть).
+        ``strict`` — только уверенные исправления (см. :meth:`correct`)."""
         parts = _TOKEN.findall(text or "")
         out: List[str] = []
         i = 0
@@ -186,12 +208,12 @@ class Words:
                 nxt = parts[i + 2]
                 if not (self.known(tok) and self.known(nxt)):
                     glued = tok + nxt
-                    fixed = glued if self.known(glued) else self.correct(glued)
+                    fixed = glued if self.known(glued) else self.correct(glued, strict)
                     if fixed and len(glued) >= 5:
                         out.append(_same_case(glued, fixed))
                         i += 3
                         continue
-            fixed = self.correct(tok) if len(tok) >= 2 else None
+            fixed = self.correct(tok, strict) if len(tok) >= 2 else None
             out.append(fixed or tok)
             i += 1
         return "".join(out)
@@ -247,8 +269,19 @@ def load(model: Optional[Path] = None) -> Optional[Words]:
                 ranks.setdefault(piece[1:].lower(), i)
         for w in ("a", "i"):
             ranks.setdefault(w, 0)
-        words = Words(ranks)
-        log.info("словарь английских слов: %d", len(words))
+        words = Words(ranks, lexicon())
+        log.info("словарь английских слов: %d частых, %d всего", len(ranks), len(words))
         if default:
             _cached = words
         return words
+
+
+def lexicon() -> List[str]:
+    """Полный словарь английского (SCOWL en_US, без имён собственных) или пустой список."""
+    import gzip
+    try:
+        with gzip.open(LEXICON_FILE, "rt", encoding="utf-8") as fh:
+            return [w for w in fh.read().split() if w]
+    except OSError as exc:
+        log.warning("полный словарь английского не загружен: %s", exc)
+        return []

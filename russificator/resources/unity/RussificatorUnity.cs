@@ -532,7 +532,19 @@ public class RussificatorUnity : BaseUnityPlugin
     {
         try
         {
-            if (value != null && value.Length > 0 && !HasCyrillic(value)) StateOf(__instance).Original = value;
+            if (value == null || value.Length == 0) return;
+            if (!HasCyrillic(value))
+            {
+                StateOf(__instance).Original = value;
+                return;
+            }
+            // текст из сцены игра не присваивает — XUnity сразу пишет перевод поверх: оригинал ещё в компоненте
+            State st = StateOf(__instance);
+            if (st.Original == null)
+            {
+                string cur = ReadText(__instance, _tmp != null && _tmp.IsInstanceOfType(__instance));
+                if (cur != null && cur.Length > 0 && !HasCyrillic(cur)) st.Original = cur;
+            }
         }
         catch { }
     }
@@ -606,6 +618,12 @@ public class RussificatorUnity : BaseUnityPlugin
         }
         st.CheckedLength = s.Length;
         if (tmp ? (bool)_tmpAuto.GetValue(inst, null) : (bool)_uguiBestFit.GetValue(inst, null)) return;
+        if (KeepOneLine(inst, tmp, s, st.Original, w))
+        {
+            st.Fitted = true;
+            if (_fitLogged++ < 100) _log.LogInfo("One line: " + NameOf(inst) + " — " + Shorten(s));
+            return;
+        }
         if (tmp)
         {
             // рамка уже одной буквы — текст нарочно выходит за неё (так задумано), не трогаем
@@ -626,6 +644,65 @@ public class RussificatorUnity : BaseUnityPlugin
     }
 
     static int _fitLogged;
+
+    // Надпись, которая в оригинале помещалась в одну строку (кнопка, пункт меню, подпись над другой
+    // надписью), а по-русски переносится: вторая строка наехала бы на соседние элементы, хотя в свою
+    // рамку и влезает. Кегль уменьшается ровно настолько, чтобы перевод тоже встал в одну строку,
+    // но не меньше MinScale (иначе пусть переносится).
+    static bool KeepOneLine(object inst, bool tmp, string s, string original, float w)
+    {
+        if (original == null || s.IndexOf('\n') >= 0 || original.IndexOf('\n') >= 0) return false;
+        float trans, orig;
+        if (tmp)
+        {
+            if (!TmpWraps(inst)) return false;
+            trans = (float)_tmpPrefW.GetValue(inst, null);       // текущий (русский) текст в одну строку
+            int a = PlainLength(original), b = PlainLength(s);
+            if (a <= 0 || b <= 0) return false;
+            orig = trans * a / b;      // ширину оригинала мерить нельзя (портит буфер TMP) — по числу букв
+        }
+        else
+        {
+            if (_genPrefW == null || Convert.ToInt32(_uguiHOverflow.GetValue(inst, null)) != 0) return false;
+            object gen = _uguiGen.GetValue(inst, null);
+            float ppu = (float)_uguiPpu.GetValue(inst, null);
+            if (gen == null || ppu <= 0f) return false;
+            object extents = Activator.CreateInstance(_vector2, new object[] { w, 0f });
+            object settings = _uguiSettings.Invoke(inst, new object[] { extents });
+            trans = (float)_genPrefW.Invoke(gen, new object[] { s, settings }) / ppu;
+            orig = (float)_genPrefW.Invoke(gen, new object[] { original, settings }) / ppu;
+        }
+        if (orig > w + 1.5f || trans <= w + 1.5f) return false;  // оригинал и так переносился / перевод влезает
+        float k = (w - 1f) / trans;
+        if (k < MinScale) return false;
+        if (tmp)
+        {
+            float size = (float)_tmpSize.GetValue(inst, null);
+            if (size <= 1f) return false;
+            _tmpSize.SetValue(inst, (float)Math.Floor(size * k * 10.0) / 10f, null);
+        }
+        else
+        {
+            int size = (int)_uguiSize.GetValue(inst, null);
+            int ns = (int)Math.Floor(size * k);
+            if (ns < 1 || ns >= size) return false;
+            _uguiSize.SetValue(inst, ns, null);
+        }
+        return true;
+    }
+
+    static int PlainLength(string s)
+    {
+        int n = 0;
+        bool tag = false;
+        foreach (char c in s)
+        {
+            if (c == '<') tag = true;
+            else if (c == '>' && tag) tag = false;
+            else if (!tag && !char.IsWhiteSpace(c)) n++;
+        }
+        return n;
+    }
 
     static string NameOf(object inst)
     {

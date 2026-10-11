@@ -77,3 +77,20 @@ def looks_like_sentence(text: str) -> bool:
     s = plain_text(text).strip()
     words = re.findall(r"[A-Za-z']+", s)
     return len(words) >= 3 or (len(words) >= 2 and bool(_SENTENCE_END.search(s)))
+
+
+#: заставки движков и технологий — названия, их не переводим
+_BRANDS = re.compile(r"(?i)^(?:made with|powered by|created with|built with|a game by|presented by)?\s*"
+                     r"(?:unity(?: technologies)?|unreal(?: engine)?|godot(?: engine)?|gamemaker(?: studio)?|"
+                     r"rpg maker(?: m[vz]| vx(?: ace)?| xp)?|ren'?py|fmod(?: studio)?|wwise|havok|nvidia|amd|"
+                     r"intel|directx|vulkan|opengl|steam(?:works)?|epic games|xbox|playstation|nintendo(?: switch)?|"
+                     r"physx|bink(?: video)?|speedtree|dolby(?: atmos)?|"
+                     # площадки и соцсети — ссылки в меню игр («Patreon», «Discord»): это названия
+                     r"patreon|discord|twitter|youtube|twitch|itch(?:\.io)?|kickstarter|reddit|tiktok|instagram|"
+                     r"facebook|bluesky|ko-?fi|tumblr|github|gog(?:\.com)?|boosty|telegram|vk|x\.com)?\s*[™®©]?$")
+
+
+def is_brand(text: str) -> bool:
+    """Строка — название движка, площадки или соцсети («Made with Unity», «Discord», «Patreon»)."""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    return bool(t) and bool(_BRANDS.match(t)) and bool(re.search(r"[A-Za-z]{3,}", t))

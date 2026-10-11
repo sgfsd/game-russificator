@@ -1,22 +1,22 @@
-"""Кириллица для шрифтов TextMeshPro: дорисовка глифов прямо в атлас шрифта.
+"""Кириллица в шрифтах Unity-игры — того же размера и вида, что родной текст.
 
-Главная причина «квадратиков» в Unity-играх — статичный атлас TextMeshPro:
-шрифт запечён в текстуру один раз при сборке игры и содержит только латиницу.
-Готовые TMP-шрифты XUnity есть не для всех версий Unity, поэтому здесь
-атлас чинится на месте для любой версии TMP (1.x, 2.x, 3.x):
+Когда в шрифте игры нет русских букв, Unity подставляет их из системного Arial того же кегля, а
+TextMeshPro — из запасного шрифта; у таких букв другой рост и вес, поэтому русский текст выходил
+в полтора-два раза крупнее английского и наезжал строками. Здесь буквы дописываются в сами шрифты
+игры по меркам каждого шрифта (``fonts/cyrillic.py``):
 
-  1. берём буквы, которых в шрифте не хватает (весь русский алфавит + все
-     символы, реально встречающиеся в переводе: «», —, №, …);
-  2. рендерим их из встроенного PT Sans (жирный — для жирных шрифтов) в
-     SDF — точно в том же кодировании, что у TMP (0.5 на контуре,
-     наклон 1/(2·GradientScale), обрезка на расстоянии Padding), и
-     подгоняем размер под высоту заглавных букв оригинального шрифта;
-  3. дописываем их в свободную часть атласа (если места нет — атлас
-     увеличивается вдвое, старые глифы остаются на своих координатах);
-  4. добавляем записи в таблицы шрифта и обновляем размеры атласа в
-     материалах, затем проверяем результат, перечитав файл заново.
+  * TTF/OTF внутри ассета ``Font`` (UI Text, TextMesh, IMGUI, исходники динамических шрифтов
+    TextMeshPro) — буквы встраиваются прямо в шрифт;
+  * атлас TextMeshPro (любой версии TMP: 1.x, 2.x, 3.x) — мерки снимаются с глифов атласа
+    (высота заглавных и строчных, ширина, толщина штриха, капитель), русские буквы, совпадающие
+    с латинскими, ссылаются на готовые глифы, остальные рисуются в SDF — точно в том же
+    кодировании, что у TMP (0.5 на контуре, наклон 1/(2·GradientScale), обрезка на расстоянии
+    Padding) — кеглем атласа; если исходный TTF шрифта есть в игре, буквы рисуются им самим;
+  * растровый шрифт (``Font`` с готовой текстурой букв) — так же, у пиксельных — без полутонов.
 
-Изменённые файлы ассетов попадают в бэкап — откат возвращает оригиналы.
+Новые глифы ложатся в свободную часть атласа (если места нет — атлас увеличивается вдвое, старые
+глифы остаются на своих координатах); результат проверяется, перечитав файл заново. Изменённые
+файлы ассетов попадают в бэкап — откат возвращает оригиналы.
 """
 
 from __future__ import annotations
@@ -26,14 +26,13 @@ import logging
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from . import unitypy_io
 
 log = logging.getLogger("russificator.unity.tmp")
 
-RUSSIAN = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-EXTRA = "«»—–…№„“”’"
+from ...fonts.cyrillic import EXTRA, RUSSIAN, needed_chars  # noqa: F401,E402 — общие для всех движков
 
 
 @dataclass
@@ -76,23 +75,30 @@ def _edt_sq(f, radius: int):
 
 
 class GlyphRenderer:
-    def __init__(self, font_path: Path):
-        self.font_path = Path(font_path)
+    """Отрисовка символов шрифта (файл или байты TTF) в растр/SDF для атласа."""
+
+    def __init__(self, font):
+        self.font_path = Path(font) if not isinstance(font, (bytes, bytearray)) else None
+        self.font_data = bytes(font) if isinstance(font, (bytes, bytearray)) else None
         self._cache: Dict[Tuple, RenderedGlyph] = {}
         self._cap_ratio: Optional[float] = None
+
+    def _pil(self, size: int):
+        import io
+        from PIL import ImageFont
+        src = io.BytesIO(self.font_data) if self.font_data is not None else str(self.font_path)
+        return ImageFont.truetype(src, size=max(1, size))
 
     def cap_ratio(self) -> float:
         """Высота заглавной «Н» в долях кегля (для подгонки под оригинальный шрифт)."""
         if self._cap_ratio is None:
-            from PIL import ImageFont
-            f = ImageFont.truetype(str(self.font_path), size=200)
+            f = self._pil(200)
             l, t, r, b = f.getbbox("Н", anchor="ls")
             self._cap_ratio = (b - t) / 200.0
         return self._cap_ratio
 
     def mean_advance(self, chars: str, size: float) -> float:
-        from PIL import ImageFont
-        f = ImageFont.truetype(str(self.font_path), size=max(1, round(size)))
+        f = self._pil(round(size))
         return sum(f.getlength(c) for c in chars) / max(1, len(chars))
 
     def render(self, char: str, size: float, padding: int, gradient: float, sdf: bool = True,
@@ -104,7 +110,7 @@ class GlyphRenderer:
         import numpy as np
         from PIL import Image, ImageDraw, ImageFont
         ss = 4 if size < 64 else 2 if size < 160 else 1
-        font = ImageFont.truetype(str(self.font_path), size=max(1, round(size * ss)))
+        font = self._pil(round(size * ss))
         l, t, r, b = font.getbbox(char, anchor="ls")
         advance = font.getlength(char) / ss * xscale
         if r <= l or b <= t:  # пробельный символ
@@ -157,7 +163,9 @@ class TmpFont:
 
     def __init__(self, tree: dict):
         self.tree = tree
-        self.v1 = "m_glyphInfoList" in tree
+        # шрифт, обновлённый из TMP 1.x в 1.4+/2.x, хранит и старый (пустой) m_glyphInfoList, и новые
+        # таблицы — TMP читает новые, туда и надо дописывать
+        self.v1 = "m_glyphInfoList" in tree and (bool(tree["m_glyphInfoList"]) or "m_GlyphTable" not in tree)
 
     @staticmethod
     def match(tree: dict) -> bool:
@@ -266,6 +274,69 @@ class TmpFont:
                 out.append((int(r["m_X"]) - pad, top - pad, int(r["m_Width"]) + 2 * pad, int(r["m_Height"]) + 2 * pad))
         return out
 
+    def point_size(self) -> float:
+        """Кегль, которым нарисован атлас (метрики глифов — в пикселях этого кегля)."""
+        if self.v1:
+            return float(self.tree["m_fontInfo"].get("PointSize") or 0)
+        fi = self.tree.get("m_FaceInfo") or {}
+        return float(fi.get("m_PointSize") or 0)
+
+    def boxes(self, alpha=None) -> Dict[str, "cyrillic.GlyphBox"]:
+        """Глифы атласа с метриками и (если дан альфа-канал атласа) картинкой «чернил»."""
+        from ...fonts import cyrillic
+        out: Dict[str, cyrillic.GlyphBox] = {}
+        H = alpha.shape[0] if alpha is not None else 0
+
+        def crop(x, y_top, w, h):
+            if alpha is None or w <= 0 or h <= 0:
+                return None
+            m = alpha[int(y_top):int(y_top) + int(math.ceil(h)), int(x):int(x) + int(math.ceil(w))] >= 0.5
+            return m if m.size and m.any() else None
+        if self.v1:
+            for g in self.tree["m_glyphInfoList"]:
+                code = int(g["id"])
+                if 0 < code < 0x110000:
+                    out[chr(code)] = cyrillic.GlyphBox(
+                        float(g["width"]), float(g["height"]), float(g["xOffset"]), float(g["yOffset"]),
+                        float(g["xAdvance"]), crop(g["x"], g["y"], g["width"], g["height"]))
+            return out
+        by_idx = {g["m_Index"]: g for g in self.tree["m_GlyphTable"]}
+        for c in self.tree["m_CharacterTable"]:
+            g = by_idx.get(c["m_GlyphIndex"])
+            code = int(c["m_Unicode"])
+            if g is None or not 0 < code < 0x110000:
+                continue
+            m, r = g["m_Metrics"], g["m_GlyphRect"]
+            mask = None
+            if int(g.get("m_AtlasIndex", 0)) == 0:
+                mask = crop(r["m_X"], H - (int(r["m_Y"]) + int(r["m_Height"])), r["m_Width"], r["m_Height"])
+            out[chr(code)] = cyrillic.GlyphBox(
+                float(m["m_Width"]), float(m["m_Height"]), float(m["m_HorizontalBearingX"]),
+                float(m["m_HorizontalBearingY"]), float(m["m_HorizontalAdvance"]), mask)
+        return out
+
+    def add_alias(self, code: int, src: int) -> bool:
+        """Символ ``code`` рисуется уже готовым глифом символа ``src`` (русская «А» — латинской «A»)."""
+        if self.v1:
+            tmpl = next((g for g in self.tree["m_glyphInfoList"] if int(g["id"]) == src), None)
+            if tmpl is None:
+                return False
+            new = copy.deepcopy(tmpl)
+            new["id"] = code
+            self.tree["m_glyphInfoList"].append(new)
+            fi = self.tree["m_fontInfo"]
+            if "CharacterCount" in fi:
+                fi["CharacterCount"] = len(self.tree["m_glyphInfoList"])
+            return True
+        chars = self.tree["m_CharacterTable"]
+        tmpl = next((c for c in chars if int(c["m_Unicode"]) == src), None)
+        if tmpl is None:
+            return False
+        new = copy.deepcopy(tmpl)
+        new["m_Unicode"] = code
+        chars.append(new)
+        return True
+
     def add_glyph(self, g: RenderedGlyph, x: int, y_top: int, atlas_h: int, advance: float, bearing_x: float) -> None:
         """Добавить глиф: (x, y_top) — левый верхний угол «чернил» в атласе (сверху вниз)."""
         code = ord(g.char)
@@ -330,10 +401,44 @@ class _Shelf:
 
 # ---------- патч одного шрифта ----------
 
-def patch_font(font: TmpFont, texture, materials: List, renderer: GlyphRenderer, bold_renderer: GlyphRenderer,
-               need: Iterable[str], only_new_area: bool = False) -> int:
+def plan_atlas(boxes: Dict[str, "cyrillic.GlyphBox"], size: float, missing: Sequence[str],
+               source: Optional[bytes] = None, pixel: Optional[float] = None
+               ) -> Tuple[Dict[str, str], List[str], Optional[GlyphRenderer], float]:
+    """Как дописать в атлас символы ``missing``: (двойники {русская: латинская}, что рисовать,
+    чем рисовать, каким кеглем).
+
+    Мерки снимаются с самого атласа (высота заглавных и строчных, ширина, толщина штриха,
+    капитель), русские буквы, совпадающие с латинскими, ссылаются на готовые глифы, остальные
+    рисуются шрифтом, построенным под эти мерки, — кеглем атласа, поэтому выходят того же размера.
+    ``source`` — исходный TTF шрифта (уже с кириллицей): тогда буквы рисуются им самим."""
+    from ...fonts import cyrillic, sfnt
+    style = cyrillic.style_from_glyphs(size, boxes, pixel) if size > 0 else None
+    aliases: Dict[str, str] = {}
+    if style is not None:
+        for c in missing:
+            twin = cyrillic.twin_of(c, style)
+            if twin and cyrillic.box_twin_ok(boxes, twin, style):
+                aliases[c] = twin
+    rest = [c for c in missing if c not in aliases]
+    if not rest:
+        return aliases, rest, None, size
+    if source is not None and size > 0:
+        try:
+            cmap = sfnt.Font(source).cmap
+            if all(ord(c) in cmap for c in rest):
+                return aliases, rest, GlyphRenderer(source), size
+        except sfnt.FontError:
+            pass
+    if style is None:
+        return aliases, [], None, size                  # не текстовый шрифт (значки, другая письменность)
+    return aliases, rest, GlyphRenderer(cyrillic.synth_font(style, rest)), size
+
+
+def patch_font(font: TmpFont, texture, materials: List, need: Iterable[str], source: Optional[bytes] = None,
+               only_new_area: bool = False) -> int:
     """Дорисовать недостающие символы. Возвращает, сколько добавлено (0 — не нужно).
 
+    ``source`` — исходный TTF шрифта с кириллицей (если есть в игре).
     ``only_new_area`` — для динамических шрифтов: глифы кладутся только в
     добавленную часть атласа, куда динамический упаковщик TMP не пишет.
     """
@@ -348,21 +453,13 @@ def patch_font(font: TmpFont, texture, materials: List, renderer: GlyphRenderer,
     gradient = _gradient_scale(materials) or (pad + 1)
     sdf = font.is_sdf()
     atlas_w, atlas_h = font.atlas_size()
-    rend = bold_renderer if any(k in font.name.lower() for k in ("bold", "black", "heavy")) else renderer
-    size = font.cap_height() / rend.cap_ratio()
-    mono = font.monospace_advance()
-    # ширина: подгоняем среднюю ширину латиницы PT Sans под латиницу шрифта игры
-    latin = "".join(ch for ch in "ABCDEFGHKLMNOPRSTUXYZabcdeghknopstuxyz" if ord(ch) in have)
-    orig_adv = font.mean_advance(latin)
-    xscale = 1.0
-    if orig_adv and len(latin) >= 10:
-        xscale = max(0.55, min(1.3, orig_adv / rend.mean_advance(latin, size)))
-    glyphs = [rend.render(c, size, pad, gradient, sdf, xscale) for c in missing]
 
     img = texture.image
     if img.size != (atlas_w, atlas_h):
         atlas_w, atlas_h = img.size
     alpha = np.asarray(img.getchannel("A"), dtype=np.float32) / 255.0
+    aliases, rest, rend, size = plan_atlas(font.boxes(alpha), font.point_size(), missing, source)
+    glyphs = [rend.render(c, size, pad, gradient, sdf, 1.0) for c in rest] if rend is not None else []
 
     # свободная полоса после занятых глифов (TMP1 — внизу картинки, TMP2 — вверху)
     rects = font.occupied_rects()
@@ -407,25 +504,26 @@ def patch_font(font: TmpFont, texture, materials: List, renderer: GlyphRenderer,
         raise RuntimeError("не удалось разместить глифы в атласе")
 
     for g in glyphs:
-        advance = mono if mono else g.advance
-        bearing_x = (mono - g.width) / 2 if mono else g.bearing_x
         if g.char not in placements:  # пробельный символ без картинки
-            font.add_glyph(g, 0, 0, atlas_h, advance, bearing_x)
+            font.add_glyph(g, 0, 0, atlas_h, g.advance, g.bearing_x)
             continue
         px, py = placements[g.char]
         bh, bw = g.bitmap.shape
         region = alpha[py:py + bh, px:px + bw]
         np.maximum(region, g.bitmap, out=region)
-        font.add_glyph(g, px + pad, py + pad, atlas_h, advance, bearing_x)
-
-    font.set_atlas_size(atlas_w, atlas_h)
-    a8 = Image.fromarray(np.round(alpha * 255).astype(np.uint8), "L")
-    rgba = Image.merge("RGBA", (a8, a8, a8, a8))
-    texture.set_image(rgba, target_format=texture.m_TextureFormat)
-    for mat_obj, mtree in materials:
-        _set_float(mtree, "_TextureHeight", float(atlas_h))
-        _set_float(mtree, "_TextureWidth", float(atlas_w))
-    return len(missing)
+        font.add_glyph(g, px + pad, py + pad, atlas_h, g.advance, g.bearing_x)
+    added = len(glyphs) + sum(1 for c, t in aliases.items() if font.add_alias(ord(c), ord(t)))
+    if not added:
+        return 0
+    if glyphs:
+        font.set_atlas_size(atlas_w, atlas_h)
+        a8 = Image.fromarray(np.round(alpha * 255).astype(np.uint8), "L")
+        rgba = Image.merge("RGBA", (a8, a8, a8, a8))
+        texture.set_image(rgba, target_format=texture.m_TextureFormat)
+        for mat_obj, mtree in materials:
+            _set_float(mtree, "_TextureHeight", float(atlas_h))
+            _set_float(mtree, "_TextureWidth", float(atlas_w))
+    return added
 
 
 def _floats(mtree: dict) -> list:
@@ -462,29 +560,49 @@ def _material_texture_id(mtree: dict) -> Optional[int]:
     return None
 
 
-def _source_has_cyrillic(font: TmpFont, objects_by_id: Dict[int, object]) -> bool:
-    """Есть ли кириллица в исходном TTF динамического TMP-шрифта (если его удаётся прочитать)."""
-    from ...fonts.cmap import has_cyrillic
+def _source_font(font: TmpFont, objects_by_id: Dict[int, object], patched: Dict[int, bytes]) -> Optional[bytes]:
+    """Исходный TTF TMP-шрифта, если он лежит в том же файле (уже дополненный кириллицей, если дополнялся)."""
     pptr = font.tree.get("m_SourceFontFile") or {}
-    obj = objects_by_id.get(int(pptr.get("m_PathID", 0))) if int(pptr.get("m_FileID", 0)) == 0 else None
+    if int(pptr.get("m_FileID", 0)) != 0:
+        return None
+    pid = int(pptr.get("m_PathID", 0))
+    if pid in patched:
+        return patched[pid]
+    obj = objects_by_id.get(pid)
     if obj is None:
-        return False
+        return None
     try:
-        data = bytes(getattr(obj.read(), "m_FontData", b"") or b"")
+        data = font_bytes(obj.read_typetree().get("m_FontData"))
     except Exception:  # noqa: BLE001
-        return False
-    return bool(data) and has_cyrillic(data)
+        return None
+    return data or None
 
 
-def patch_file(path: Path, gen, need: Set[str], renderer: GlyphRenderer, bold: GlyphRenderer,
-               write: Callable[[Path, bytes], None]) -> List[FontReport]:
-    """Починить все TMP-шрифты в одном файле ассетов. write(path, data) — запись с бэкапом."""
+def font_bytes(value) -> bytes:
+    """m_FontData из typetree (список байтов или bytes) -> bytes."""
+    if not value:
+        return b""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    return bytes(v & 0xFF for v in value)
+
+
+def font_list(data: bytes, like) -> object:
+    """bytes -> значение m_FontData того же вида, что было в typetree (список знаковых/беззнаковых байтов)."""
+    if isinstance(like, (bytes, bytearray, memoryview)):
+        return bytes(data)
+    signed = any(v < 0 for v in like[:4096]) if like else False
+    return [v - 256 if v > 127 else v for v in data] if signed else list(data)
+
+
+def patch_file(path: Path, gen, need: Set[str], write: Callable[[Path, bytes], None]) -> List[FontReport]:
+    """Дописать кириллицу во все шрифты одного файла ассетов. write(path, data) — запись с бэкапом."""
     with unitypy_io.load_assets(str(path)) as env:
-        return _patch_env(env, path, gen, need, renderer, bold, write)
+        return _patch_env(env, path, gen, need, write)
 
 
-def _patch_env(env, path: Path, gen, need: Set[str], renderer: GlyphRenderer, bold: GlyphRenderer,
-               write: Callable[[Path, bytes], None]) -> List[FontReport]:
+def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, bytes], None]) -> List[FontReport]:
+    from ...fonts import cyrillic
     if gen is not None:
         env.typetree_generator = gen
     reports: List[FontReport] = []
@@ -492,6 +610,7 @@ def _patch_env(env, path: Path, gen, need: Set[str], renderer: GlyphRenderer, bo
     fonts = []
     material_trees: Dict[int, Tuple] = {}
     legacy = []
+    ttf = []
     for obj in env.objects:
         try:
             if obj.type.name == "MonoBehaviour":
@@ -502,16 +621,45 @@ def _patch_env(env, path: Path, gen, need: Set[str], renderer: GlyphRenderer, bo
                 tree = obj.read_typetree()
                 if is_bitmap_font(tree):
                     legacy.append((obj, tree))
+                elif tree.get("m_FontData"):
+                    ttf.append((obj, tree))
             elif obj.type.name == "Material":
                 material_trees[obj.path_id] = (obj, obj.read_typetree())
         except Exception:  # noqa: BLE001
             continue
     objects_by_id = {o.path_id: o for o in env.objects}
+
+    # 1) обычные шрифты (TTF/OTF внутри ассета Font): кириллица дописывается в сам шрифт по его меркам —
+    #    ими рисуют UI Text, TextMesh, IMGUI и динамические шрифты TextMeshPro
+    patched: Dict[int, bytes] = {}
+    checks: List[Tuple[int, bool, FontReport]] = []        # что перепроверить после сохранения
+    for obj, tree in ttf:
+        rep = FontReport(path.name, str(tree.get("m_Name", "font")))
+        try:
+            data = font_bytes(tree["m_FontData"])
+            new = cyrillic.add_cyrillic(data, need)
+            if new is None:
+                continue
+            from ...fonts import sfnt
+            rep.added = len(cyrillic.missing(sfnt.Font(data), need))
+            tree["m_FontData"] = font_list(new, tree["m_FontData"])
+            obj.save_typetree(tree)
+            patched[obj.path_id] = new
+            changed = True
+            reports.append(rep)
+            checks.append((obj.path_id, False, rep))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Шрифт %s не дополнен: %s", rep.name, exc)
+            rep.error = str(exc)
+            reports.append(rep)
+
+    # 2) атласы TextMeshPro
     for obj, font in fonts:
         rep = FontReport(path.name, font.name)
         reports.append(rep)
         dynamic = font.is_dynamic()
-        if dynamic and _source_has_cyrillic(font, objects_by_id):
+        source = _source_font(font, objects_by_id, patched)
+        if dynamic and source is not None and all(ord(c) in _cmap_of(source) for c in need):
             continue  # динамический шрифт сам дорисует кириллицу из исходного TTF
         try:
             pptr = font.atlas_pptr() or {}
@@ -521,7 +669,7 @@ def _patch_env(env, path: Path, gen, need: Set[str], renderer: GlyphRenderer, bo
             tex_obj = objects_by_id[int(pptr["m_PathID"])]
             texture = tex_obj.read()
             mats = [(o, t) for pid, (o, t) in material_trees.items() if _material_texture_id(t) == tex_obj.path_id]
-            added = patch_font(font, texture, mats, renderer, bold, need, only_new_area=dynamic)
+            added = patch_font(font, texture, mats, need, source=source, only_new_area=dynamic)
             if not added:
                 continue
             obj.save_typetree(font.tree)
@@ -530,9 +678,12 @@ def _patch_env(env, path: Path, gen, need: Set[str], renderer: GlyphRenderer, bo
                 mobj.save_typetree(mtree)
             rep.added = added
             changed = True
+            checks.append((obj.path_id, True, rep))
         except Exception as exc:  # noqa: BLE001
             log.warning("TMP-шрифт %s не починен: %s", font.name, exc)
             rep.error = str(exc)
+
+    # 3) растровые шрифты (Font с готовой текстурой букв)
     for obj, tree in legacy:
         rep = FontReport(path.name, str(tree.get("m_Name", "font")))
         try:
@@ -540,13 +691,14 @@ def _patch_env(env, path: Path, gen, need: Set[str], renderer: GlyphRenderer, bo
             if int(pptr.get("m_FileID", 0)) != 0 or int(pptr.get("m_PathID", 0)) not in objects_by_id:
                 continue
             texture = objects_by_id[int(pptr["m_PathID"])].read()
-            added = patch_legacy_font(tree, texture, renderer, need)
+            added = patch_legacy_font(tree, texture, need)
             if added:
                 obj.save_typetree(tree)
                 texture.save()
                 rep.added = added
                 changed = True
                 reports.append(rep)
+                checks.append((obj.path_id, False, rep))
         except Exception as exc:  # noqa: BLE001
             log.warning("Растровый шрифт %s не починен: %s", rep.name, exc)
             rep.error = str(exc)
@@ -554,62 +706,54 @@ def _patch_env(env, path: Path, gen, need: Set[str], renderer: GlyphRenderer, bo
     if not changed:
         return reports
     data = env.file.save()
-    _verify(data, path, gen, [(obj.path_id, font) for obj, font in fonts], reports, need)
+    _verify(data, path, gen, checks, need)
     write(path, data)
     return reports
 
 
-def _verify(data: bytes, path: Path, gen, fonts: List[Tuple[int, TmpFont]], reports: List[FontReport],
-            need: Set[str]) -> None:
+def _cmap_of(data: bytes) -> Dict[int, int]:
+    from ...fonts import sfnt
+    try:
+        return sfnt.Font(data).cmap
+    except sfnt.FontError:
+        return {}
+
+
+def _verify(data: bytes, path: Path, gen, checks: List[Tuple[int, bool, FontReport]], need: Set[str]) -> None:
     """Перечитать сохранённый файл и убедиться, что каждый исправленный шрифт покрывает нужные символы.
 
-    Проверка обязана реально прочитать каждый изменённый шрифт и его атлас —
-    если что-то не читается, файл не записывается (лучше не тронуть игру,
-    чем записать непроверенное).
+    ``checks`` — (path_id объекта, это TMP-шрифт, отчёт) для каждого изменённого шрифта. Проверка
+    обязана реально прочитать каждый изменённый шрифт и его атлас — если что-то не читается, файл
+    не записывается (лучше не тронуть игру, чем записать непроверенное).
     """
     with unitypy_io.load_assets(data) as env:
         env.path = str(path.parent)  # внешние ссылки (скрипты шрифтов) — из папки игры
-        _verify_env(env, gen, fonts, reports, need)
+        _verify_env(env, gen, checks, need)
 
 
-def _verify_env(env, gen, fonts: List[Tuple[int, TmpFont]], reports: List[FontReport], need: Set[str]) -> None:
+def _verify_env(env, gen, checks: List[Tuple[int, bool, FontReport]], need: Set[str]) -> None:
     if gen is not None:
         env.typetree_generator = gen
     objects = {o.path_id: o for o in env.objects}
-    for obj in env.objects:
-        if obj.type.name != "Font":
-            continue
-        tree = obj.read_typetree()
-        rep = next((r for r in reports if r.name == tree.get("m_Name") and r.added), None)
-        if rep is None:
-            continue
-        have = {int(r["index"]) for r in tree.get("m_CharacterRects", [])}
-        rep.missing_after = [c for c in need if ord(c) not in have and not c.isspace()]
-        if rep.missing_after:
-            raise RuntimeError(f"проверка: в шрифте {rep.name} по-прежнему нет {''.join(rep.missing_after[:10])}")
-    for (pid, font), rep in zip(fonts, reports):
-        if not rep.added:
-            continue
+    for pid, is_tmp, rep in checks:
         obj = objects.get(pid)
         if obj is None:
             raise RuntimeError(f"проверка: шрифт {rep.name} пропал из файла")
-        fresh = TmpFont(obj.read_typetree())
-        rep.missing_after = [c for c in need if ord(c) not in fresh.chars() and not c.isspace()]
-        pptr = fresh.atlas_pptr() or {}
-        tex = objects[int(pptr["m_PathID"])].read()
-        w, h = fresh.atlas_size()
-        if (tex.m_Width, tex.m_Height) != (w, h) or tex.image.size != (w, h):
-            raise RuntimeError(f"проверка: размер атласа {rep.name} не совпадает с описанием шрифта")
+        tree = obj.read_typetree()
+        if is_tmp:
+            fresh = TmpFont(tree)
+            have = fresh.chars()
+            pptr = fresh.atlas_pptr() or {}
+            tex = objects[int(pptr["m_PathID"])].read()
+            w, h = fresh.atlas_size()
+            if (tex.m_Width, tex.m_Height) != (w, h) or tex.image.size != (w, h):
+                raise RuntimeError(f"проверка: размер атласа {rep.name} не совпадает с описанием шрифта")
+        else:
+            data = font_bytes(tree.get("m_FontData"))
+            have = set(_cmap_of(data)) if data else {int(r["index"]) for r in tree.get("m_CharacterRects", [])}
+        rep.missing_after = [c for c in need if ord(c) not in have and not c.isspace()]
         if rep.missing_after:
             raise RuntimeError(f"проверка: в шрифте {rep.name} по-прежнему нет {''.join(rep.missing_after[:10])}")
-
-
-def needed_chars(translations: Iterable[str]) -> Set[str]:
-    """Весь русский алфавит + все не-ASCII символы, реально встречающиеся в переводе."""
-    need = set(RUSSIAN) | set(EXTRA)
-    for t in translations:
-        need.update(ch for ch in t if ord(ch) > 127)
-    return need
 
 
 # ---------- растровые шрифты старого формата (UnityEngine.Font без TTF) ----------
@@ -618,8 +762,42 @@ def is_bitmap_font(tree: dict) -> bool:
     return isinstance(tree, dict) and not tree.get("m_FontData") and bool(tree.get("m_CharacterRects"))
 
 
-def patch_legacy_font(tree: dict, texture, renderer: GlyphRenderer, need: Iterable[str]) -> int:
-    """Дорисовать недостающие символы в растровый шрифт Unity (CharacterInfo + текстура)."""
+def legacy_boxes(tree: dict, alpha) -> Dict[str, "cyrillic.GlyphBox"]:
+    """Глифы растрового шрифта Unity: метрики «чернил» (vert — вместе с отступом m_CharacterPadding)."""
+    from ...fonts import cyrillic
+    H, W = alpha.shape
+    pad = float(tree.get("m_CharacterPadding") or 0)
+    out: Dict[str, cyrillic.GlyphBox] = {}
+    for r in tree["m_CharacterRects"]:
+        code = int(r["index"])
+        if not 0 < code < 0x110000:
+            continue
+        v, uv = r["vert"], r["uv"]
+        h = abs(float(v["height"]))
+        top = float(v["y"]) if float(v["height"]) < 0 else float(v["y"]) + float(v["height"])
+        mask = None
+        if not r.get("flipped"):
+            ya, yb = float(uv["y"]), float(uv["y"]) + float(uv["height"])
+            r0, r1 = int(round((1 - max(ya, yb)) * H)), int(round((1 - min(ya, yb)) * H))
+            x0 = int(round(float(uv["x"]) * W))
+            x1 = int(round((float(uv["x"]) + float(uv["width"])) * W))
+            crop = alpha[max(0, r0):r1, max(0, x0):x1] >= 0.5
+            mask = crop if crop.size and crop.any() else None
+        out[chr(code)] = cyrillic.GlyphBox(max(0.0, float(v["width"]) - 2 * pad), max(0.0, h - 2 * pad),
+                                           float(v["x"]) + pad, top - pad, float(r["advance"]), mask)
+    return out
+
+
+def _binary(alpha) -> bool:
+    """Буквы нарисованы без сглаживания (пиксельный шрифт): полутонов почти нет."""
+    ink = (alpha > 0.05).sum()
+    mid = ((alpha > 0.05) & (alpha < 0.95)).sum()
+    return ink > 0 and mid / ink < 0.03
+
+
+def patch_legacy_font(tree: dict, texture, need: Iterable[str]) -> int:
+    """Дорисовать недостающие символы в растровый шрифт Unity (CharacterInfo + текстура) — по меркам
+    его же букв; русские буквы, совпадающие с латинскими, берутся готовыми из текстуры."""
     import numpy as np
     from PIL import Image
 
@@ -631,18 +809,17 @@ def patch_legacy_font(tree: dict, texture, renderer: GlyphRenderer, need: Iterab
     img = texture.image
     W, H = img.size
     alpha = np.asarray(img.getchannel("A"), dtype=np.float32) / 255.0
+    boxes = legacy_boxes(tree, alpha)
+    caps = [b.top for c, b in boxes.items() if c in "HIEFTLNZ" and b.height > 0]
+    size = float(tree.get("m_FontSize") or 0) or (max(caps) / 0.7 if caps else 16.0)
+    pixel = 1.0 if _binary(alpha) else None
+    aliases, rest, rend, size = plan_atlas(boxes, size, missing, None, pixel)
+    glyphs = [rend.render(c, size, 1, 1.0, sdf=False, xscale=1.0) for c in rest] if rend is not None else []
+    if pixel:                                       # пиксельный шрифт — без полутонов, как буквы игры
+        for g in glyphs:
+            if g.bitmap.size:
+                g.bitmap = (g.bitmap >= 0.5).astype(np.float32)
     by_code = {int(r["index"]): r for r in rects}
-    ref = by_code.get(ord("H")) or rects[0]
-    cap = abs(float(ref["vert"]["height"])) - 2  # вместе с отступом 1 px с каждой стороны
-    size = max(6.0, cap / renderer.cap_ratio())
-    advs = [float(r["advance"]) for r in rects if 65 <= int(r["index"]) <= 122]
-    mono = advs[0] if advs and max(advs) - min(advs) < 0.5 else None
-    latin = "ABCDEFGHKLMNOPRSTUXYZabcdeghknopstuxyz"
-    orig = [float(by_code[ord(c)]["advance"]) for c in latin if ord(c) in by_code]
-    xscale = 1.0
-    if len(orig) >= 10:
-        xscale = max(0.55, min(1.3, (sum(orig) / len(orig)) / renderer.mean_advance(latin, size)))
-    glyphs = [renderer.render(c, size, 1, 1.0, sdf=False, xscale=xscale) for c in missing]
 
     def used_bottom_row() -> int:
         """Нижняя занятая строка текстуры (сверху вниз) по UV существующих символов."""
@@ -678,12 +855,11 @@ def patch_legacy_font(tree: dict, texture, renderer: GlyphRenderer, need: Iterab
     else:
         raise RuntimeError("не удалось разместить символы в текстуре шрифта")
 
-    template = copy.deepcopy(ref)
+    template = copy.deepcopy(by_code.get(ord("H")) or rects[0])
     for g in glyphs:
-        advance = mono if mono else round(g.advance)
         entry = copy.deepcopy(template)
         entry["index"] = ord(g.char)
-        entry["advance"] = float(advance)
+        entry["advance"] = float(round(g.advance))
         entry["flipped"] = False
         if g.char not in placements:
             entry["uv"] = {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0}
@@ -693,52 +869,63 @@ def patch_legacy_font(tree: dict, texture, renderer: GlyphRenderer, need: Iterab
             bh, bw = g.bitmap.shape
             region = alpha[py:py + bh, px:px + bw]
             np.maximum(region, g.bitmap, out=region)
-            bearing = (mono - g.width) / 2 if mono else g.bearing_x
             entry["uv"] = {"x": px / W, "y": 1 - py / H, "width": bw / W, "height": -bh / H}
-            entry["vert"] = {"x": float(round(bearing) - 1), "y": float(round(g.bearing_y) + 1),
+            entry["vert"] = {"x": float(round(g.bearing_x) - 1), "y": float(round(g.bearing_y) + 1),
                              "width": float(bw), "height": float(-bh)}
         rects.append(entry)
-    a8 = Image.fromarray(np.round(alpha * 255).astype(np.uint8), "L")
-    texture.set_image(Image.merge("RGBA", (a8, a8, a8, a8)), target_format=texture.m_TextureFormat)
-    return len(missing)
+    for c, t in aliases.items():
+        src = by_code.get(ord(t))
+        if src is not None:
+            entry = copy.deepcopy(src)
+            entry["index"] = ord(c)
+            rects.append(entry)
+    if glyphs:
+        a8 = Image.fromarray(np.round(alpha * 255).astype(np.uint8), "L")
+        texture.set_image(Image.merge("RGBA", (a8, a8, a8, a8)), target_format=texture.m_TextureFormat)
+    return len(glyphs) + len(aliases)
 
 
 # ---------- вся игра ----------
 
 def fix_game(files: Iterable[Path], gen, translations: Iterable[str], backup,
              status: Callable[[str, Optional[float]], None] = lambda m, f=None: None) -> Tuple[List[FontReport], List[str]]:
-    """Проверить все шрифты игры и дорисовать кириллицу в TMP-шрифты.
+    """Дописать кириллицу во все шрифты игры (TTF, TextMeshPro, растровые) по меркам каждого шрифта.
 
-    Возвращает (отчёты по TMP-шрифтам, проблемы, которые починить не удалось).
+    Возвращает (отчёты по шрифтам, проблемы, которые починить не удалось).
     """
     from ...fonts.cmap import codepoints
     from ...fonts.library import ensure_font
 
-    regular, bold = ensure_font(), ensure_font(bold=True)
+    regular = ensure_font()
     if regular is None:
-        return [], ["Встроенный шрифт PT Sans не найден — кириллица в TMP-шрифты не дорисована."]
+        return [], ["Встроенный шрифт PT Sans не найден — кириллица в шрифты игры не дорисована."]
     cover = codepoints(regular)
     need = needed_chars(translations)
     unsupported = sorted(c for c in need if ord(c) not in cover)
     need = {c for c in need if ord(c) in cover}
-    rend, rend_bold = GlyphRenderer(regular), GlyphRenderer(bold or regular)
     problems: List[str] = []
     if unsupported:
         problems.append("Символы, которых нет во встроенном шрифте, могут не отображаться: " + "".join(unsupported[:20]))
 
+    written: List[Path] = []
+
     def write(path: Path, data: bytes) -> None:
         backup.save_original(path)
         path.write_bytes(data)
+        written.append(path)
 
     reports: List[FontReport] = []
     files = list(files)
     for i, f in enumerate(files):
         status(f"Проверка шрифтов: {f.name}", i / max(1, len(files)))
         try:
-            reports += patch_file(f, gen, need, rend, rend_bold, write)
+            reports += patch_file(f, gen, need, write)
         except Exception as exc:  # noqa: BLE001
             log.warning("Шрифты в %s не исправлены: %s", f.name, exc)
             problems.append(f"{f.name}: шрифты не исправлены ({exc})")
+    if written:
+        from . import addressables
+        addressables.disable_crc(written, backup)   # изменённый бандл Addressables не прошёл бы проверку CRC
     for r in reports:
         if r.error:
             problems.append(f"Шрифт {r.name} ({r.file}): {r.error}")

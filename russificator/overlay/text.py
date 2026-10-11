@@ -20,6 +20,8 @@ import re
 from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from ..translation.filters import is_brand  # noqa: F401 — названия движков, площадок, соцсетей
+
 
 @dataclass
 class Line:
@@ -161,23 +163,6 @@ def without_junk(text: str) -> str:
     return re.sub(r"\s{2,}", " ", "".join(out)).strip()
 
 
-#: заставки движков и технологий — названия, их не переводим
-_BRANDS = re.compile(r"(?i)^(?:made with|powered by|created with|built with|a game by|presented by)?\s*"
-                     r"(?:unity(?: technologies)?|unreal(?: engine)?|godot(?: engine)?|gamemaker(?: studio)?|"
-                     r"rpg maker(?: m[vz]| vx(?: ace)?| xp)?|ren'?py|fmod(?: studio)?|wwise|havok|nvidia|amd|"
-                     r"intel|directx|vulkan|opengl|steam(?:works)?|epic games|xbox|playstation|nintendo(?: switch)?|"
-                     r"physx|bink(?: video)?|speedtree|dolby(?: atmos)?|"
-                     # площадки и соцсети — ссылки в меню игр («Patreon», «Discord»): это названия
-                     r"patreon|discord|twitter|youtube|twitch|itch(?:\.io)?|kickstarter|reddit|tiktok|instagram|"
-                     r"facebook|bluesky|ko-?fi|tumblr|github|gog(?:\.com)?|boosty|telegram|vk|x\.com)?\s*[™®©]?$")
-
-
-def is_brand(text: str) -> bool:
-    """Строка — название движка, площадки или соцсети («Made with Unity», «Discord», «Patreon»)."""
-    t = re.sub(r"\s+", " ", (text or "").strip())
-    return bool(t) and bool(_BRANDS.match(t)) and bool(re.search(r"[A-Za-z]{3,}", t))
-
-
 def misread_cyrillic(text: str, words: Optional[Set[str]] = None) -> bool:
     """Похоже ли на русский текст, прочитанный английским распознаванием (абракадабра латиницей).
 
@@ -300,7 +285,7 @@ def normalize(text: str) -> str:
     return t.strip()
 
 
-def group_lines(lines: List[Line], apart=None) -> List[Block]:
+def group_lines(lines: List[Line], apart=None, same_size=None) -> List[Block]:
     """Склеить строки в абзацы: близко по вертикали, похожая высота, общий край или центр.
 
     Промежуток между абзацами заметно больше, чем между строками одного абзаца, — граница
@@ -322,11 +307,13 @@ def group_lines(lines: List[Line], apart=None) -> List[Block]:
             if gap < -h * 0.5:
                 continue
             gaps = b["gaps"]
-            limit = min(0.9 * h, 2 * sorted(gaps)[len(gaps) // 2] + 0.1 * h) if gaps else 0.6 * h
+            # рамки распознавания разной высоты (заглавные, хвосты букв) — промежутки «прыгают» на
+            # несколько пикселей: меньше трети строки абзацы не разделяет никто
+            limit = min(0.9 * h, max(2 * sorted(gaps)[len(gaps) // 2] + 0.1 * h, 0.3 * h)) if gaps else 0.6 * h
             if gap > limit:
                 continue
-            if max(last.h, ln.h) / max(1, min(last.h, ln.h)) > 1.35:
-                continue
+            if max(last.h, ln.h) / max(1, min(last.h, ln.h)) > 1.35 and not (same_size and same_size(last, ln)):
+                continue                    # другой размер шрифта (рамку мог раздуть значок — сверяем буквы)
             if list_break(last, ln):
                 continue                    # пункты меню или списка, а не перенос строки абзаца
             if apart is not None and apart(last, ln):
@@ -635,7 +622,10 @@ class TranslationCache:
             return self.items[alias]
         if len(key) < 6 or key in self._miss:
             return None
-        cands = [k for k in self.items if abs(len(k) - len(key)) <= max(3, len(key) // 10)]
+        # похожий ключ — только с теми же числами: «HP 99/120» не должно показаться переводом «HP 100/120»
+        digits = re.findall(r"\d+", key)
+        cands = [k for k in self.items if abs(len(k) - len(key)) <= max(3, len(key) // 10)
+                 and re.findall(r"\d+", k) == digits]
         best = difflib.get_close_matches(key, cands, n=1, cutoff=0.92)
         if best:
             self._alias[key] = best[0]
@@ -650,3 +640,69 @@ class TranslationCache:
             self._alias.clear()
         self.items[key] = value
         self._miss.clear()
+
+
+_NUM = re.compile(r"(?<!\d)\d+(?:[.,:/]\d+)*(?!\d)")
+
+
+class NumberTemplates:
+    """Переводы фраз с числами как шаблоны: счётчики, таймеры, очки, «60 FPS», «HP 99/120»
+    меняются каждую секунду — фраза с другими числами собирается из готового перевода, а не
+    переводится заново (переводчик не занят счётчиком, пока ждут реплики). Шаблон получается,
+    только если каждое число оригинала ровно один раз стоит в переводе."""
+
+    MARK = "\x01"
+
+    def __init__(self, limit: int = 2000):
+        self.limit = limit
+        self.items: Dict[str, str] = {}
+
+    @staticmethod
+    def shape(src: str) -> str:
+        return normalize(_NUM.sub(" 0 ", src))
+
+    def learn(self, src: str, tr: str, skip: str = "") -> None:
+        nums = _NUM.findall(src or "")
+        if not nums or len(nums) > 8:
+            return
+        shape = self.shape(src)
+        if skip and tr == skip:
+            self._put(shape, skip)               # непереводимое (коды, «60 FPS») — и с другими числами тоже
+            return
+        if len(set(nums)) != len(nums):
+            return                               # одинаковые числа («1/1») — не понять, где какое
+        spans = []
+        for n in nums:
+            found = list(re.finditer(rf"(?<!\d){re.escape(n)}(?!\d)", tr))
+            if len(found) != 1:
+                return
+            spans.append((found[0].start(), found[0].end()))
+        order = sorted(range(len(spans)), key=lambda i: spans[i][0])
+        if any(spans[order[k]][1] > spans[order[k + 1]][0] for k in range(len(order) - 1)):
+            return
+        out, pos = [], 0
+        for i in order:
+            a, b = spans[i]
+            out.append(tr[pos:a] + f"{self.MARK}{i}{self.MARK}")
+            pos = b
+        out.append(tr[pos:])
+        self._put(shape, "".join(out))
+
+    def fill(self, src: str, skip: str = "") -> Optional[str]:
+        nums = _NUM.findall(src or "")
+        if not nums:
+            return None
+        tpl = self.items.get(self.shape(src))
+        if tpl is None:
+            return None
+        if skip and tpl == skip:
+            return skip
+        if tpl.count(self.MARK) != 2 * len(nums):
+            return None
+        return re.sub(rf"{self.MARK}(\d+){self.MARK}", lambda m: nums[int(m.group(1))], tpl)
+
+    def _put(self, shape: str, value: str) -> None:
+        if len(self.items) >= self.limit:
+            for k in list(self.items)[: self.limit // 4]:
+                del self.items[k]
+        self.items[shape] = value

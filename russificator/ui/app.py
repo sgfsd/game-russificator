@@ -160,11 +160,13 @@ class Api:
         }
 
     def _presets(self) -> List[Dict[str, Any]]:
+        from .. import net
         from ..translation import local_llm
         return [{
             "id": p.id, "title": p.title, "description": p.description, "size_gb": p.size_gb,
             "min_ram_gb": p.min_ram_gb, "good_vram_gb": p.good_vram_gb,
             "installed": local_llm.model_installed(p),
+            "partial": 0 if local_llm.model_installed(p) else net.partial_bytes(local_llm.model_path(p)),
         } for p in local_llm.PRESETS]
 
     def hardware(self) -> Dict[str, Any]:
@@ -321,19 +323,61 @@ class Api:
         return self._run_task("download", work)
 
     def download_local(self, preset_id: str) -> Dict[str, Any]:
+        from .. import net
         from ..translation import local_llm
 
         def work():
             task = f"local:{preset_id}"
             report = (lambda m, f=None: self._emit({"type": "download", "task": task, "message": m, "fraction": f}))
+            note = (lambda m: self._emit({"type": "download", "task": task, "note": m, "final": True}))
             try:
-                local_llm.install_runtime(report, self._cancel)
-                local_llm.install_model(local_llm.PRESET_BY_ID[preset_id], report, self._cancel)
+                local_llm.install_runtime(report, self._cancel, notes=note)
+                local_llm.install_model(local_llm.PRESET_BY_ID[preset_id], report, self._cancel, notes=note)
                 self._emit({"type": "download", "task": task, "done": True, "final": True,
                             "message": "Модель установлена"})
             except Exception as exc:  # noqa: BLE001
-                self._emit({"type": "download", "task": task, "error": _err(exc), "final": True})
+                log.warning("загрузка %s не удалась: %s", task, exc)
+                partial = net.partial_bytes(local_llm.model_path(local_llm.PRESET_BY_ID[preset_id]))
+                self._emit({"type": "download", "task": task, "error": _err(exc), "final": True,
+                            "cancelled": exc.__class__.__name__ == "Cancelled", "partial": partial,
+                            "log": str(net.download_log()),
+                            "urls": local_llm.PRESET_BY_ID[preset_id].urls})
         return self._run_task("download", work)
+
+    def import_local_model(self, preset_id: str) -> Dict[str, Any]:
+        """Поставить модель из .gguf, скачанного вручную (браузером, у друга, с флешки)."""
+        import webview
+        from ..translation import local_llm
+        preset = local_llm.PRESET_BY_ID.get(preset_id)
+        if preset is None:
+            return {"ok": False, "error": "Неизвестная модель."}
+        res = self._window.create_file_dialog(webview.FileDialog.OPEN, file_types=("Модель GGUF (*.gguf)",
+                                                                                   "Все файлы (*.*)"))
+        if not res:
+            return {"ok": False}
+        src = Path(res[0])
+
+        def work():
+            task = f"local:{preset_id}"
+            report = (lambda m, f=None: self._emit({"type": "download", "task": task, "message": m, "fraction": f}))
+            try:
+                local_llm.import_model(preset, src, report, self._cancel)
+                note = (lambda m: self._emit({"type": "download", "task": task, "note": m, "final": True}))
+                local_llm.install_runtime(report, self._cancel, notes=note)
+                self._emit({"type": "download", "task": task, "done": True, "final": True,
+                            "message": "Модель установлена"})
+            except Exception as exc:  # noqa: BLE001
+                self._emit({"type": "download", "task": task, "error": _err(exc), "final": True,
+                            "cancelled": exc.__class__.__name__ == "Cancelled"})
+        return self._run_task("download", work)
+
+    def open_download_log(self) -> None:
+        from .. import net
+        f = net.download_log()
+        if f.is_file():
+            _open_path(f)
+        else:
+            _open_path(paths.logs_dir())
 
     def cancel_task(self) -> None:
         self._cancel.set()
@@ -525,6 +569,10 @@ class Api:
             snap["scanning"] = True
         return snap
 
+    def library_status(self, path: str) -> Dict[str, Any]:
+        """Перечитать состояние игры с диска (открыли её карточку); окну уходит ``game_status``."""
+        return {"ok": True, "game": self._library.refresh_status(path)}
+
     def library_add(self, path: str = "") -> Dict[str, Any]:
         """Добавить игру вручную (папка — корень игры)."""
         if not path:
@@ -538,18 +586,68 @@ class Api:
         root = find_root(p)
         if root is not None and (root in p.parents or root.parent == p):
             p = root                            # выбрали папку внутри игры или над ней — берём корень игры
-        manual = [m for m in self._cfg.get("library_manual") or [] if Path(m) != p] + [str(p)]
-        hidden = [h for h in self._cfg.get("library_hidden") or [] if Path(h) != p]
+        from ..library import _norm
+        key = _norm(p)
+        manual = [m for m in self._cfg.get("library_manual") or [] if _norm(Path(m)) != key] + [str(p)]
+        hidden = [h for h in self._cfg.get("library_hidden") or [] if _norm(Path(h)) != key]
         self._cfg.update(library_manual=manual, library_hidden=hidden)
         settings.save(self._cfg)
         return {"ok": True, "game": self._library.add(str(p))}
 
+    def library_forget(self, path: str) -> Dict[str, Any]:
+        """Убрать вручную добавленную папку совсем (не игра, ошиблись папкой)."""
+        from ..library import _norm
+        key = _norm(Path(path))
+        for k in ("library_manual", "library_hidden"):
+            self._cfg[k] = [m for m in self._cfg.get(k) or [] if _norm(Path(m)) != key]
+        settings.save(self._cfg)
+        self._library.forget(path)
+        return {"ok": True}
+
     def library_hide(self, path: str) -> Dict[str, Any]:
-        p = Path(path)
-        self._cfg["library_manual"] = [m for m in self._cfg.get("library_manual") or [] if Path(m) != p]
-        self._cfg["library_hidden"] = list(dict.fromkeys((self._cfg.get("library_hidden") or []) + [str(p)]))
+        """Скрыть игру: она уходит во вкладку «Скрытые» (и вручную добавленная тоже — её папка
+        остаётся в списке, чтобы игру можно было вернуть одной кнопкой, без поиска папки)."""
+        from ..library import _norm
+        key = _norm(Path(path))
+        hidden = [h for h in self._cfg.get("library_hidden") or [] if _norm(Path(h)) != key]
+        self._cfg["library_hidden"] = hidden + [str(Path(path))]
         settings.save(self._cfg)
         return {"ok": True}
+
+    def library_unhide(self, path: str) -> Dict[str, Any]:
+        from ..library import _norm
+        key = _norm(Path(path))
+        self._cfg["library_hidden"] = [h for h in self._cfg.get("library_hidden") or [] if _norm(Path(h)) != key]
+        settings.save(self._cfg)
+        return {"ok": True}
+
+    def library_cover(self, path: str, reset: bool = False) -> Dict[str, Any]:
+        """Своя обложка игры (выбрать картинку) или вернуть обычную (``reset``)."""
+        from ..library import _norm
+        from .games import cover_data, covers_dir, save_cover
+        key = _norm(Path(path))
+        covers = {p: f for p, f in (self._cfg.get("library_covers") or {}).items() if _norm(Path(p)) != key}
+        old = [f for p, f in (self._cfg.get("library_covers") or {}).items() if _norm(Path(p)) == key]
+        data = ""
+        if not reset:
+            import webview
+            res = self._window.create_file_dialog(
+                webview.FileDialog.OPEN,
+                file_types=("Картинки (*.jpg;*.jpeg;*.png;*.webp;*.bmp;*.gif)", "Все файлы (*.*)"))
+            if not res:
+                return {"ok": False}
+            try:
+                name = save_cover(Path(res[0]), Path(path))
+            except (ValueError, OSError) as exc:
+                return {"ok": False, "error": str(exc)}
+            covers[str(Path(path))] = name
+            data = cover_data(name)
+        else:
+            for f in old:
+                (covers_dir() / f).unlink(missing_ok=True)
+        self._cfg["library_covers"] = covers
+        settings.save(self._cfg)
+        return {"ok": True, "cover": data}
 
     def library_folders(self) -> List[str]:
         return list(self._cfg.get("library_folders") or [])
@@ -803,10 +901,49 @@ class Api:
         from .. import play
         return play._game_exe(game)
 
+    # ---------- полнота перевода (Unity) ----------
+
+    def coverage_last(self, path: str) -> Dict[str, Any]:
+        """Последний отчёт о полноте перевода и сколько строк найдено во время игры сейчас."""
+        from ..core.pipeline import project_dir
+        from ..engines.unity import coverage
+        game = Path(path)
+        work = project_dir(game)
+        return {"ok": True, "report": coverage.last_report(work), "missed": len(coverage.missed(game, work))}
+
+    def coverage_check(self, path: str) -> Dict[str, Any]:
+        """Найти, где в файлах игры лежат строки, пропущенные при русификации (фоном; итог — событием)."""
+        from ..core.pipeline import project_dir
+        from ..engines.unity import coverage
+        game = Path(path)
+        if not game.is_dir():
+            return {"ok": False, "error": "Папка игры не найдена."}
+
+        def work():
+            status = (lambda m, f=None: self._emit({"type": "coverage", "message": m, "fraction": f}))
+            try:
+                rep = coverage.diagnose(game, project_dir(game), status)
+                self._emit({"type": "coverage_done", "ok": True, "report": rep, "final": True})
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Проверка полноты не удалась")
+                self._emit({"type": "coverage_done", "ok": False, "error": _err(exc), "final": True})
+        return self._run_task("coverage", work)
+
+    def open_file(self, path: str) -> None:
+        p = Path(path)
+        if p.is_file():
+            _open_path(p)
+
     def restore(self, path: str) -> Dict[str, Any]:
         from ..core.restore import restore_backups
         if self._task is not None and self._task.is_alive():
             return {"ok": False, "error": "Дождитесь окончания текущей операции."}
+        try:   # найденное во время игры — в проект: откат удалит его вместе с файлами русификатора
+            from ..core.pipeline import project_dir
+            from ..engines.unity import coverage
+            coverage.harvest(Path(path), project_dir(Path(path)))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("найденное во время игры не сохранено: %s", exc)
         try:
             count, notes = restore_backups(Path(path))
             self._library.refresh_status(path)
@@ -842,6 +979,11 @@ def _fresh_webview_cache(storage: Path) -> None:
 
 def _setup_logging() -> None:
     log_file = paths.logs_dir() / "russificator.log"
+    try:                                       # журнал прошлого запуска не стираем — в нём бывает ответ
+        if log_file.is_file() and log_file.stat().st_size:
+            log_file.replace(log_file.with_name("russificator.prev.log"))
+    except OSError:
+        pass
     handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()

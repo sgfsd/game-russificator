@@ -67,9 +67,12 @@ FRAMEWORK_PREFIXES = ("UnityEngine", "Unity.", "System", "Mono.", "mscorlib", "n
 ProgressFn = Callable[[str, Optional[float]], None]
 
 #: явно технические строки (имена типов, пути шейдеров, форматы дат, теги логов)
+#: клавиша в подсказке «[E] to interact», «[Space] Jump» — это текст, а не метка журнала «[Info]»
+_KEY_HINT = (r"(?:[A-Za-z0-9]|Space|Esc|Escape|Tab|Shift|Ctrl|Alt|Enter|Return|Backspace|Del|LMB|RMB|MMB|"
+             r"F\d{1,2}|Mouse ?\d|Left Click|Right Click|Up|Down|Left|Right)")
 _TECH_RE = re.compile(r"PublicKeyToken|Version=\d|Culture=|\bUnityEngine\.|\bSystem\.[A-Z]|^Hidden/|"
-                      r"^[\w\- ]+/[\w\- ]+/|yyyy|HH:mm|^\[[\w. ]+\]|NullReference|Exception\b|"
-                      r"\bshaders?\b|\.cs\b|\bdebug\b|\bSteamworks\b", re.I)
+                      r"^[\w\- ]+/[\w\- ]+/|yyyy|HH:mm|^\[(?!" + _KEY_HINT + r"\])[\w. ]+\]|NullReference|"
+                      r"Exception\b|\bshaders?\b|\.cs\b|\bdebug\b|\bSteamworks\b", re.I)
 
 
 def _noop(message: str, fraction: Optional[float] = None) -> None:
@@ -93,9 +96,16 @@ class _Collector:
         self.ui: List[dict] = []           # компоненты текста: путь в сцене, размер шрифта (для resizer)
         self.prefixes: List[str] = []      # подписи из кода, к которым игра приклеивает текст («Pro Tip: »)
         self.pages: List[Entry] = []       # фразы страниц встроенного браузера
+        #: все встреченные строки до отбора -> где встретились (только для проверки полноты перевода)
+        self.seen: Optional[Dict[str, str]] = None
+
+    def see(self, text: str, origin: str) -> None:
+        if self.seen is not None and isinstance(text, str) and text.strip() and len(text) <= 20000:
+            self.seen.setdefault(text, origin)
 
     def add(self, text: str, kind: TextKind, origin: str) -> None:
         # текст не нормализуем: ключ XUnity должен совпасть с тем, что игра выводит на экран
+        self.see(text, origin)
         if not text.strip() or len(text) > MAX_TEXT or _TECH_RE.search(text) or looks_technical(text):
             return
         prev = self.items.get(text)
@@ -128,10 +138,27 @@ def serialized_files(game: UnityGame) -> List[Path]:
             files.append(p)
     sa = data / "StreamingAssets"
     if sa.is_dir():
-        for p in sa.rglob("*"):
-            if p.is_file() and p.stat().st_size > 64 and _is_bundle(p):
-                files.append(p)
+        bundles = [p for p in sa.rglob("*") if p.is_file() and p.stat().st_size > 64 and _is_bundle(p)]
+        files += [p for p in bundles if not _foreign_bundle(p, bundles)]
     return files
+
+
+def _foreign_bundle(path: Path, bundles: List[Path]) -> bool:
+    """Бандл таблицы строк другого языка (пакет Unity Localization кладёт каждый язык в свой бандл:
+    ``…string-tables-danish(denmark)(da-dk)…``) — если рядом есть такой же английский. Иначе в словарь
+    попал бы датский или португальский текст, «переведённый» как английский."""
+    toks = _lang_tokens(re.sub(r"[()\[\]]", "_", path.stem))
+    hit = [i for i, t in enumerate(toks) if t in _LANGS]
+    if not hit or any(t in _ENGLISH for t in toks) or hit[0] < 1:
+        return False
+    prefix = toks[:hit[0]]
+    for other in bundles:
+        if other.parent != path.parent or other == path:
+            continue
+        ot = _lang_tokens(re.sub(r"[()\[\]]", "_", other.stem))
+        if ot[:len(prefix)] == prefix and any(t in _ENGLISH for t in ot[len(prefix):]):
+            return True
+    return False
 
 
 def _is_bundle(path: Path) -> bool:
@@ -186,6 +213,7 @@ def extract_assets(game: UnityGame, col: _Collector, warnings: List[str], progre
                 env.typetree_generator = gen
             scene = f.name.lower().startswith("level")
             trees = _TreeCache()
+            text_assets_found: List[object] = []
             for obj in env.objects:
                 tname = obj.type.name
                 try:
@@ -207,16 +235,52 @@ def extract_assets(game: UnityGame, col: _Collector, warnings: List[str], progre
                     elif tname == "TextMesh":
                         tree = obj.read_typetree()
                         val = tree.get("m_Text")
+                        col.see(val, f.name)
                         if isinstance(val, str) and looks_translatable(val):
                             col.add(val, TextKind.UI, f.name)
                     elif tname == "TextAsset":
-                        _from_text_asset(obj, col, f.name)
+                        text_assets_found.append(obj)
+                except Exception:  # noqa: BLE001
+                    continue
+            for obj in _drop_foreign_text_assets(text_assets_found):
+                try:
+                    _from_text_asset(obj, col, f.name)
                 except Exception:  # noqa: BLE001
                     continue
         finally:
             unitypy_io.release(env)   # файлы игры не остаются открытыми
         if has_font:
             col.font_files.append(f)
+
+
+#: ассеты с именами людей (титры, спонсоры, тестеры) — имена не переводятся
+NAMES_ASSET_RE = re.compile(r"credit|patron|tester|supporter|backer|sponsor|thank|translator|contributor|donor", re.I)
+
+
+def _asset_name(obj) -> str:
+    try:
+        return str(obj.peek_name() or "")
+    except Exception:  # noqa: BLE001
+        try:
+            return str(obj.read().m_Name or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+
+def _drop_foreign_text_assets(objs: List[object]) -> List[object]:
+    """Текстовые ассеты без таблиц других языков: игры кладут локализацию ассетами «English», «French»,
+    «Chinese Simplified»… — переводить нужно английскую, остальные в словаре только мешают (французский
+    текст «переводился бы» как английский). Чужой язык отбрасывается, только если английский рядом есть."""
+    named = [(o, _lang_tokens(re.sub(r"[(),\[\]]", " ", _asset_name(o)))) for o in objs]
+    if not any(t and set(t) & _ENGLISH for _, t in named):
+        return objs
+    out = []
+    for o, toks in named:
+        if toks and set(toks) <= (_LANGS | {"simplified", "traditional", "brazilian", "portugal", "brazil",
+                                            "latin", "american", "spain", "mexico", "chinese"})                 and not set(toks) & _ENGLISH:
+            continue
+        out.append(o)
+    return out
 
 
 def _from_text_asset(obj, col: _Collector, origin: str) -> None:
@@ -233,7 +297,9 @@ def _from_text_asset(obj, col: _Collector, origin: str) -> None:
     text = text_assets.decode(raw)
     if text:
         name = getattr(data, "m_Name", "") or ""
-        text_assets.extract(text, lambda s: col.add(s, TextKind.OTHER, f"{origin}:{name}"))
+        where = f"{origin}:{name}"
+        text_assets.extract(text, lambda s: col.add(s, TextKind.OTHER, where), lambda s: col.see(s, where),
+                            tables=not NAMES_ASSET_RE.search(name))
 
 
 def _from_monobehaviour(tree: dict, col: _Collector, origin: str) -> Optional[str]:
@@ -241,6 +307,7 @@ def _from_monobehaviour(tree: dict, col: _Collector, origin: str) -> Optional[st
     for field, marker in TEXT_COMPONENT_FIELDS.items():
         val = tree.get(field)
         if isinstance(val, str) and (marker in tree or (field == "mText" and NGUI_ALT in tree)):
+            col.see(val, origin)
             if looks_translatable(val):
                 col.add(val, TextKind.UI, origin)
             return field
@@ -262,12 +329,14 @@ def _walk_strings(node, col: _Collector, origin: str, depth: int, field: str = "
             if k in SKIP_FIELDS:
                 continue
             if isinstance(v, str):
+                col.see(v, origin)
                 _maybe_add(v, k, col, origin)
             elif isinstance(v, (dict, list)):
                 _walk_strings(v, col, origin, depth + 1, k)
     elif isinstance(node, list):
         for v in node[:5000]:
             if isinstance(v, str):
+                col.see(v, origin)
                 _maybe_add(v, field, col, origin)
             elif isinstance(v, (dict, list)):
                 _walk_strings(v, col, origin, depth + 1, field)
@@ -312,6 +381,8 @@ def _from_raw(obj, col: _Collector, origin: str) -> None:
         return
     # заголовок MonoBehaviour: m_GameObject, m_Enabled, m_Script, затем m_Name — имя объекта не переводим
     for off, s in raw_strings(data, 0):
+        if off > 32:
+            col.see(s, origin)
         if off <= 32 or not looks_translatable(s, strict=True):
             continue
         if looks_like_sentence(s) or _ui_word(s) or _chat_line(s):
@@ -504,6 +575,7 @@ def extract_code_strings(game: UnityGame, col: _Collector, warnings: List[str]) 
                 warnings.append("global-metadata.dat зашифрован или нестандартный — строки из кода "
                                 "переведутся в игре на лету.")
     for s in strings:
+        col.see(s, "code")
         if looks_translatable(s, strict=True) and (looks_like_sentence(s) or _ui_word(s)):
             col.add(s, TextKind.OTHER, "code")
             if _PREFIX_RE.fullmatch(s) and s not in col.prefixes and len(col.prefixes) < 300:
@@ -579,11 +651,108 @@ def extract_browser_pages(game: UnityGame, col: _Collector, progress: ProgressFn
                                        scene=name))
 
 
+# ---------- текстовые файлы рядом с ассетами ----------
+
+#: расширения текстовых данных, которые игры кладут файлами в StreamingAssets: описания предметов,
+#: таблицы локализации, диалоги (Ink, Yarn), JSON/CSV/XML с текстом
+LOOSE_TEXT_EXT = {".json", ".csv", ".tsv", ".txt", ".xml", ".yaml", ".yml", ".ink", ".yarn", ".lang", ".loc",
+                  ".strings", ".dialog", ".dlg"}
+#: сколько файлов и байт читать (на случай игр с тысячами служебных файлов)
+LOOSE_MAX_FILES = 5000
+LOOSE_MAX_BYTES = 256 * 1024 * 1024
+#: названия языков в путях файлов локализации
+_LANGS = {"fr", "fre", "french", "francais", "de", "ger", "german", "deutsch", "es", "spa", "spanish", "espanol",
+          "it", "ita", "italian", "pt", "por", "portuguese", "br", "brazilian", "ptbr", "pl", "pol", "polish",
+          "tr", "tur", "turkish", "ja", "jp", "jpn", "japanese", "ko", "kr", "kor", "korean", "koreana", "zh",
+          "cn", "chs", "cht", "chinese", "schinese", "tchinese", "zhcn", "zhtw", "tw", "ru", "rus", "russian",
+          "uk", "ua", "ukrainian", "nl", "dutch", "sv", "swedish", "no", "norwegian", "da", "danish", "fi",
+          "finnish", "cs", "czech", "hu", "hungarian", "ro", "romanian", "th", "thai", "vi", "vietnamese", "id",
+          "indonesian", "ar", "arabic", "he", "hebrew", "el", "greek", "latam", "mx"}
+_ENGLISH = {"en", "eng", "english", "enus", "engb"}
+
+
+def _lang_tokens(name: str) -> List[str]:
+    return [t for t in re.split(r"[\s_.\-]+", name.lower().replace("en-us", "enus").replace("zh-cn", "zhcn")
+                                .replace("zh-tw", "zhtw").replace("pt-br", "ptbr").replace("en-gb", "engb")) if t]
+
+
+def _foreign_language(path: Path) -> bool:
+    """Файл другого языка игры (``fr.json``, ``strings_de.csv``, ``Localization/ja/…``) — только если
+    рядом есть такой же английский: иначе ``item_id.json`` приняли бы за индонезийский."""
+    parent = path.parent
+    pname = parent.name.lower()
+    if pname in _LANGS and any((parent.parent / e).is_dir() for e in _ENGLISH | {"English", "EN", "En"}):
+        return True
+    toks = _lang_tokens(path.stem)
+    if toks and toks[-1] in _LANGS:
+        base = re.sub(r"[\s_.\-]*[A-Za-z]+$", "", path.stem)        # «strings_fr» -> «strings»
+        try:
+            siblings = [p for p in parent.iterdir() if p.suffix.lower() == path.suffix.lower()]
+        except OSError:
+            return False
+        for p in siblings:
+            st = _lang_tokens(p.stem)
+            if st and st[-1] in _ENGLISH and p.stem.lower().startswith(base.lower()):
+                return True
+    return False
+
+
+def loose_text_files(game: UnityGame) -> List[Path]:
+    """Текстовые файлы данных игры в StreamingAssets (без каталога Addressables и бандлов)."""
+    sa = game.data / "StreamingAssets"
+    if not sa.is_dir():
+        return []
+    out: List[Path] = []
+    total = 0
+    for p in sorted(sa.rglob("*")):
+        if len(out) >= LOOSE_MAX_FILES or total >= LOOSE_MAX_BYTES:
+            break
+        try:
+            rel = p.relative_to(sa).parts
+        except ValueError:
+            continue
+        if not p.is_file() or p.suffix.lower() not in LOOSE_TEXT_EXT or (rel and rel[0].lower() == "aa"):
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        if size < 8 or size > 8 * 1024 * 1024 or _foreign_language(p):
+            continue
+        out.append(p)
+        total += size
+    return out
+
+
+def extract_loose_files(game: UnityGame, col: _Collector) -> int:
+    """Текст из файлов данных в StreamingAssets: описания предметов, таблицы локализации, диалоги.
+
+    Игра читает такой файл сама и выводит строку как есть — XUnity найдёт её перевод в словаре. Файлы
+    игры не меняются. Возвращает, сколько файлов дали текст."""
+    from . import text_assets
+    sa = game.data / "StreamingAssets"
+    used = 0
+    for p in loose_text_files(game):
+        try:
+            text = text_assets.decode(p.read_bytes())
+        except OSError:
+            continue
+        if not text:
+            continue
+        before = len(col.items)
+        origin = "StreamingAssets/" + p.relative_to(sa).as_posix()
+        text_assets.extract(text, lambda s, o=origin: col.add(s, TextKind.OTHER, o), lambda s, o=origin: col.see(s, o))
+        used += len(col.items) > before
+    return used
+
+
 def extract_all(game: UnityGame, progress: ProgressFn = _noop) -> Tuple[List[Entry], List[str], "_Collector"]:
     """Вернуть (строки, предупреждения, сборщик: шрифты, компоненты для resizer, подписи из кода)."""
     warnings: List[str] = []
     col = _Collector()
     extract_assets(game, col, warnings, progress)
+    progress("Текстовые файлы игры…", None)
+    extract_loose_files(game, col)
     progress("Строки из кода игры…", None)
     extract_code_strings(game, col, warnings)
     extract_browser_pages(game, col, progress)

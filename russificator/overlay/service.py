@@ -138,6 +138,7 @@ class LiveService:
         self.target_reason = ""
         self.region: Tuple[int, int, int, int] = (0, 0, 0, 0)
         self.cache = TranslationCache()                      # переводы предложений в этой сессии
+        self.numbers = text.NumberTemplates()                # они же шаблонами — для фраз с числами
         self.book = inline.StyleBook()
         self._gen = 0                                        # номер состояния (смена игры/области)
         self.pipe = self._new_pipe()
@@ -175,6 +176,7 @@ class LiveService:
         self._decider = detect.Decider()
         self._decider_at = 0.0
         self._announced: set = set()
+        self._logged: Set[str] = set()                       # надписи, уже записанные в журнал
         self._http: Optional[ThreadingHTTPServer] = None
         self.gui: Optional[win32.Gui] = None
         self._reload_translator = True
@@ -446,9 +448,18 @@ class LiveService:
         if free.sum() < 0.3 * free.size:
             return self._window_wrong
         differs = float((np.abs(a - b)[free] > 30).mean())
-        self._window_wrong = differs >= 0.3
+        # «дыра» в кадре окна: на экране в клетке есть детали (буквы, края), а с окна — ровная заливка.
+        # Так бывает, когда картинку рисует OpenGL/Vulkan в дочернем окне (эмуляторы, некоторые движки):
+        # PrintWindow отдаёт рамку, меню и строку состояния, а вместо самой игры — чёрное. В тёмной сцене
+        # такой кадр мало отличается от экрана по яркости, но по деталям — сразу видно.
+        da, db = pixels.cell_detail(win_img, 16), pixels.cell_detail(screen, 16)
+        detailed = (db > 40) & free
+        hole = detailed & (da < 6)
+        missing = float(hole.sum()) / max(1, int(detailed.sum()))
+        self._window_wrong = differs >= 0.3 or (detailed.sum() >= 12 and missing >= 0.35)
         if self._window_wrong:
-            log.info("кадр окна игры не совпадает с экраном (%.0f%% кадра) — снимаем экран", differs * 100)
+            log.info("кадр окна игры не совпадает с экраном (%.0f%% кадра, %.0f%% деталей нет) — снимаем экран",
+                     differs * 100, missing * 100)
         return self._window_wrong
 
     def _mask_plates(self, img):
@@ -659,7 +670,7 @@ class LiveService:
         ranks = self.words.ranks if self.words is not None else None
         out: List[LiveBlock] = []
         skip: List[List[Line]] = [g.lines for g in text.group_lines(other, apart=apart)] if other else []
-        groups = [g for g in text.group_lines(cands, apart=apart)]
+        groups = [g for g in text.group_lines(cands, apart=apart, same_size=lambda a, b: pixels.same_size(img, a, b))]
         ok = [self._translatable(img, g.lines, ranks) for g in groups]
         for i, g in enumerate(groups):
             if ok[i] and ranks is not None and text.is_name(g.text, ranks) and _above_reply(g, groups, ok):
@@ -671,6 +682,7 @@ class LiveService:
             return [split.get(id(ln), ln) for ln in ls]
         for g, good in zip(groups, ok):
             if not good:
+                self._note("не переводится (имя, русский текст, мусор распознавания)", g.text)
                 skip.append(g.lines)
                 continue
             body = text.strip_marker(text.join_lines(ln.text for ln in g.lines if getattr(ln, "conf", 1.0) >= 0.4))
@@ -688,6 +700,15 @@ class LiveService:
                 out.append(b)
         return out
 
+    def _note(self, what: str, body: str) -> None:
+        """Строка в журнал live.log — один раз на надпись и не больше 400 за запуск: по журналу видно,
+        что программа нашла на экране и что с этим сделала (разбор жалоб «перевелось одно слово»)."""
+        key = what + "|" + text.normalize(body)[:80]
+        if key in self._logged or len(self._logged) >= 400:
+            return
+        self._logged.add(key)
+        log.info("%s: %s", what, " ".join(body.split())[:250])
+
     def _translatable(self, img, lines: List[Line], ranks) -> bool:
         """Абзац надо переводить: в нём есть уверенно прочитанный иностранный текст, и это не
         русский текст, не мусор распознавания, не логотип и не имя."""
@@ -696,10 +717,36 @@ class LiveService:
         body = text.strip_marker(text.join_lines(ln.text for ln in lines if getattr(ln, "conf", 1.0) >= 0.4))
         if not text.is_foreign(body) or self._russian(img, lines, body, ranks):
             return False
-        junk = text.junk_tokens(body)
-        if junk and (ranks is None or text.known_words(body, ranks) < 2 * len(junk)):
-            return False                        # мусор распознавания (узор, логотип)
-        return not (ranks is not None and (text.gibberish(body, ranks) or text.caps_junk(body, ranks)))
+        # мусор — только если мусор и прочтение как есть, и с уверенно исправленными ошибками
+        # распознавания: пиксельный шрифт капсом читается с ошибкой в букве («PIAY», «OPTI ONS»),
+        # а это пункт меню. Неуверенное исправление («CONTIME» → «CONFINE»?) надпись не спасает.
+        for cand in dict.fromkeys((body, self._fixed(body))):
+            junk = text.junk_tokens(cand)
+            if junk and (ranks is None or text.known_words(cand, ranks) < 2 * len(junk)):
+                continue                        # мусор распознавания (узор, логотип)
+            if ranks is not None and (text.gibberish(cand, ranks) or text.caps_junk(cand, ranks)):
+                continue
+            return True
+        return False
+
+    def _fixed(self, body: str) -> str:
+        """Прочтение с уверенно исправленными ошибками — для решения «мусор или нет». Короткие слова
+        и слова из одних букв-двойников кириллицы не исправляются: «HET» — это русское «НЕТ»,
+        прочитанное латиницей, а не «NET»."""
+        if self.words is None:
+            return body
+        try:
+            fixed = self.words.fix(body, strict=True)
+        except Exception:  # noqa: BLE001
+            return body
+        before, after = re.findall(r"[A-Za-z']+", body), re.findall(r"[A-Za-z']+", fixed)
+        if len(before) != len(after):
+            changed = [t for t in before if t not in after]
+        else:
+            changed = [a for a, b in zip(before, after) if a != b]
+        if any(len(t) < 4 or re.fullmatch(r"[ABCEHKMOPTXYabcehkmoptxy']+", t) for t in changed):
+            return body
+        return fixed
 
     def _russian(self, img, lines: List[Line], body: str, ranks) -> bool:
         """Русский текст, прочитанный английским распознаванием как абракадабра («HaqaTb»). Нейросеть
@@ -827,7 +874,7 @@ class LiveService:
         self.gui.set_tip(f"Живой перевод: {name}")
         if fg.exe not in self._announced:
             self._announced.add(fg.exe)
-            log.info("игра: %s (%s) — %s", name, fg.exe, reason)
+            log.info("игра: %s (%s) — %s, окно %dx%d", name, fg.exe, reason, fg.client[2], fg.client[3])
 
     def _russified(self, exe: str) -> bool:
         """Игра русифицирована программой (или в ней XUnity): папка игры — выше exe на 0–3 уровня."""
@@ -879,6 +926,7 @@ class LiveService:
                 plates.append(render.Item(rect=b.rect, text=tr, line_h=b.line_height))
             if id(b) not in self._shown_ids:
                 log.debug("показана через %d мс после кадра: %s", (time.monotonic() - b.read_at) * 1000, tr[:50])
+                self._note("показан перевод", f"{b.source[:120]} → {tr[:120]}")
                 self._shown_ids.add(id(b))
                 self.count += 1
                 self.recent.appendleft({"src": b.source[:160], "tr": tr[:160]})
@@ -930,6 +978,11 @@ class LiveService:
             for key, src, urgent in need:
                 if key in self._pending:
                     continue
+                ready = self.numbers.fill(src, SKIP)     # та же фраза с другими числами (счётчик, таймер)
+                if ready is not None:
+                    self.cache.put(key, ready)
+                    self._redraw = True
+                    continue
                 self._pending.add(key)
                 if urgent:
                     self._queue.appendleft((key, src))
@@ -971,6 +1024,7 @@ class LiveService:
                     self.translator_error = ""
                     self._reload_translator = False
                     self.cache = TranslationCache()     # переводы прошлого переводчика не смешиваем
+                    self.numbers = text.NumberTemplates()
                 except Exception as exc:  # noqa: BLE001
                     self.translator_error = str(exc)
                     log.warning("переводчик для живого перевода: %s", exc)
@@ -1040,6 +1094,7 @@ class LiveService:
         # перевод без русских букв или совпавший с оригиналом (имена, коды) — остаётся оригинал
         useless = not text.cyrillic_share(tr) or text.normalize(tr) == text.normalize(src)
         self.cache.put(key, SKIP if useless else tr)
+        self.numbers.learn(src, SKIP if useless else tr, SKIP)
         with self._cond:
             self._pending.discard(key)
 
@@ -1319,7 +1374,13 @@ def open_main_window() -> None:
 def run(argv: Optional[List[str]] = None) -> int:
     """Точка входа процесса живого перевода (``Russificator.exe --overlay``)."""
     win32.set_dpi_aware()
-    handler = logging.FileHandler(paths.logs_dir() / "live.log", mode="w", encoding="utf-8")
+    log_file = paths.logs_dir() / "live.log"
+    try:                                       # журнал прошлого запуска не стираем (по нему разбирают жалобы)
+        if log_file.is_file() and log_file.stat().st_size:
+            log_file.replace(log_file.with_name("live.prev.log"))
+    except OSError:
+        pass
+    handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()
     root.addHandler(handler)

@@ -413,6 +413,23 @@ def text_height(mask) -> int:
     return d - t + 1
 
 
+def body_height(mask) -> int:
+    """Высота «тела» строки (полосы, где заполнены почти все буквы, — у строчных это высота «x»):
+    у строк одного шрифта она одна и та же, есть ли в тексте хвосты букв или нет."""
+    import numpy as np
+    m = np.asarray(mask, dtype=bool)
+    if m.ndim != 2 or not m.any():
+        return 0
+    counts = m.sum(axis=1).astype(np.float64)
+    dense = counts >= CORE * counts.max()
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], dense.astype(np.int8), [0]])))
+    runs = list(zip(edges[::2], edges[1::2]))
+    mid = m.shape[0] / 2
+    own = [r for r in runs if r[0] <= mid < r[1]]
+    a, b = own[0] if own else max(runs, key=lambda r: counts[r[0]:r[1]].sum())
+    return int(b - a)
+
+
 @lru_cache(maxsize=512)
 def _sample_height(font_path: Optional[str], sample: str) -> int:
     """:func:`text_height` строки ``sample`` нашим шрифтом размера 100."""

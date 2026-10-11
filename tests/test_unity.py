@@ -105,41 +105,8 @@ def test_tech_strings_filtered():
 # ---------- XUnity ----------
 
 def _xua_decode_line(line: str):
-    """Порт TextHelper.ReadTranslationLineAndDecode из XUnity 5.6 (как плагин читает файлы)."""
-    parts, buf, esc, i = [], [], False, 0
-    while i < len(line):
-        c = line[i]
-        if esc:
-            if c in "=\\":
-                buf.append(c)
-            elif c == "n":
-                buf.append("\n")
-            elif c == "r":
-                buf.append("\r")
-            elif c == "u":
-                buf.append(chr(int(line[i + 1:i + 5], 16)))
-                i += 4
-            else:
-                buf.append("\\" + c)
-            esc = False
-        elif c == "\\":
-            esc = True
-        elif c == "=":
-            if len(parts) > 1:
-                return None
-            parts.append("".join(buf))
-            buf = []
-        elif c == "%" and line[i + 1:i + 3] == "3D":
-            buf.append("=")
-            i += 2
-        elif c == "/" and line[i + 1:i + 2] == "/":   # комментарий до конца строки
-            parts.append("".join(buf))
-            return parts if len(parts) == 2 else None
-        else:
-            buf.append(c)
-        i += 1
-    parts.append("".join(buf))
-    return parts if len(parts) == 2 else None
+    """Как плагин читает строку файла (порт TextHelper.ReadTranslationLineAndDecode из XUnity 5.6)."""
+    return xunity.decode_line(line)
 
 
 @pytest.mark.parametrize("src,dst", [
@@ -359,25 +326,43 @@ def _tmp2_tree(atlas=256):
 
 
 def test_patch_tmp2_font_adds_cyrillic_and_grows_atlas():
-    from russificator.fonts.library import ensure_font
     tree = _tmp2_tree()
+    tree["m_FaceInfo"] = {"m_PointSize": 42.0}
     font = tmp_cyrillic.TmpFont(tree)
+    glyphs_before = len(tree["m_GlyphTable"])
     tex = _FakeTexture(256, 256)
     mat = {"m_SavedProperties": {"m_Floats": [["_GradientScale", 6.0], ["_TextureHeight", 256.0]]}}
-    rend = tmp_cyrillic.GlyphRenderer(ensure_font())
-    added = tmp_cyrillic.patch_font(font, tex, [(None, mat)], rend, rend, set(tmp_cyrillic.RUSSIAN))
+    added = tmp_cyrillic.patch_font(font, tex, [(None, mat)], set(tmp_cyrillic.RUSSIAN))
     assert added == len(tmp_cyrillic.RUSSIAN)
     assert all(ord(c) in font.chars() for c in tmp_cyrillic.RUSSIAN)
+    # русская «А» — тот же глиф, что латинская «A» (атлас не растёт ради двойников)
+    by_code = {c["m_Unicode"]: c["m_GlyphIndex"] for c in tree["m_CharacterTable"]}
+    assert by_code[ord("А")] == by_code[ord("A")] and by_code[ord("О")] == by_code[ord("O")]
+    assert by_code[ord("Ж")] != by_code[ord("A")]
+    new_glyphs = tree["m_GlyphTable"][glyphs_before:]
+    assert 30 < len(new_glyphs) < 66
     w, h = font.atlas_size()
     assert tex.image.size == (w, h) and h > 256
     # старые глифы не сдвинулись (координаты снизу вверх), новые — внутри атласа
     assert tree["m_GlyphTable"][0]["m_GlyphRect"]["m_Y"] == 256 - 40
-    for g in tree["m_GlyphTable"][-66:]:
+    for g in new_glyphs:
         r = g["m_GlyphRect"]
         assert 0 <= r["m_X"] and r["m_X"] + r["m_Width"] <= w and 0 <= r["m_Y"] and r["m_Y"] + r["m_Height"] <= h
+    # рост букв — как у букв атласа (H — 30 px)
+    zh = next(g for g in new_glyphs if g["m_Index"] == by_code[ord("Ж")])
+    assert abs(zh["m_Metrics"]["m_Height"] - 30) <= 1.5
     assert mat["m_SavedProperties"]["m_Floats"][1] == ["_TextureHeight", float(h)]
     # второй проход ничего не добавляет
-    assert tmp_cyrillic.patch_font(font, tex, [(None, mat)], rend, rend, set(tmp_cyrillic.RUSSIAN)) == 0
+    assert tmp_cyrillic.patch_font(font, tex, [(None, mat)], set(tmp_cyrillic.RUSSIAN)) == 0
+
+
+def test_tmp_font_upgraded_from_v1_uses_new_tables():
+    tree = _tmp2_tree()
+    tree["m_glyphInfoList"] = []          # TMP 1.4+: старый список остаётся пустым
+    tree["m_GlyphTable"] = []             # …и у динамического шрифта новая таблица тоже может быть пуста
+    assert not tmp_cyrillic.TmpFont(tree).v1
+    tree["m_glyphInfoList"] = [{"id": 65}]
+    assert tmp_cyrillic.TmpFont(tree).v1
 
 
 def test_needed_chars_includes_translation_symbols():
@@ -585,3 +570,174 @@ def test_concat_templates_from_compiled_code():
     meta = il_scan._Meta((Path(__file__).parent / "data" / "il_concat.dll").read_bytes())
     assert il_scan.concat_templates(meta) == [
         "Day {0} of {1}", "Gold: {0}", "Welcome back, {0}! Ready?", "Level {0} — {1} has {2} coins"]
+
+
+def test_addressables_crc_zeroed_without_changing_lengths(tmp_path):
+    import base64
+    import json
+    from russificator.engines.unity import addressables
+    rec = '{"m_Hash":"abc","m_Crc":3735928559,"m_Timeout":0}'.encode("utf-16-le")
+    blob = b"\x07\x10\x00" + rec + b"\x00\x01"
+    cat_dir = tmp_path / "Game_Data" / "StreamingAssets" / "aa"
+    (cat_dir / "StandaloneWindows64").mkdir(parents=True)
+    bundle = cat_dir / "StandaloneWindows64" / "fonts.bundle"
+    bundle.write_bytes(b"UnityFS")
+    cat = cat_dir / "catalog.json"
+    cat.write_text(json.dumps({"m_LocatorId": "x", "m_ExtraDataString": base64.b64encode(blob).decode()}),
+                   encoding="utf-8")
+    assert addressables.catalog_for(bundle) == cat
+
+    class _Backup:
+        def write_bytes(self, path, data):
+            path.write_bytes(data)
+    assert addressables.disable_crc([bundle], _Backup()) == 1
+    new = base64.b64decode(json.loads(cat.read_text(encoding="utf-8"))["m_ExtraDataString"])
+    assert len(new) == len(blob)
+    text = new[3:-2].decode("utf-16-le")
+    assert json.loads(text)["m_Crc"] == 0 and json.loads(text)["m_Hash"] == "abc"
+
+
+def test_paragraph_rule_splits_glued_text():
+    rule = xunity.paragraph_rules()[0]
+    kind, out = _apply_xua_rule(rule, "For those who favour speed.\n\nTrade Rusted Blade +VALUE")
+    assert kind == "sr" and out == "For those who favour speed.\n\nTrade Rusted Blade +VALUE"
+    assert _apply_xua_rule(rule, "One paragraph only\nsecond line")[1] is None
+
+
+def test_loose_text_files_in_streaming_assets(tmp_path):
+    """Описания и таблицы в StreamingAssets (json/csv/xml) попадают в словарь; чужие языки и каталог
+    Addressables — нет."""
+    import json as _json
+    root = _fake_game(tmp_path)
+    sa = root / "MyGame_Data" / "StreamingAssets"
+    (sa / "Data").mkdir(parents=True)
+    (sa / "Data" / "items.json").write_text(_json.dumps({"items": [
+        {"id": "dagger_01", "name": "Dagger", "desc": "For those who favour speed and accuracy over range and power."}]}),
+        encoding="utf-8")
+    (sa / "Loc").mkdir()
+    (sa / "Loc" / "strings_en.csv").write_text("key,english\nmenu_start,Start the journey now\n", encoding="utf-8")
+    (sa / "Loc" / "strings_fr.csv").write_text("key,english\nmenu_start,Commencer le voyage maintenant\n",
+                                               encoding="utf-8")
+    (sa / "aa").mkdir()
+    (sa / "aa" / "settings.json").write_text(_json.dumps({"m_buildTarget": "Windows build for the player"}),
+                                             encoding="utf-8")
+    (sa / "item_id.json").write_text(_json.dumps({"text": "Press any key to continue."}), encoding="utf-8")
+    game = detect.inspect(root)
+    col = extract._Collector()
+    assert extract.extract_loose_files(game, col) == 3
+    found = set(col.items)
+    assert "For those who favour speed and accuracy over range and power." in found
+    assert "Dagger" in found and "Start the journey now" in found and "Press any key to continue." in found
+    assert "Commencer le voyage maintenant" not in found and "Windows build for the player" not in found
+    assert "dagger_01" not in found
+
+
+def test_coverage_harvest_keeps_live_lines_in_project(tmp_path):
+    from russificator.engines.unity import coverage
+    root = _fake_game(tmp_path)
+    live = root / coverage.LIVE_FILE
+    live.parent.mkdir(parents=True)
+    live.write_text(xunity.encode("For those who favour speed.") + "=" + xunity.encode("Для любителей скорости.") +
+                    "\nPapaNovember=PapaNovember\n", encoding="utf-8")
+    work = tmp_path / "proj"
+    assert coverage.harvest(root, work) == 2
+    live.unlink()                                   # откат удалил папку BepInEx — в проекте всё осталось
+    found = coverage.load_found(work)
+    assert found["For those who favour speed."]["translation"] == "Для любителей скорости."
+    assert coverage.missed(root, work)["PapaNovember"] == "PapaNovember"
+    assert coverage.worth_translating("For those who favour speed.", "Для любителей скорости.")
+    assert not coverage.worth_translating("PapaNovember", "PapaNovember")   # живой перевод вернул как есть
+    assert not coverage.worth_translating("Discord", "Разногласия")
+
+
+def test_coverage_classify_explains_each_miss():
+    from russificator.engines.unity import coverage
+    seen = {"For those who favour speed and accuracy over range and power": "resources.assets",
+            "Trade": "code", "Rusted Blade": "level1", "VALUE": "code", "DAMAGE": "code",
+            "You have {0} coins": "code", "ok": "level0"}
+    texts = {"For those who favour speed and accuracy over range and power": "",
+             "Trade Rusted Blade <color=#9f3>+VALUE</color>\n<color=#9f3>+DAMAGE</color>": "",
+             "You have 15 coins": "", "Trade Golden Spoon +VALUE": "", "Completely generated words here": ""}
+    got = {m.text: m for m in coverage.classify(texts, seen)}
+    first = got["For those who favour speed and accuracy over range and power"]
+    assert first.kind == "filtered" and first.where == "resources.assets" and first.note
+    assert got["Trade Rusted Blade <color=#9f3>+VALUE</color>\n<color=#9f3>+DAMAGE</color>"].kind == "composed"
+    assert got["You have 15 coins"].kind == "template"
+    assert got["Trade Golden Spoon +VALUE"].kind == "partly"
+    assert got["Completely generated words here"].kind == "absent"
+    text = coverage.format_report({"game": "G", "date": "d", "total": 5, "items": [m.__dict__ for m in got.values()]})
+    assert "поиск её отбросил" in text and "resources.assets" in text
+    # уже находится нынешним поиском; имена из титров — отдельно
+    got = {m.text: m.kind for m in coverage.classify({"Alex0080": "", "Difficulty": "", "Trade Golden Spoon +VALUE": ""},
+                                                       {"Difficulty": "English", "Alex0080": "resources.assets:Credits_Names"},
+                                                       found={"Difficulty"})}
+    assert got == {"Difficulty": "found", "Alex0080": "names", "Trade Golden Spoon +VALUE": "absent"}
+
+
+def test_live_found_strings_join_dictionary(tmp_path):
+    """Найденное во время прошлых сеансов входит в словарь новой русификации."""
+    from russificator.core.universal import TranslationProject
+    from russificator.engines.unity import coverage
+    from russificator.engines.unity.plugin import UnityPlugin
+    root = _fake_game(tmp_path)
+    live = root / coverage.LIVE_FILE
+    live.parent.mkdir(parents=True)
+    live.write_text("For those who favour speed.=Для любителей скорости.\nPapaNovember=PapaNovember\n", encoding="utf-8")
+    proj = TranslationProject(root, "unity", tmp_path / "proj")
+    plugin = UnityPlugin()
+    assert plugin.harvest_live(root, proj.work_dir) == 2
+    entries = plugin._live_entries(proj, known=set())
+    assert [e.source for e in entries] == ["For those who favour speed."]
+    assert entries[0].target_key.startswith("xua:") and proj.meta["unity_live_found"] == 1
+
+
+def test_localization_table_keeps_short_labels():
+    """Таблица «идентификатор -> текст»: короткие подписи берутся при любом имени ключа."""
+    import json as _json
+    from russificator.engines.unity import text_assets
+    table = {"LBL_CRYO_POD": "Cryo pod", "SET_DIFFICULTY": "Difficulty", "SET_POST": "Post processing",
+             "CMD_COMPLETED": "Task completed.", "CMD_SCAN_FAIL": "Couldn't find any items to scan.",
+             "TXT_CONTINUE": "Press <Key><KeyBind></> to continue...", "LBL_DISPENSER": "Task dispenser",
+             "SET_SFX": "Sound effects", "ID_X": "player_spawn_point"}
+    got = []
+    text_assets.extract(_json.dumps(table), got.append)
+    assert {"Cryo pod", "Difficulty", "Post processing", "Sound effects", "Task completed."} <= set(got)
+    assert "player_spawn_point" not in got
+    # обычный JSON с данными (не таблица) — короткие значения по-прежнему только под «текстовыми» ключами
+    got = []
+    text_assets.extract(_json.dumps({"speed": "Fast", "mode": "Hard", "title": "Main Menu"}), got.append)
+    assert got == ["Main Menu"]
+
+
+def test_foreign_language_text_assets_are_skipped():
+    class _Obj:
+        def __init__(self, name):
+            self.name = name
+
+        def peek_name(self):
+            return self.name
+    objs = [_Obj(n) for n in ("English", "French", "Chinese Simplified", "Portuguese, Brazilian", "Credits_Names",
+                              "Pirate English", "Dialogue")]
+    kept = [o.name for o in extract._drop_foreign_text_assets(objs)]
+    assert kept == ["English", "Credits_Names", "Pirate English", "Dialogue"]
+    # английского нет — ничего не выбрасывается (таблица может быть единственной)
+    assert len(extract._drop_foreign_text_assets([_Obj("French"), _Obj("Dialogue")])) == 2
+
+
+def test_credits_names_are_not_a_localization_table():
+    import json as _json
+    from russificator.engines.unity import text_assets
+    names = {f"N{i}": n for i, n in enumerate(["Alexander Kairento", "Capitan Noob", "Gabriel Steel", "Brackhar",
+                                               "Josh Warren", "Sophia Katsaros", "Nate Laurence", "Corey K"])}
+    got = []
+    text_assets.extract(_json.dumps(names), got.append)
+    assert got == []
+    assert extract.NAMES_ASSET_RE.search("Credits_Names") and extract.NAMES_ASSET_RE.search("FormattedPatrons")
+
+
+def test_key_hints_are_text_not_log_tags():
+    col = extract._Collector()
+    for s in ("[C] to Crouch", "[Space] Jump over the gap", "[E] Interact", "[Info] Loading scene", "[Debug] x=1"):
+        col.add(s, extract.TextKind.UI, "level1")
+    assert {"[C] to Crouch", "[Space] Jump over the gap", "[E] Interact"} <= set(col.items)
+    assert "[Info] Loading scene" not in col.items and "[Debug] x=1" not in col.items

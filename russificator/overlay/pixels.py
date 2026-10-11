@@ -64,6 +64,19 @@ def cells(img, cell: int = 8):
     return g[:hh, :ww].reshape(hh // cell, cell, ww // cell, cell).mean(axis=(1, 3), dtype=np.float32)
 
 
+def cell_detail(img, cell: int = 16):
+    """Перепад яркости (макс − мин по зелёному каналу) в клетках cell × cell: есть ли в клетке
+    детали — буквы, края, узор. Ровная заливка — около нуля."""
+    import numpy as np
+    g = img[:, :, 1]
+    h, w = g.shape
+    hh, ww = h // cell * cell, w // cell * cell
+    if hh == 0 or ww == 0:
+        return np.zeros((0, 0), np.int16)
+    blocks = g[:hh, :ww].reshape(hh // cell, cell, ww // cell, cell)
+    return blocks.max(axis=(1, 3)).astype(np.int16) - blocks.min(axis=(1, 3))
+
+
 def _dominant(px):
     """Самый частый цвет среди пикселей (n, 3) — с точностью до 16 уровней на канал."""
     import numpy as np
@@ -84,7 +97,11 @@ def line_colors(img, box: Box) -> Optional[Tuple[Tuple[int, int, int], Tuple[int
     x0, y0, x1, y1 = max(0, x), max(0, y), min(W, x + w), min(H, y + h)
     if x1 - x0 < 4 or y1 - y0 < 4:
         return None
-    px = img[y0:y1, x0:x1, :3].reshape(-1, 3).astype(np.int32)
+    box_px = img[y0:y1, x0:x1, :3]
+    period = stripes(box_px)
+    if period:                          # строки развёртки: у букв то яркие, то тёмные ряды — усредняем
+        box_px = _smooth_rows(box_px, period)
+    px = box_px.reshape(-1, 3).astype(np.int32)
     if len(px) > 6000:
         px = px[:: len(px) // 6000 + 1]
     bg, _ = _dominant(px)
@@ -96,6 +113,35 @@ def line_colors(img, box: Box) -> Optional[Tuple[Tuple[int, int, int], Tuple[int
     core = ink[d >= np.percentile(d, 50)]
     fg = np.median(core, axis=0)
     return tuple(int(v) for v in fg), tuple(int(v) for v in bg)
+
+
+def _ink_mask(img, box: Box):
+    """Маска букв строки (пиксели ближе к цвету букв, чем к фону; полосы развёртки усреднены)."""
+    import numpy as np
+    colors = line_colors(img, box)
+    if colors is None:
+        return None
+    fg, bg = (np.array(c, np.int32) for c in colors)
+    x, y, w, h = box
+    H, W = img.shape[:2]
+    px = img[max(0, y):min(H, y + h), max(0, x):min(W, x + w), :3]
+    period = stripes(px)
+    if period:
+        px = _smooth_rows(px, period)
+    px = px.astype(np.int32)
+    return ((px - fg) ** 2).sum(axis=2) < ((px - bg) ** 2).sum(axis=2)
+
+
+def same_size(img, a: Line, b: Line) -> bool:
+    """Буквы двух строк одного размера, хотя рамки распознавания различаются по высоте (одна
+    захватила значок «дальше» или хвосты соседней строки): сверяется высота «тела» строк
+    (у строчных — высота «x»), она не зависит от того, есть ли в тексте хвосты букв."""
+    from .inline import body_height
+    ma, mb = _ink_mask(img, (a.x, a.y, a.w, a.h)), _ink_mask(img, (b.x, b.y, b.w, b.h))
+    if ma is None or mb is None:
+        return False
+    ha, hb = body_height(ma), body_height(mb)
+    return bool(ha and hb) and max(ha, hb) / min(ha, hb) <= 1.3
 
 
 def color_distance(a, b) -> float:
@@ -272,7 +318,15 @@ def rule_between(img, a: Line, b: Line) -> bool:
     # плавно меняются по градиенту); между полями, кнопками, ячейками — рамки и щели другого цвета:
     # рядом (до 3 пикселей) лежат ровные строки заметно разного цвета
     region = img[y0:y1, x0:x1].astype(np.int32)
-    flat = [(i, row.mean(axis=0)) for i, row in enumerate(region) if float(row.std(axis=0).mean()) < 12]
+    period = stripes(region)
+    if period:                          # полосы развёртки (CRT-шейдер эмулятора) — это фон, не черта
+        region = _smooth_rows(region, period)
+    spread = [float(row.std(axis=0).mean()) for row in region]
+    n = len(region)
+    # ровный ряд у самых букв — край их сглаживания (градиент к фону), а не черта: черта лежит среди
+    # ровных рядов фона
+    flat = [(i, region[i].mean(axis=0)) for i in range(n) if spread[i] < 12 and
+            (i == 0 or spread[i - 1] < 12) and (i == n - 1 or spread[i + 1] < 12)]
     for k, (i, a) in enumerate(flat):
         for j, b in flat[k + 1:]:
             if j - i > 3:
@@ -280,6 +334,36 @@ def rule_between(img, a: Line, b: Line) -> bool:
             if float(np.sqrt(((a - b) ** 2).sum())) > 22:
                 return True
     return False
+
+
+def stripes(region) -> int:
+    """Период горизонтальных полос по области (строки развёртки CRT-шейдера в эмуляторах,
+    «полосатые» фоны): соседние ряды пикселей резко отличаются, а ряды через период — почти нет.
+    На обычной картинке (буквы, края, градиенты) ряды через несколько пикселей отличаются не
+    меньше соседних. 0 — полос нет."""
+    import numpy as np
+    n = len(region)
+    if n < 8:
+        return 0
+    means = region.mean(axis=1).astype(np.float32)          # средний цвет каждого ряда
+    d1 = float(np.abs(means[1:] - means[:-1]).sum(axis=1).mean())
+    if d1 < 12:
+        return 0
+    for p in range(2, 7):
+        if n < 3 * p:
+            break
+        dp = float(np.abs(means[p:] - means[:-p]).sum(axis=1).mean())
+        if dp < 0.45 * d1:
+            return p
+    return 0
+
+
+def _smooth_rows(region, p: int):
+    """Скользящее среднее по ``p`` рядам (по вертикали) — полосы с этим периодом исчезают."""
+    import numpy as np
+    c = np.cumsum(region.astype(np.float32), axis=0)
+    c = np.concatenate([np.zeros_like(c[:1]), c], axis=0)
+    return (c[p:] - c[:-p]) / p
 
 
 def cut_side(ln: Line, img) -> Optional[str]:

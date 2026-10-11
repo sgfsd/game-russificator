@@ -4,13 +4,15 @@ RPG Maker 2000/2003 распознаётся, но перевод для нег�
 пользователь получает честное сообщение.
 
 Шрифты (заранее, а не по «квадратикам» в игре): шрифт игры проверяется на
-кириллицу, и если её нет —
-  * MV: к семейству GameFont добавляется PT Sans только для кириллицы
+кириллицу, и если её нет, в его копию дописываются русские буквы по меркам
+самого шрифта (``fonts/cyrillic.py``) — того же роста, толщины и вида:
+  * MV: к семейству GameFont добавляется эта копия только для кириллицы
     (``unicode-range``) — латиница остаётся родной;
-  * MZ: основной шрифт в System.json меняется на PT Sans (движок дожидается
+  * MZ: основной шрифт в System.json меняется на эту копию (движок дожидается
     его загрузки, так что буквы гарантированно появятся);
-  * VX/VX Ace: PT Sans кладётся в Fonts/, а маленький скрипт перед Main
-    делает его шрифтом по умолчанию.
+  * VX/VX Ace: шрифты из папки Fonts дополняются на месте.
+Если шрифт дополнить нельзя, вместо копии берётся встроенный PT Sans (в VX/VX Ace
+он кладётся в Fonts/, а маленький скрипт перед Main делает его шрифтом по умолчанию).
 """
 
 from __future__ import annotations
@@ -93,6 +95,7 @@ class RPGMakerPlugin(EnginePlugin):
 
     def install_font(self, game_dir: Path, project: TranslationProject, font_path) -> Optional[bool]:
         from ...fonts.library import ensure_font
+        self._own_font = not font_path           # шрифт, выбранный пользователем, — как есть, без дорисовки
         font = Path(font_path) if font_path else ensure_font()
         if font is None or not font.is_file():
             return False
@@ -118,13 +121,33 @@ class RPGMakerPlugin(EnginePlugin):
         game_font = (css.parent / m.group(1)) if m else None
         if game_font and game_font.is_file() and _has_cyrillic_bytes(game_font.read_bytes()) is True:
             return True
-        backup.copy_new(font, css.parent / font.name)
-        face = ("\n/* Game Russificator: русские буквы из PT Sans, латиница — родным шрифтом */\n"
-                f"@font-face {{ font-family: GameFont; src: url('{font.name}'); unicode-range: {CYRILLIC_RANGE}; }}\n")
+        patched = self._patched_copy(game_font, project) if game_font else None
+        if patched is not None:
+            source = f"{game_font.stem}-ru.ttf"
+            backup.write_bytes(css.parent / source, patched)
+            note = "В шрифте игры не было русских букв — они дорисованы по его меркам."
+        else:
+            backup.copy_new(font, css.parent / font.name)
+            source, note = font.name, "В шрифте игры нет русских букв — они подставлены из PT Sans."
+        face = ("\n/* Game Russificator: русские буквы — из шрифта с кириллицей, латиница — родным шрифтом */\n"
+                f"@font-face {{ font-family: GameFont; src: url('{source}'); unicode-range: {CYRILLIC_RANGE}; }}\n")
         backup.write_text(css, text + face)
         self._preload_hint(base, backup, "GameFont")
-        project.warnings.append("В шрифте игры нет русских букв — они подставлены из PT Sans.")
+        project.warnings.append(note)
         return True
+
+    def _patched_copy(self, game_font: Path, project) -> Optional[bytes]:
+        """Шрифт игры с кириллицей, дописанной по его меркам (None — шрифт выбран пользователем или
+        не дополняется: тогда берётся PT Sans)."""
+        if not getattr(self, "_own_font", True) or not game_font.is_file():
+            return None
+        from ...fonts import cyrillic
+        try:
+            data = game_font.read_bytes()
+        except OSError:
+            return None
+        texts = [e.translation for e in project.entries if e.translation]
+        return cyrillic.add_cyrillic(data, cyrillic.needed_chars(texts))
 
     def _font_mz(self, game_dir: Path, font: Path, backup, project) -> bool:
         ddir = mv_mz.data_dir(game_dir)
@@ -138,11 +161,18 @@ class RPGMakerPlugin(EnginePlugin):
         current = fonts_dir / str(adv.get("mainFontFilename") or "")
         if current.is_file() and _has_cyrillic_bytes(current.read_bytes()) is True:
             return True
-        backup.copy_new(font, fonts_dir / font.name)
-        adv["mainFontFilename"] = font.name
+        patched = self._patched_copy(current, project) if current.is_file() else None
+        if patched is not None:
+            name = f"{current.stem}-ru.ttf"
+            backup.write_bytes(fonts_dir / name, patched)
+            note = "В шрифте игры не было русских букв — они дорисованы по его меркам (копия шрифта)."
+        else:
+            backup.copy_new(font, fonts_dir / font.name)
+            name, note = font.name, "В шрифте игры нет русских букв — основной шрифт заменён на PT Sans."
+        adv["mainFontFilename"] = name
         sysdata["advanced"] = adv
         backup.write_text(sys_file, json.dumps(sysdata, ensure_ascii=False, separators=(",", ":")))
-        project.warnings.append("В шрифте игры нет русских букв — основной шрифт заменён на PT Sans.")
+        project.warnings.append(note)
         return True
 
     def _preload_hint(self, base: Path, backup, family: str) -> None:
@@ -162,6 +192,15 @@ class RPGMakerPlugin(EnginePlugin):
         existing = [p for p in fonts_dir.glob("*") if p.suffix.lower() in (".ttf", ".otf", ".ttc")] \
             if fonts_dir.is_dir() else []
         if existing and all(_has_cyrillic_bytes(p.read_bytes()) is True for p in existing):
+            return True
+        # шрифты игры дополняются на месте: имя семейства то же, скрипты игры ничего не заметят
+        lacking = [p for p in existing if _has_cyrillic_bytes(p.read_bytes()) is not True]
+        patched = {p: self._patched_copy(p, project) for p in lacking}
+        if lacking and all(v is not None for v in patched.values()):
+            for p, data in patched.items():
+                backup.write_bytes(p, data)
+            project.warnings.append("В шрифтах игры не было русских букв — они дорисованы по их меркам: "
+                                    + ", ".join(p.name for p in lacking[:6]))
             return True
         ext = old_marshal.EXT[self.version]
         scripts = game_dir / "Data" / f"Scripts.{ext}"

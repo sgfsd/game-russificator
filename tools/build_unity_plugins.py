@@ -83,10 +83,10 @@ def build_mono() -> Path:
     cc = _compiler()
     stub = CACHE / "stub" / "UnityEngine.dll"
     stub.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(cc + ["-nologo", "-target:library", "-nostdlib", *_mscorlib2(), f"-out:{stub}",
+    subprocess.run(cc + ["-nologo", "-noconfig", "-target:library", "-nostdlib", *_mscorlib2(), f"-out:{stub}",
                          str(ROOT / "tools" / "unity_stubs" / "UnityEngine.cs")], check=True)
     out = RES / "Russificator.Unity.dll"
-    subprocess.run(cc + ["-nologo", "-target:library", "-optimize", "-nostdlib", *_mscorlib2(),
+    subprocess.run(cc + ["-nologo", "-noconfig", "-target:library", "-optimize", "-nostdlib", *_mscorlib2(),
                          f"-r:{stub}", f"-r:{refs / 'BepInEx.dll'}", f"-r:{refs / '0Harmony.dll'}",
                          f"-out:{out}", str(RES / "RussificatorUnity.cs")], check=True)
     print("built", out, out.stat().st_size)

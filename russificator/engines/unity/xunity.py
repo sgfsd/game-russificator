@@ -404,6 +404,68 @@ def set_ini_values(text: str, section: str, values: Dict[str, str]) -> str:
     return "\n".join(out).rstrip("\n") + "\n"
 
 
+def decode_line(line: str) -> Optional[List[str]]:
+    """Строка файла переводов XUnity -> [оригинал, перевод] (порт TextHelper.ReadTranslationLineAndDecode
+    из XUnity 5.6) или None — комментарий, пустая или битая строка."""
+    parts: List[str] = []
+    buf: List[str] = []
+    esc = False
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if esc:
+            if c in "=\\":
+                buf.append(c)
+            elif c == "n":
+                buf.append("\n")
+            elif c == "r":
+                buf.append("\r")
+            elif c == "u" and len(line) >= i + 5:
+                try:
+                    buf.append(chr(int(line[i + 1:i + 5], 16)))
+                except ValueError:
+                    buf.append("\\u")
+                    i -= 4
+                i += 4
+            else:
+                buf.append("\\" + c)
+            esc = False
+        elif c == "\\":
+            esc = True
+        elif c == "=":
+            if len(parts) > 1:
+                return None
+            parts.append("".join(buf))
+            buf = []
+        elif c == "%" and line[i + 1:i + 3] == "3D":
+            buf.append("=")
+            i += 2
+        elif c == "/" and line[i + 1:i + 2] == "/":   # комментарий до конца строки
+            parts.append("".join(buf))
+            return parts if len(parts) == 2 else None
+        else:
+            buf.append(c)
+        i += 1
+    parts.append("".join(buf))
+    return parts if len(parts) == 2 else None
+
+
+def read_translations(path: Path) -> Dict[str, str]:
+    """Файл переводов XUnity (``оригинал=перевод``) -> словарь; правила-регулярки пропускаются."""
+    out: Dict[str, str] = {}
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("//"):
+            continue
+        kv = decode_line(line)
+        if kv and kv[0] and not re.match(r'^s?r:"', kv[0]):
+            out.setdefault(kv[0], kv[1])
+    return out
+
+
 def encode(text: str) -> str:
     """Экранирование строки для файлов переводов XUnity (обратное TextHelper.ReadTranslationLineAndDecode).
 
@@ -509,6 +571,15 @@ def template_rules(pairs: Dict[str, str]) -> List[str]:
         scored.append((letters, _rule("r" if numeric else "sr", "^" + "".join(parts) + "$", value)))
     scored.sort(key=lambda x: -x[0])
     return [r for _, r in scored[:MAX_TEMPLATE_RULES]]
+
+
+def paragraph_rules() -> List[str]:
+    """Правило XUnity «по абзацам»: текст, которого целиком нет в словаре, но который игра склеила из
+    абзацев (описание предмета + пустая строка + строка обмена/характеристик), переводится по частям —
+    каждый абзац по словарю, правилам-шаблонам или живым переводом. Так склейки переводятся и в
+    русификаторе «для друзей», где живого перевода нет. Правило — последним: словарь и более точные
+    правила проверяются раньше."""
+    return [_rule("sr", r"^([\S\s]+?)\n\n([\S\s]+)$", "$1\n\n$2")]
 
 
 def _net_regex_escape(s: str) -> str:

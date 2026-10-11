@@ -169,13 +169,20 @@ class RenPyPlugin(EnginePlugin):
             return
         backup.write_text(game_root / TL_FILE, json.dumps(table, ensure_ascii=False, indent=0, sort_keys=True))
 
-        font_map, font_notes = self._fonts(game_root, project, backup)
+        font_map, font_notes = self._fonts(game_root, project, backup, list(table.values()))
         project.warnings.extend(font_notes)
         backup.write_text(game_root / HOOK_FILE, hook_script(font_map))
         project.meta["renpy_translations"] = len(table)
 
-    def _fonts(self, game_root: Path, project: TranslationProject, backup) -> Tuple[Dict, List[str]]:
-        """Найти шрифты игры без кириллицы и подменить их встроенным PT Sans."""
+    def _fonts(self, game_root: Path, project: TranslationProject, backup,
+               translations: List[str] = ()) -> Tuple[Dict, List[str]]:
+        """Найти шрифты игры без кириллицы и подменить их копиями с русскими буквами.
+
+        Русские буквы дописываются в сам шрифт игры по его меркам (``fonts/cyrillic.py``) — тот же
+        рост, толщина и вид, что у латиницы; копия ложится в ``game/russificator/``, а Ren'Py
+        подменяет шрифт через ``config.font_replacement_map``. Если шрифт дополнить нельзя
+        (повреждён, это не TrueType/OpenType), его место занимает встроенный PT Sans."""
+        from ...fonts import cyrillic
         from ...fonts.cmap import has_cyrillic
         from ...fonts.library import ensure_font
 
@@ -195,6 +202,7 @@ class RenPyPlugin(EnginePlugin):
                     candidates.setdefault(n, None)
 
         bad: List[str] = []
+        datas: Dict[str, bytes] = {}
         for name in candidates:
             data = None
             loose = game_root / name
@@ -207,26 +215,55 @@ class RenPyPlugin(EnginePlugin):
                         break
             if data and not has_cyrillic(data):
                 bad.append(name)
+                datas[name] = data
         if not bad:
             return {}, []
         fonts_dir = game_root / FONT_DIR
         if not fonts_dir.exists():
             fonts_dir.mkdir(parents=True)
             backup.track_new(fonts_dir)
-        backup.copy_new(regular, fonts_dir / regular.name)
-        if bold:
-            backup.copy_new(bold, fonts_dir / bold.name)
-        reg_rel = f"{FONT_DIR}/{regular.name}"
-        bold_rel = f"{FONT_DIR}/{bold.name}" if bold else reg_rel
+        need = cyrillic.needed_chars(translations)
         mapping: Dict[Tuple[str, bool, bool], Tuple[str, bool, bool]] = {}
+        own: List[str] = []
+        fallback: List[str] = []
+        used_names: set = set()
         for name in bad:
-            for alias in {name, Path(name).name}:
-                for b in (False, True):
-                    for i in (False, True):
-                        mapping[(alias, b, i)] = (bold_rel if b else reg_rel, False, i)
-        note = ("Шрифты игры без русских букв заменены на PT Sans: " + ", ".join(sorted(bad)[:6])
-                + (" …" if len(bad) > 6 else ""))
-        return mapping, [note]
+            patched = cyrillic.add_cyrillic(datas[name], need)
+            if patched is not None:
+                stem = Path(name).stem
+                fname = f"{stem}-ru.ttf"
+                k = 2
+                while fname.lower() in used_names:
+                    fname = f"{stem}-ru{k}.ttf"
+                    k += 1
+                used_names.add(fname.lower())
+                backup.write_bytes(fonts_dir / fname, patched)
+                rel = f"{FONT_DIR}/{fname}"
+                for alias in {name, Path(name).name}:
+                    for b in (False, True):
+                        for i in (False, True):
+                            mapping[(alias, b, i)] = (rel, b, i)
+                own.append(name)
+                continue
+            fallback.append(name)
+        notes: List[str] = []
+        if own:
+            notes.append("Шрифтам игры без кириллицы дорисованы русские буквы по их меркам: "
+                         + ", ".join(sorted(own)[:6]) + (" …" if len(own) > 6 else ""))
+        if fallback:
+            backup.copy_new(regular, fonts_dir / regular.name)
+            if bold:
+                backup.copy_new(bold, fonts_dir / bold.name)
+            reg_rel = f"{FONT_DIR}/{regular.name}"
+            bold_rel = f"{FONT_DIR}/{bold.name}" if bold else reg_rel
+            for name in fallback:
+                for alias in {name, Path(name).name}:
+                    for b in (False, True):
+                        for i in (False, True):
+                            mapping[(alias, b, i)] = (bold_rel if b else reg_rel, False, i)
+            notes.append("Шрифты игры без русских букв заменены на PT Sans: " + ", ".join(sorted(fallback)[:6])
+                         + (" …" if len(fallback) > 6 else ""))
+        return mapping, notes
 
     def install_font(self, game_dir: Path, project: TranslationProject, font_path) -> bool:
         return True  # шрифты подключаются в inject (нужен список шрифтов игры)
