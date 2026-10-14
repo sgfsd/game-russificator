@@ -106,8 +106,19 @@ class TranslationService:
             else:
                 pending[key] = group
         if self.memory is not None and pending:
-            hits = self.memory.get_many(self.tr.cache_id, pending.keys())
+            by_ns: Dict[str, List[Key]] = {}
+            for key in pending:
+                by_ns.setdefault(self.tr.memory_ns(key[0]), []).append(key)
+            hits = {}
+            for ns, keys in by_ns.items():
+                hits.update(self.memory.get_many(ns, keys))
+            hits = {k: v for k, v in hits.items() if not filters.is_transliteration(k[0], v)}
             for key, tr in hits.items():
+                if tr == key[0]:                         # запомнено «оставить как есть» (инициалы, буквы)
+                    for e in pending.pop(key):
+                        e.status = EntryStatus.SKIPPED
+                    stats.skipped += 1
+                    continue
                 tr = markup.normalize_layout(key[0], tr)    # записи прошлых версий — тоже в порядок
                 if markup.same_markup(key[0], tr):
                     self._assign(pending.pop(key), tr, True)
@@ -266,6 +277,12 @@ class TranslationService:
             if not tr or not tr.strip():
                 self._failed[key] = group   # решается в конце прохода: повтор, куски, запасной переводчик
                 continue
+            if filters.is_transliteration(rep.source, tr):
+                for e in group:          # инициалы, буквы: «перевод» — те же буквы кириллицей
+                    e.status = EntryStatus.SKIPPED
+                stats.skipped += 1
+                to_memory[key] = rep.source              # в следующий раз — сразу «как есть»
+                continue
             tr = _keep_edges(rep.source, apply_glossary(tr, forced) if forced else tr)
             ok, final = validate_length(rep, tr, self.tr)
             if not ok:
@@ -275,7 +292,11 @@ class TranslationService:
             stats.translated += 1
         if self.memory is not None and to_memory:
             try:
-                self.memory.put_many(self.tr.cache_id, to_memory)
+                by_ns: Dict[str, Dict[Key, str]] = {}
+                for key, tr in to_memory.items():
+                    by_ns.setdefault(self.tr.memory_ns(key[0]), {})[key] = tr
+                for ns, part in by_ns.items():
+                    self.memory.put_many(ns, part)
             except Exception as exc:  # noqa: BLE001
                 log.warning("Память переводов недоступна: %s", exc)
         return len(keys)

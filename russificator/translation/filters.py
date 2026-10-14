@@ -28,6 +28,13 @@ _CODE_RE = re.compile(r"[;{}]\s*$|^\s*(?:function|var|let|const|return|if|for|wh
 _SENTENCE_END = re.compile(r"[.!?…:)\"'»]$")
 
 
+def alphabet_run(token: str, min_len: int = 3) -> bool:
+    """Буквы алфавита подряд («ABCD», «qrst», «XYZ») — строка экрана ввода имени или раскладки, не слово."""
+    t = token.strip()
+    return (len(t) >= min_len and t.isalpha() and t.isascii() and (t.isupper() or t.islower())
+            and all(ord(b) - ord(a) == 1 for a, b in zip(t, t[1:])))
+
+
 def looks_translatable(text: str, strict: bool = False) -> bool:
     """Похоже ли на текст для игрока."""
     if not text:
@@ -35,6 +42,11 @@ def looks_translatable(text: str, strict: bool = False) -> bool:
     s = text.strip()
     if not s or not has_words(s) or is_cyrillic(s):
         return False
+    lines = [ln.strip() for ln in plain_text(s).splitlines() if ln.strip()]
+    compact = [ln.replace(" ", "") for ln in lines]
+    if (any(alphabet_run(ln) for ln in compact)
+            and all(alphabet_run(ln, 2) or not re.search(r"[A-Za-z]{2}", ln) for ln in compact)):
+        return False  # «ABCD↵EFGH↵…» — сетка букв для ввода имени
     if _URL_RE.match(s) or _EMAIL_RE.match(s) or _HEX_RE.match(s):
         return False
     if " " not in s:
@@ -50,7 +62,8 @@ def looks_translatable(text: str, strict: bool = False) -> bool:
             if _IDENT_RE.match(s) and s.isupper() and len(s) > 12:
                 return False
     if strict:
-        if _CODE_RE.search(s):
+        # вставки String.Format («Level {0}») — не фигурные скобки кода
+        if _CODE_RE.search(re.sub(r"\{\d+(?:,-?\d+)?(?::[^{}]*)?\}", "0", s)):
             return False
         p = plain_text(s)
         letters = sum(ch.isalpha() for ch in p)
@@ -94,3 +107,38 @@ def is_brand(text: str) -> bool:
     """Строка — название движка, площадки или соцсети («Made with Unity», «Discord», «Patreon»)."""
     t = re.sub(r"\s+", " ", (text or "").strip())
     return bool(t) and bool(_BRANDS.match(t)) and bool(re.search(r"[A-Za-z]{3,}", t))
+
+
+#: как буквы латиницы передаются кириллицей при транслитерации и «на вид» (B → В, P → Р)
+_TRANSLIT = {
+    "a": ("а", "э", "ей", "эй", "я"), "b": ("б", "би", "в"), "c": ("к", "с", "ц", "си", "ч"),
+    "d": ("д", "ди"), "e": ("е", "э", "и", "ё"), "f": ("ф", "эф"), "g": ("г", "дж", "ж", "джи"),
+    "h": ("х", "г", "", "эйч", "ш", "н"), "i": ("и", "ай", "й", "ы"), "j": ("дж", "й", "ж", "джей"),
+    "k": ("к", "кей"), "l": ("л", "эл", "ль"), "m": ("м", "эм"), "n": ("н", "эн"), "o": ("о", "оу", "а"),
+    "p": ("п", "пи", "р"), "q": ("к", "кью"), "r": ("р", "эр"), "s": ("с", "з", "эс", "ш"),
+    "t": ("т", "ти"), "u": ("у", "ю", "а"), "v": ("в", "ви"), "w": ("в", "у"), "x": ("кс", "х", "икс"),
+    "y": ("й", "и", "ы", "уай", "у"), "z": ("з", "зет", "зи"),
+}
+
+
+def is_transliteration(source: str, translation: str) -> bool:
+    """«Перевод» короткого не-слова — те же буквы кириллицей: инициалы игрока («DAP» → «ДАП»),
+    окончания порядковых («ST», «ND» → «СТ», «НД»), буквы («B» → «Б»). Перевода тут нет — понятнее
+    оставить как в игре. Только для одного «слова» до четырёх букв."""
+    s = (source or "").strip()
+    if not s or any(ch.isspace() for ch in s):
+        return False
+    src = [c for c in s.lower() if c.isalpha()]
+    if not 1 <= len(src) <= 4 or not all("a" <= c <= "z" for c in src):
+        return False
+    dst = "".join(c for c in (translation or "").lower() if c.isalpha())
+    if not dst or any("a" <= c <= "z" for c in dst):
+        return False
+    from functools import lru_cache
+
+    @lru_cache(maxsize=None)
+    def fits(i: int, j: int) -> bool:
+        if i == len(src):
+            return j == len(dst) or dst[j:] == "ь"
+        return any(dst.startswith(o, j) and fits(i + 1, j + len(o)) for o in _TRANSLIT[src[i]])
+    return fits(0, 0)

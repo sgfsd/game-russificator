@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
+import string
 import shutil
 import zipfile
 from pathlib import Path
@@ -501,7 +502,7 @@ def prefix_rules(prefixes: List[str], pairs: Dict[str, str]) -> List[str]:
         if label.endswith(":") and not tr.endswith(":"):
             tr = tr.rstrip(".") + ":"
         value = (tr + tail).replace("$", "$$") + "$1"
-        rules.append(_rule("sr", f"^{_net_regex_escape(p)}([\\S\\s]+)$", value))
+        rules.append(_rule("sr", f"^{_flex_ws(_net_regex_escape(p))}([\\S\\s]+)$", value))
     return rules
 
 
@@ -547,7 +548,7 @@ def template_rules(pairs: Dict[str, str]) -> List[str]:
             continue                      # «{0}{1}» — не разделить
         parts, group_of, numeric, pos = [], {}, True, 0
         for n, m in enumerate(items, 1):
-            parts.append(_net_regex_escape(src[pos:m.start()].replace("{{", "{").replace("}}", "}")))
+            parts.append(_flex_ws(_net_regex_escape(src[pos:m.start()].replace("{{", "{").replace("}}", "}"))))
             if m.group(3) and _NUMERIC_FMT.match(m.group(3)):
                 parts.append(r"([-+]?[\d\s.,\u00a0]*\d[%]?)")
             else:
@@ -555,7 +556,7 @@ def template_rules(pairs: Dict[str, str]) -> List[str]:
                 numeric = False
             group_of[m.group(1)] = n
             pos = m.end()
-        parts.append(_net_regex_escape(src[pos:].replace("{{", "{").replace("}}", "}")))
+        parts.append(_flex_ws(_net_regex_escape(src[pos:].replace("{{", "{").replace("}}", "}"))))
         value = tr.replace("$", "$$").replace("{{", "{").replace("}}", "}")
         ok = True
 
@@ -573,6 +574,15 @@ def template_rules(pairs: Dict[str, str]) -> List[str]:
     return [r for _, r in scored[:MAX_TEMPLATE_RULES]]
 
 
+def number_rules() -> List[str]:
+    """Правила XUnity «число + слово»: игра склеивает число со словом из словаря («+2 Vitality», «-1
+    Agility», «Level 7», «Gold: 50») — целиком такой строки нет нигде. Число остаётся как есть, слово
+    переводится по словарю (или живым переводом). Ставятся после точных строк и шаблонов."""
+    num = r"[-+\u2212]?\d+(?:[.,]\d+)?%?"
+    return [_rule("sr", rf"^({num}\s+)(\p{{L}}[\S\s]*)$", "$1$2"),
+            _rule("sr", rf"^(\p{{L}}[\S\s]*?)(:?\s+{num})$", "$1$2")]
+
+
 def paragraph_rules() -> List[str]:
     """Правило XUnity «по абзацам»: текст, которого целиком нет в словаре, но который игра склеила из
     абзацев (описание предмета + пустая строка + строка обмена/характеристик), переводится по частям —
@@ -586,6 +596,33 @@ def _net_regex_escape(s: str) -> str:
     return re.sub(r"([\\^$.|?*+()\[\]{}])", r"\\\1", s)
 
 
+def _flex_ws(pattern: str) -> str:
+    """Пробелы и переводы строк в тексте правила — любые пробельные: игра переносит строки сама
+    («…by buying items↵in-game») и вставляет «\r\n» вместо «\n» — правило должно сработать."""
+    return re.sub(r"[ \t\r\n]+", lambda m: r"\s+", pattern)
+
+
+def short_guards(pairs: Dict[str, str]) -> List[str]:
+    """Записи «как есть» для одиночных букв и цифр и для 1–2 первых знаков каждой строки словаря.
+
+    С GeneratePartialTranslations XUnity строит перевод для каждого начала строки словаря (чтобы
+    текст, который игра печатает по букве, сразу шёл по-русски) и применяет его к любому тексту:
+    буква «B» в сетке ввода имени или подпись кнопки «A» получают начало чужого перевода («Б»,
+    «Сл»). Точная запись важнее частичной — короткие строки остаются как в игре; печатающийся
+    текст теряет перевод только на первых двух буквах."""
+    keep = set(string.ascii_letters + string.digits)
+    for src in pairs:
+        for k in (1, 2):
+            if len(src) > k:
+                keep.add(src[:k])
+    out = []
+    for p in sorted(keep):
+        if p in pairs or not p.strip() or p != p.strip() or p.startswith(("r:", "//")) or any(c in p for c in "\r\n="):
+            continue
+        out.append(f"{encode(p)}={encode(p)}")
+    return out
+
+
 def write_translations(game: UnityGame, backup, pairs: Dict[str, str], rules: Optional[List[str]] = None) -> int:
     lines = ["// Русификация (Game Russificator). Формат: оригинал=перевод.",
              "// Этот файл можно править вручную — изменения подхватятся при запуске игры."]
@@ -597,6 +634,8 @@ def write_translations(game: UnityGame, backup, pairs: Dict[str, str], rules: Op
             continue
         lines.append(f"{encode(src)}={encode(dst)}")
         n += 1
+    lines += ["// Короткие строки — как есть: иначе XUnity подставит в них начало чужого перевода",
+              "// (частичные переводы для печатающегося текста: «B» → «Б», «I» → «Вс»)."] + short_guards(pairs)
     lang_dir = game.root / "BepInEx" / "Translation" / "ru"
     if not lang_dir.exists():
         lang_dir.mkdir(parents=True)

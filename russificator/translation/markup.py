@@ -121,6 +121,110 @@ def _fix_spacing(masked_source: str, translated: str, count: int, sign: str) -> 
     return translated
 
 
+#: конец строки, после которого фраза закончена (перенос — не посреди фразы)
+_PHRASE_END = tuple(".!?:;…»\"')]>}|*-–—")
+
+
+#: теги разметки и подстановки ({0}, [name]) по краям строки — не текст
+_EDGE_TAGS = r"(?:<[^<>]*>|\{[^{}]*\}|\[[^\[\]]*\])"
+
+
+def _soft_break(prev: str, nxt: str) -> bool:
+    """Перенос посреди фразы: строка не кончается знаком конца фразы, а следующая начинается со
+    строчной буквы («insert↵coin», «you have found↵a rusty key»); теги по краям не в счёт."""
+    p = re.sub(_EDGE_TAGS + r"+\s*$", "", prev.rstrip()).rstrip()
+    # в начале строки пропускаются только теги оформления: строка с подстановки («{2} challenges
+    # passed») или числа — новый пункт, а не продолжение фразы
+    n = re.sub(r"^\s*(?:<[^<>]*>)+", "", nxt).lstrip()
+    return bool(p) and bool(n) and not p.endswith(_PHRASE_END) and n[0].isalpha() and n[0].islower()
+
+
+def join_soft_wraps(text: str):
+    """Склеить строки, разбитые посреди фразы, в одну (через пробел). Возвращает (текст, раскладка)
+    — раскладка None, если склеивать нечего; иначе по ней :func:`rewrap` вернёт переводу те же
+    переносы."""
+    if "\n" not in text:
+        return text, None
+    lines = text.split("\n")
+    groups: List[List[str]] = []
+    for line in lines:
+        if groups and _soft_break(groups[-1][-1], line):
+            groups[-1].append(line)
+        else:
+            groups.append([line])
+    if all(len(g) == 1 for g in groups):
+        return text, None
+    layout = []
+    out = []
+    for g in groups:
+        if len(g) == 1:
+            out.append(g[0])
+            layout.append(None)
+            continue
+        lead = g[0][: len(g[0]) - len(g[0].lstrip())]
+        trail = g[-1][len(g[-1].rstrip()):]
+        eol = "\r\n" if g[0].endswith("\r") else "\n"
+        out.append(lead + " ".join(x.strip() for x in g) + trail)
+        layout.append((eol, [len(x.strip()) for x in g]))
+    return "\n".join(out), layout
+
+
+#: короткие служебные слова: строка ими не кончается («нажмите, чтобы↵присоединиться» — плохо)
+_HANGING = {"и", "а", "но", "или", "в", "во", "на", "с", "со", "к", "ко", "по", "из", "от", "до", "для", "за",
+            "не", "ни", "о", "об", "у", "что", "чтобы", "как", "если", "это", "при", "без", "под", "над"}
+
+
+def _cut_cost(word: str, at: int, target: float, total: int) -> float:
+    """Насколько плох перенос после слова ``word`` (на ``at`` символе при желаемом ``target``):
+    после знака препинания — лучше, после предлога или союза — плохо."""
+    cost = abs(at - target)
+    if word[-1:] in ",;:—–":
+        cost *= 0.5
+    if word.lower().strip(",.;:!?") in _HANGING:
+        cost += total * 0.3
+    return cost
+
+
+def rewrap(text: str, layout) -> str:
+    """Разложить перевод склеенных строк обратно на столько же строк, сколько было в оригинале,
+    — по словам, в той же пропорции длин."""
+    lines = text.split("\n")
+    if len(lines) != len(layout):
+        return text
+    out = []
+    for line, lay in zip(lines, layout):
+        if lay is None:
+            out.append(line)
+            continue
+        eol, lengths = lay
+        lead = line[: len(line) - len(line.lstrip())]
+        trail = line[len(line.rstrip()):]
+        words = re.split(r" (?![^<>]*>)", line.strip())     # пробел внутри тега — не граница слов
+        k = min(len(lengths), len(words))
+        if k <= 1:
+            out.append(line)
+            continue
+        total = len(line.strip())
+        whole = float(sum(lengths)) or 1.0
+        cum = [0]                                    # длина текста до конца i-го слова
+        for w in words:
+            cum.append(cum[-1] + len(w) + (1 if cum[-1] else 0))
+        cuts: List[int] = []                         # после какого слова перенос
+        acc = 0.0
+        for j in range(1, k):
+            acc += lengths[j - 1]
+            target = total * acc / whole
+            lo = (cuts[-1] if cuts else 0) + 1
+            hi = len(words) - (k - j)
+            cuts.append(min(range(lo, hi + 1), key=lambda i: _cut_cost(words[i - 1], cum[i], target, total)))
+        pieces, start = [], 0
+        for c in cuts + [len(words)]:
+            pieces.append(" ".join(words[start:c]))
+            start = c
+        out.append(lead + eol.join(pieces) + trail)
+    return "\n".join(out)
+
+
 def normalize_layout(source: str, translation: str) -> str:
     """Убрать «самодеятельность» переводчика в вёрстке строки.
 
@@ -129,6 +233,11 @@ def normalize_layout(source: str, translation: str) -> str:
     """
     if "\n" not in source and "\n" in translation:
         translation = re.sub(r"[ \t]*\n[ \t]*", " ", translation).strip()
+    # переводчик склеил строки, разбитые посреди фразы (нейросеть так делает почти всегда): перевод
+    # раскладывается на столько же строк, сколько было в оригинале, — игра переносила их по ширине
+    joined, layout = join_soft_wraps(source)
+    if layout and translation.count("\n") == joined.count("\n") < source.count("\n"):
+        translation = rewrap(translation, layout)
     if "\\n" not in source and "\\n" in translation:
         translation = re.sub(r"[ \t]*\\n[ \t]*", " ", translation).strip()
     # «Go to the forest» -> «Иди в лес.»: лишняя точка в конце кнопки/пункта меню

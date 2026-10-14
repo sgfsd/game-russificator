@@ -438,8 +438,8 @@ def test_il_scan_survives_non_dotnet(tmp_path):
 def test_prefix_rules_split_label_and_text():
     rules = xunity.prefix_rules(["Pro Tip: ", "Level (x): "], {"Pro Tip: ": "Совет", "Level (x): ": "Уровень $ (x):"})
     # так правила увидит XUnity после чтения файла (обратные слэши в файле удвоены)
-    assert [_xua_decode_line(r) for r in rules] == [[r'sr:"^Pro Tip: ([\S\s]+)$"', "Совет: $1"],
-                                                    [r'sr:"^Level \(x\): ([\S\s]+)$"', "Уровень $$ (x): $1"]]
+    assert [_xua_decode_line(r) for r in rules] == [[r'sr:"^Pro\s+Tip:\s+([\S\s]+)$"', "Совет: $1"],
+                                                    [r'sr:"^Level\s+\(x\):\s+([\S\s]+)$"', "Уровень $$ (x): $1"]]
 
 
 def test_technical_text_is_not_translated():
@@ -741,3 +741,71 @@ def test_key_hints_are_text_not_log_tags():
         col.add(s, extract.TextKind.UI, "level1")
     assert {"[C] to Crouch", "[Space] Jump over the gap", "[E] Interact"} <= set(col.items)
     assert "[Info] Loading scene" not in col.items and "[Debug] x=1" not in col.items
+
+
+def test_object_table_guard_catches_script_index_change():
+    """Сохранение не должно менять тип и номер скрипта объектов (UnityPy путал их в файлах Unity 5)."""
+    from russificator.engines.unity import unitypy_io
+
+    class _St:
+        script_type_index = 7
+
+    class _Obj:
+        def __init__(self, cid):
+            self.class_id, self.type_id, self.serialized_type = cid, 3, _St()
+
+    class _Sf:
+        def __init__(self, own):
+            self.objects = {1: _Obj(114), 2: _Obj(28)}
+            self._russificator_script_index = own
+
+    class _Env:
+        def __init__(self, own):
+            self.file = _Sf(own)
+            # соседний файл игры, подгруженный при чтении скриптов: те же path_id — не в счёт
+            self.files = {"f": self.file, "other": _Sf({1: 1, 2: 2})}
+    before = unitypy_io.object_table(_Env({1: 9}))
+    assert before == {(0, 1): (114, 3, 9), (0, 2): (28, 3, 7)}
+    assert unitypy_io.same_object_table(before, unitypy_io.object_table(_Env({1: 9}))) == ""
+    assert "номер скрипта" in unitypy_io.same_object_table(before, unitypy_io.object_table(_Env({1: 188})))
+    unitypy_io.fix_script_type_index()          # обёртка ставится один раз и не ломает чтение
+    unitypy_io.fix_script_type_index()
+
+
+def test_short_texts_are_guarded_from_partial_translations():
+    """XUnity с частичными переводами подставлял в одиночные буквы начало чужого перевода (сетка
+    ввода имени Crawl: «B» → «Б», «I» → «Вс»). Буквы, цифры и первые 1–2 знака строк словаря —
+    записи «как есть»; строки, у которых есть свой перевод, не трогаются."""
+    from russificator.engines.unity import xunity
+    pairs = {"Bringing your own hero": "Вернуть своего героя", "On": "Вкл", "Slay the boss": "Убить босса"}
+    guards = xunity.short_guards(pairs)
+    keys = {g.split("=", 1)[0] for g in guards}
+    assert {"B", "Br", "S", "Sl", "A", "z", "7"} <= keys
+    assert "On" not in keys and "O" in keys
+    assert all(g.split("=", 1)[0] == g.split("=", 1)[1] for g in guards)
+
+
+def test_template_rules_match_text_the_game_wrapped_itself():
+    """Игра сама переносит строки (вставляет перевод строки по ширине) — правило-шаблон всё равно
+    срабатывает: пробелы и переводы строк в нём — любые пробельные."""
+    import re
+    from russificator.engines.unity import xunity
+    rule = xunity.template_rules({"{0} / {1} entries found\r\n\r\nDiscover more entries by buying items in-game":
+                                  "Найдено {0} / {1}\r\n\r\nОткройте больше записей, покупая предметы"})[0]
+    key, _ = xunity.decode_line(rule)
+    rx = re.compile(key[len('sr:"'):-1])
+    assert rx.match("1 / 61 entries found\r\n\r\nDiscover more entries by buying items\nin-game")
+    assert rx.match("1 / 61 entries found\n\nDiscover more entries by buying items in-game")
+    assert not rx.match("1 / 61 entries lost\n\nDiscover more entries by buying items in-game")
+
+
+def test_format_strings_from_script_fields_are_collected():
+    """Короткая строка-формат в поле скрипта («{0} / {1} completed», «Level {0}») — подпись для экрана:
+    собирается, хотя «предложением» не выглядит."""
+    from russificator.engines.unity.extract import _format_text, _maybe_add
+    col = extract._Collector()
+    for v in ("{0} / {1} completed", "Level {0}", "{0}_{1}.png", "GetComponent<{0}>()"):
+        _maybe_add(v, "m_stringAchievementsCategorySummary", col, "level2")
+    assert set(col.items) == {"{0} / {1} completed", "Level {0}"}
+    assert _format_text("{0} / {1} completed") and _format_text("Level {0}")
+    assert not _format_text("{0}_{1}.png") and not _format_text("x{0}")

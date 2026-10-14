@@ -6,7 +6,7 @@
     russificator.run_russification(game_dir, mode, …) -> PipelineResult
 """
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 from .translation import ORDER_CONTACT, ORDER_TELEGRAM, create_translator  # noqa: E402,F401
 

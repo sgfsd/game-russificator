@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, urlparse
 from ..core.universal import Entry, TextKind
 from . import markup
 from .base import Translator
-from .filters import is_brand, looks_technical, looks_translatable
+from .filters import is_brand, is_transliteration, looks_technical, looks_translatable
 from .memory import TranslationMemory
 from .service import translate_by_segments
 
@@ -128,10 +128,10 @@ class LiveServer:
         if self.memory is not None:
             try:
                 with self._mem_lock:
-                    hit = self.memory.get_many(self.translator.cache_id, [key]).get(key)
+                    hit = self.memory.get_many(self.translator.memory_ns(text), [key]).get(key)
             except Exception:  # noqa: BLE001
                 hit = None
-            if hit:
+            if hit and not is_transliteration(text, hit):
                 return hit
         started = time.monotonic()
         try:
@@ -151,6 +151,8 @@ class LiveServer:
                                                                        kind=TextKind.OTHER), {})
             except Exception:  # noqa: BLE001
                 tr = None
+        if tr and is_transliteration(text, tr):
+            return text                  # инициалы, буквы: перевода нет — как в игре
         if not tr or not markup.same_markup(text, tr):
             # не вышло и так — отдаём оригинал: повтор даст то же самое, а ошибки XUnity
             # копит и после пяти подряд отключает перевод целиком
@@ -160,7 +162,7 @@ class LiveServer:
         if self.memory is not None:
             try:
                 with self._mem_lock:
-                    self.memory.put_many(self.translator.cache_id, {key: tr})
+                    self.memory.put_many(self.translator.memory_ns(text), {key: tr})
             except Exception:  # noqa: BLE001
                 pass
         self.count += 1

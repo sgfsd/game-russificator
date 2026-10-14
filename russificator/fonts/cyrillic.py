@@ -837,40 +837,97 @@ def _pixel_glyph(ch: str, src: str, target: Style, upper: bool, track: int) -> O
                     arr = _squeeze(arr, room)
             left = (cell - arr.shape[1]) // 2
         advance_px = cell
-    contours: List[List[Tuple[int, int, bool]]] = []
     ox, oy = target.origin
     lift = target.base if upper else target.xbase
     oy = oy + g * round((lift - oy) / g) if lift else oy
-    if arr is not None:
-        h, w = arr.shape
-        # прямоугольники: отрезки строк, одинаковые отрезки соседних строк сливаются
-        open_runs: Dict[Tuple[int, int], int] = {}   # (x0, x1) -> строка начала
-        rects = []
-        for r in range(h + 1):
-            runs = set()
-            if r < h:
-                x = 0
-                while x < w:
-                    if arr[r, x]:
-                        x0 = x
-                        while x < w and arr[r, x]:
-                            x += 1
-                        runs.add((x0, x))
-                    else:
-                        x += 1
-            for run in list(open_runs):
-                if run not in runs:
-                    rects.append((run[0], run[1], open_runs.pop(run), r))
-            for run in runs:
-                open_runs.setdefault(run, r)
-        for x0, x1, r0, r1 in rects:
-            X0 = ox + (left + x0) * g
-            X1 = ox + (left + x1) * g
-            Y1 = oy + (top - r0) * g             # верх прямоугольника
-            Y0 = oy + (top - r1) * g             # низ
-            contours.append([(int(round(X0)), int(round(Y0)), True), (int(round(X0)), int(round(Y1)), True),
-                             (int(round(X1)), int(round(Y1)), True), (int(round(X1)), int(round(Y0)), True)])
+    contours = _cell_contours(arr, left, top, g, ox, oy) if arr is not None else []
     return sfnt.NewGlyph(codepoint=ord(ch), advance=int(round(advance_px * g)), contours=contours)
+
+
+def _cell_contours(arr, left: int, top: int, g: float, ox: float, oy: float) -> List[List[Tuple[int, int, bool]]]:
+    """Клетки буквы -> контуры: граница каждого куска клеток обводится одним контуром (внутренние
+    просветы — отдельными, обходом в другую сторону), как у родных букв пиксельного шрифта.
+
+    Набор отдельных квадратиков или прямоугольников рисуется так же, но хинтинг растеризатора
+    (Unity — FreeType с выравниванием по пикселям) двигает края разных контуров по-разному: на
+    стыках клетки съезжают, а мелкие детали (кратка над Й) пропадают. ``top`` — строк над базовой
+    линией, ``left`` — клеток от начала."""
+    h, w = arr.shape
+
+    def filled(r, c):
+        return 0 <= r < h and 0 <= c < w and bool(arr[r, c])
+
+    # рёбра границы в клетках (x вправо, y вверх от базовой линии); закрашено — справа по ходу
+    out_edges: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+    for r in range(h):
+        for c in range(w):
+            if not arr[r, c]:
+                continue
+            yt, yb = top - r, top - r - 1
+            if not filled(r, c - 1):
+                out_edges.setdefault((c, yb), []).append((c, yt))
+            if not filled(r - 1, c):
+                out_edges.setdefault((c, yt), []).append((c + 1, yt))
+            if not filled(r, c + 1):
+                out_edges.setdefault((c + 1, yt), []).append((c + 1, yb))
+            if not filled(r + 1, c):
+                out_edges.setdefault((c + 1, yb), []).append((c, yb))
+
+    def turn(d_in, d_out) -> int:
+        # правый поворот предпочтительнее: куски, касающиеся углами, остаются разными контурами
+        cross = d_in[0] * d_out[1] - d_in[1] * d_out[0]
+        return 0 if cross < 0 else (1 if cross == 0 else 2)
+
+    loops = []
+    while out_edges:
+        # начало — в обычном углу, не в точке, где куски касаются углами (там два выхода)
+        start = next((p for p, v in out_edges.items() if len(v) == 1), next(iter(out_edges)))
+        loop = [start]
+        cur = start
+        prev_dir = None
+        while True:
+            nexts = out_edges.get(cur)
+            if not nexts:
+                break
+            if prev_dir is not None and len(nexts) > 1:
+                nexts.sort(key=lambda p: turn(prev_dir, (p[0] - cur[0], p[1] - cur[1])))
+            nxt = nexts.pop(0)
+            if not nexts:
+                del out_edges[cur]
+            prev_dir = (nxt[0] - cur[0], nxt[1] - cur[1])
+            cur = nxt
+            if cur == start and start not in out_edges:
+                break
+            loop.append(cur)
+        # точки посреди прямых участков не нужны
+        pts = []
+        n = len(loop)
+        for i in range(n):
+            a, b, c = loop[i - 1], loop[i], loop[(i + 1) % n]
+            if (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]) != 0:
+                pts.append(b)
+        if len(pts) >= 3:
+            loops.append(pts)
+    return [[(int(round(ox + (left + x) * g)), int(round(oy + y * g)), True) for x, y in loop] for loop in loops]
+
+
+def _kit_glyph(ch: str, bm, target: Style, spacing: Tuple[int, int]) -> sfnt.NewGlyph:
+    """Буква, собранная из латиницы пиксельного шрифта (:mod:`pixel_cyrillic`), — в контуры шрифта."""
+    g = target.pixel
+    arr = bm.a
+    lsb, rsb = spacing
+    left, advance_px = lsb, lsb + arr.shape[1] + rsb
+    if target.mono:
+        cell = int(round(target.mono / g))
+        room = cell - 1 if cell > 4 else cell
+        if arr.shape[1] > room:                      # широкая буква (Ж, Ш, Ю) в клетке моноширинного
+            from .pixel_cyrillic import fit_cols
+            arr = fit_cols(arr, room)
+        left = (cell - arr.shape[1]) // 2
+        advance_px = cell
+    ox, oy = target.origin
+    return sfnt.NewGlyph(codepoint=ord(ch), advance=int(round(advance_px * g)),
+                         contours=_cell_contours(arr, left, bm.top, g, ox, oy))
 
 
 def _pixel_tracking(target: Style) -> int:
@@ -944,11 +1001,12 @@ def twin_of(ch: str, style: Style) -> Optional[str]:
     return HOMO_UPPER.get(ch) or (HOMO_SMALLCAPS if style.smallcaps else HOMO_LOWER).get(ch)
 
 
-def make_glyphs(style: Style, todo: Sequence[str], font: Optional[sfnt.Font] = None) -> List[sfnt.NewGlyph]:
+def make_glyphs(style: Style, todo: Sequence[str], font: Optional[sfnt.Font] = None, kit=None) -> List[sfnt.NewGlyph]:
     """Глифы для символов ``todo`` по меркам ``style`` (в единицах ``style.upem``).
 
     ``font`` — сам шрифт игры: из него берутся буквы-двойники латиницы; без него (мерки сняты с
-    атласа) все буквы строятся заново."""
+    атласа) все буквы строятся заново. ``kit`` — латиница пиксельного шрифта в клетках
+    (:mod:`pixel_cyrillic`), если шрифта нет, а есть картинки букв атласа."""
     donors = {b: (_donor_font(b), donor_style(b)) for b in (False, True)}
 
     def pick(upper: bool) -> Tuple[sfnt.Font, _Fit]:
@@ -964,6 +1022,10 @@ def make_glyphs(style: Style, todo: Sequence[str], font: Optional[sfnt.Font] = N
     upper_fit = pick(True)
     lower_fit = pick(False)
     track = _pixel_tracking(style) if style.pixel else 0
+    # пиксельный шрифт: русские буквы собираются из его же латиницы, клетка в клетку
+    if kit is None and style.pixel and font is not None:
+        from . import pixel_cyrillic
+        kit = pixel_cyrillic.kit_from_font(font, style)
     new: List[sfnt.NewGlyph] = []
     by_char: Dict[str, sfnt.NewGlyph] = {}
     for ch in todo:
@@ -981,7 +1043,11 @@ def make_glyphs(style: Style, todo: Sequence[str], font: Optional[sfnt.Font] = N
             # 2) строчные «капителью» — та же форма, что у заглавной
             src = ch.upper() if (ch.islower() and style.smallcaps) else ch
             if style.pixel:
-                ng = _pixel_glyph(ch, src, style, upper, track)
+                bm = None
+                if kit is not None:
+                    bm = kit.upper(ch) if ch.isupper() else kit.lower(ch)
+                ng = (_kit_glyph(ch, bm, style, kit.spacing(upper)) if bm is not None
+                      else _pixel_glyph(ch, src, style, upper, track))
             else:
                 dfont, fit = upper_fit if upper else lower_fit
                 ng = _vector_glyph(ch, src, dfont, fit, style.mono)
@@ -1003,14 +1069,19 @@ def plan(data: bytes, need: Iterable[str]) -> Tuple[Optional[sfnt.Font], List[sf
     return font, make_glyphs(style, todo, font)
 
 
-def synth_font(style: Style, chars: Iterable[str]) -> bytes:
+def synth_font(style: Style, chars: Iterable[str], boxes: Optional[Dict[str, GlyphBox]] = None) -> bytes:
     """Шрифт (TrueType, PT Sans), в котором символы ``chars`` нарисованы по меркам ``style``.
 
     Для атласов TextMeshPro и растровых шрифтов, у которых нет исходного TTF: мерки снимаются с
-    самого атласа, а этот шрифт рисует недостающие буквы кеглем, равным кеглю атласа."""
+    самого атласа, а этот шрифт рисует недостающие буквы кеглем, равным кеглю атласа. У пиксельного
+    атласа (``boxes`` с картинками букв) русские буквы собираются из его латиницы, клетка в клетку."""
     st = style.scaled(1000.0 / style.upem)
     base = _donor_font(False)
-    new = make_glyphs(st, sorted(set(c for c in chars if not c.isspace())))
+    kit = None
+    if style.pixel and boxes:
+        from . import pixel_cyrillic
+        kit = pixel_cyrillic.kit_from_boxes(boxes, style)
+    new = make_glyphs(st, sorted(set(c for c in chars if not c.isspace())), kit=kit)
     return sfnt.build(base, new)
 
 

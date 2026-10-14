@@ -479,3 +479,99 @@ def test_brand_names_are_not_translated():
     from russificator.translation.filters import is_brand
     assert is_brand("Discord") and is_brand("Made with Unity") and is_brand("Patreon")
     assert not is_brand("Discord server rules") and not is_brand("Continue")
+
+
+def test_phrase_split_across_lines_is_translated_whole():
+    """«insert↵coin»: игра разбила фразу на строки ради вёрстки — переводится вся фраза («вставить
+    монету», а не «вставить» + «монета»), перевод раскладывается на столько же строк."""
+    from russificator.translation import machine
+    seen = []
+
+    def run(sentences):
+        seen.extend(sentences)
+        table = {"Insert coin": "Вставить монету", "Insert": "Вставить", "Coin": "Монета",
+                 "Press start to join": "Нажмите старт, чтобы присоединиться", "Options": "Настройки",
+                 "Quit": "Выход", "You found a key.": "Вы нашли ключ.", "It is rusty": "Он ржавый"}
+        return [table.get(s[:1].upper() + s[1:], s) for s in sentences]
+    t = machine.MachineTranslator()
+    t._big = type("Big", (), {"src": None})()
+    t._run = run
+    got = t.translate_texts(["insert\r\ncoin", "Press start\nto join", "Options\nQuit",
+                             "You found a key.\nIt is rusty"])
+    assert got[0] == "вставить\r\nмонету"
+    assert got[1] == "Нажмите старт,\nчтобы присоединиться"
+    assert got[2] == "Настройки\nВыход"                      # список пунктов — строки по отдельности
+    assert got[3] == "Вы нашли ключ.\nОн ржавый"             # конец фразы — перенос настоящий
+    assert "insert coin" in seen and "coin" not in seen
+    assert machine.join_soft_wraps("{0} entries found\r\n{1} challenges passed")[1] is None
+    assert machine.join_soft_wraps("damaging\n<color=#d4be9c>opposing heroes</color>")[1] is not None
+
+
+def test_old_line_by_line_translations_are_redone(tmp_path):
+    """Проект, переведённый прошлой версией (фраза «insert↵coin» — по строкам), при новой русификации
+    переводит такие строки заново; остальные переводы берутся из прошлого раза."""
+    from russificator.core.pipeline import Pipeline
+    from russificator.core.universal import Entry, EntryStatus, TranslationProject
+    from russificator.translation import machine
+
+    def project(entries):
+        p = TranslationProject(tmp_path / "game", "unity", tmp_path / "work")
+        p.entries = [Entry(id=k, source=k, target_key=k) for k in entries]
+        return p
+    old = project(["insert\r\ncoin", "Options\nQuit", "Hello", "-NEW-"])
+    for e, tr in zip(old.entries, ["вставить\r\nмонета", "Настройки\nВыход", "Привет", "-НОВОСТИ-"]):
+        e.translation, e.status = tr, EntryStatus.APPROVED
+    old.meta["translator"] = f"MachineTranslator:{machine.MachineTranslator().cache_id}"
+    old.save()
+    new = project(["insert\r\ncoin", "Options\nQuit", "Hello", "-NEW-"])
+    Pipeline(machine.MachineTranslator())._merge_previous(new, tmp_path / "work")
+    got = {e.source: (e.status, e.translation) for e in new.entries}
+    assert got["insert\r\ncoin"] == (EntryStatus.NEW, None)
+    assert got["Options\nQuit"][1] == "Настройки\nВыход" and got["Hello"][1] == "Привет"
+    assert got["-NEW-"] == (EntryStatus.NEW, None)                  # слово словаря в рамке — из словаря
+    assert new.meta["rules"] == 3
+
+
+def test_letters_initials_and_alphabet_rows_stay_as_is():
+    """Сетка ввода имени («ABCD↵EFGH…»), инициалы игроков («DAP»), окончания порядковых («2ND»)
+    и буквы не «переводятся» транслитерацией («АБСД», «ДАП», «НД») — остаются как в игре."""
+    from russificator.translation.filters import is_transliteration, looks_translatable
+    assert not looks_translatable("ABCD\nEFGH\nIJKL\nMNOP\nQRST") and not looks_translatable("UVWX\nYZ")
+    assert looks_translatable("Start\nQuit") and looks_translatable("ABC Corp")
+    for src, tr in (("DAP", "ДАП"), ("ND", "НД"), ("TH", "ТХ"), ("B", "Б"), ("JED", "ДЖЕД"), ("XP", "ХР")):
+        assert is_transliteration(src, tr), src
+    for src, tr in (("MAP", "КАРТА"), ("On", "Вкл"), ("GO", "ВПЕРЁД!"), ("Start game", "Начать игру")):
+        assert not is_transliteration(src, tr), src
+
+
+def test_title_case_and_caps_leftovers_are_retried_in_sentence_case():
+    """Модель принимает Заглавный Регистр и КАПС за имена («Sallow Cavern» → «Sallow Пещера») —
+    такие строки переводятся ещё раз в обычном регистре; берётся вариант, где английского меньше,
+    выделение капсом в разметке сохраняется."""
+    from russificator.translation import machine
+    table = {"Shattered Roost": "Shattered Roost написал", "Shattered roost": "Разбитое гнездо",
+             "Last attempt: LEVEL 7": "Последняя попытка: LEVEL 7", "Last attempt: level 7": "Последняя попытка: уровень 7",
+             "Challenge KOURAK": "Вызов KOURAK", "Challenge kourak": "Вызов kourak",
+             "Your @0 WRATH @1 grows": "Ваш @0 WRATH @1 растёт", "Your @0 wrath @1 grows": "Ваш @0 гнев @1 растёт"}
+    t = machine.MachineTranslator()
+    t._big = type("Big", (), {"src": None})()
+    t._signs = lambda: "@#"
+    t._run = lambda sentences: [table.get(s, s) for s in sentences]
+    got = t.translate_texts(["Shattered Roost", "Last attempt: LEVEL 7", "Challenge KOURAK", "Your <b>WRATH</b> grows"])
+    assert got[0] == "Разбитое гнездо"
+    assert got[1] == "Последняя попытка: уровень 7"
+    assert got[2] == "Вызов KOURAK"                        # имя не перевелось и так — оставлен первый вариант
+    assert got[3] == "Ваш <b>ГНЕВ</b> растёт"
+    assert t.redo("Shattered Roost", "Shattered Roost написал", 2) and not t.redo("Shattered Roost", "Разбитое гнездо", 2)
+
+
+def test_any_translator_keeps_lines_the_game_wrapped():
+    """Нейросеть склеивает строки, которые игра перенесла по ширине: перевод раскладывается обратно
+    на столько же строк — иначе в TextMesh (без своего переноса) строка уходит за край экрана."""
+    from russificator.translation.markup import normalize_layout
+    src = "0 / 61 entries found\r\n0 challenges passed\n\nDiscover more entries by inhabiting\r\nmonsters in-game"
+    llm = "0 / 61 записей найдено\r\n0 испытаний пройдено\n\nОткрывайте больше записей, вселяясь в монстров в игре"
+    got = normalize_layout(src, llm)
+    assert got.count("\n") == src.count("\n")
+    assert got.startswith("0 / 61 записей найдено\r\n0 испытаний пройдено\n\nОткрывайте")
+    assert normalize_layout("Options\nQuit", "Настройки\nВыход") == "Настройки\nВыход"

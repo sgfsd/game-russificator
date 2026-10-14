@@ -20,6 +20,21 @@
 // 4. Надпись о программе (только в русификаторах «для друзей», параметр credit в
 //    Russificator.cfg): полупрозрачная строка в правом нижнем углу первые секунды игры.
 //
+// 5. TextMesh (Mono): у него нет переноса строк — игры переносят текст сами, вставляя
+//    переводы строк по ширине английского. Русский текст, который пришёл одной строкой
+//    (а игра перенесла бы), разбивается по той же ширине; текст, перенесённый игрой, ищется
+//    в словаре и без её переносов; надписи, которые игра переставляет каждые несколько кадров
+//    (мигающее «insert coin» — XUnity такие перестаёт переводить), сразу получают перевод из
+//    словаря XUnity. Если перевод выключен (Alt+T) — ничего не делается.
+//
+// 6. Текстовые компоненты, которых XUnity не знает (ex2D exSpriteFont, Mono): текст переводится
+//    через XUnity — словарь, правила, живой перевод; буквы для их растровых шрифтов дорисовывает
+//    русификатор.
+//
+// 7. После перестройки текстуры динамического шрифта (в неё добавляются русские буквы) все TextMesh
+//    с этим шрифтом, в том числе неактивные, строятся заново — иначе в них остаются старые координаты
+//    букв и на экране мусор.
+//
 // Типы TextMeshPro и UGUI берутся через отражение (в IL2CPP — обёртки Il2CppInterop,
 // поля там видны как свойства, а объект узнаётся по указателю); из UnityEngine напрямую —
 // только IMGUI для надписи. Любой сбой внутри плагина выключает только его часть, игру
@@ -35,6 +50,7 @@ using System.IO;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using BepInEx;
 using BepInEx.Logging;
@@ -208,18 +224,35 @@ public class RussificatorUnity : BaseUnityPlugin
         if (cfg.TryGetValue("workdir", out workdir) && Directory.Exists(workdir)) psi.WorkingDirectory = workdir;
         Process.Start(psi);
         // ждём, пока сервер откроет порт: иначе XUnity получит отказы и после пяти подряд
-        // отключит перевод до конца игры (обычно это доли секунды)
-        DateTime until = DateTime.Now.AddSeconds(20);
+        // отключит перевод до конца игры (обычно это доли секунды). Но не дольше BlockSeconds:
+        // плагины старых Unity грузятся вместе с первой сценой (часто это уже главное меню), и
+        // долгое ожидание здесь — это зависшая игра. Дальше ждём в фоне, только чтобы записать итог.
+        if (WaitPort(port, BlockSeconds, false)) return;
+        Thread waiter = new Thread(delegate ()
+        {
+            try { WaitPort(port, 20 - BlockSeconds, true); }
+            catch { }
+        });
+        waiter.IsBackground = true;
+        waiter.Start();
+    }
+
+    const int BlockSeconds = 3;
+
+    static bool WaitPort(int port, int seconds, bool report)
+    {
+        DateTime until = DateTime.Now.AddSeconds(seconds);
         while (DateTime.Now < until)
         {
             if (PortOpen(port, 250))
             {
                 _log.LogInfo("Live translation started");
-                return;
+                return true;
             }
             Thread.Sleep(150);
         }
-        _log.LogWarning("Live translation server did not start in 20 s");
+        if (report) _log.LogWarning("Live translation server did not start in 20 s");
+        return false;
     }
 
     static bool PortOpen(int port, int timeoutMs)
@@ -330,6 +363,19 @@ public class RussificatorUnity : BaseUnityPlugin
                 HookUgui(harmony);
             }
         }
+#if !IL2CPP
+        if (_textMesh == null)
+        {
+            Type t = FindType("UnityEngine.TextMesh");
+            if (t != null)
+            {
+                _textMesh = t;
+                HookTextMesh(harmony);
+                HookFontRebuild();
+            }
+        }
+        HookForeign(harmony);
+#endif
     }
 
     static MethodInfo Own(string name)
@@ -502,6 +548,595 @@ public class RussificatorUnity : BaseUnityPlugin
         return false;
     }
 
+    // ---------- 5. TextMesh: перенос по ширине оригинала, словарь XUnity для «мигающих» надписей ----------
+
+#if !IL2CPP
+    static Type _textMesh;
+    static bool _textMeshOff;
+    static bool _xuaLooked;
+    static object _xuaTranslator, _xuaPlugin;
+    static MethodInfo _xuaTry;
+    static FieldInfo _xuaMode;
+    static PropertyInfo _xuaModeProp;
+
+    static void HookTextMesh(Harmony harmony)
+    {
+        try
+        {
+            PropertyInfo text = _textMesh.GetProperty("text");
+            MethodInfo setter = text != null ? text.GetSetMethod() : null;
+            if (setter == null) return;
+            harmony.Patch(setter, new HarmonyMethod(Own("TextMeshPrefix")));
+            _log.LogInfo("TextMesh hooks installed");
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning("TextMesh hooks failed: " + ex.Message);
+        }
+    }
+
+    // XUnity: словарь (TryTranslate) и режим «перевод включён» (Alt+T) — через отражение
+    static void FindXua()
+    {
+        if (_xuaLooked) return;
+        _xuaLooked = true;
+        try
+        {
+            Type api = FindType("XUnity.AutoTranslator.Plugin.Core.AutoTranslator");
+            Type itf = FindType("XUnity.AutoTranslator.Plugin.Core.ITranslator");
+            PropertyInfo def = api != null ? api.GetProperty("Default", BindingFlags.Static | BindingFlags.Public) : null;
+            _xuaTranslator = def != null ? def.GetValue(null, null) : null;
+            if (itf != null)
+                _xuaTry = itf.GetMethod("TryTranslate", new Type[] { typeof(string), typeof(string).MakeByRefType() });
+            Type plugin = FindType("XUnity.AutoTranslator.Plugin.Core.AutoTranslationPlugin");
+            if (plugin != null)
+            {
+                const BindingFlags Any = BindingFlags.Static | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                PropertyInfo cur = plugin.GetProperty("Current", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                FieldInfo curField = plugin.GetField("Current", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                _xuaPlugin = cur != null ? cur.GetValue(null, null) : curField != null ? curField.GetValue(null) : null;
+                _xuaMode = plugin.GetField("_isInTranslatedMode", Any);
+                if (_xuaMode == null) _xuaModeProp = plugin.GetProperty("IsInTranslatedMode", Any);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug("XUnity API: " + ex.Message);
+        }
+        if (_xuaTranslator == null || _xuaTry == null) _xuaLooked = false;   // XUnity ещё не готов — спросим позже
+    }
+
+    static bool XuaTranslating()
+    {
+        try
+        {
+            if (_xuaMode != null) return (bool)_xuaMode.GetValue(_xuaMode.IsStatic ? null : _xuaPlugin);
+            if (_xuaModeProp != null) return (bool)_xuaModeProp.GetValue(_xuaPlugin, null);
+        }
+        catch { }
+        return true;
+    }
+
+    static bool TryXua(string text, out string tr)
+    {
+        if (TryXuaExact(text, out tr)) return true;
+        // «+2 Vitality», «Level 7»: целиком строки в словаре нет — число остаётся, слово по словарю
+        Match m = NumberFirst.Match(text);
+        if (m.Success && TryXuaExact(m.Groups[2].Value, out tr)) { tr = m.Groups[1].Value + tr; return true; }
+        m = NumberLast.Match(text);
+        if (m.Success && TryXuaExact(m.Groups[1].Value, out tr)) { tr = tr + m.Groups[2].Value; return true; }
+        tr = null;
+        return false;
+    }
+
+    static readonly Regex NumberFirst = new Regex(@"^([-+\u2212]?\d+(?:[.,]\d+)?%?\s+)(\p{L}[\S\s]*)$");
+    static readonly Regex NumberLast = new Regex(@"^(\p{L}[\S\s]*?)(:?\s+[-+\u2212]?\d+(?:[.,]\d+)?%?)$");
+
+    static bool TryXuaExact(string text, out string tr)
+    {
+        tr = null;
+        if (_xuaTranslator == null || _xuaTry == null) return false;
+        object[] args = new object[] { text, null };
+        if (!(bool)_xuaTry.Invoke(_xuaTranslator, args)) return false;
+        tr = args[1] as string;
+        return tr != null && tr != text && HasCyrillic(tr);
+    }
+
+    // Диагностика: файл BepInEx/config/Russificator.debug — первые 400 событий текста в журнал BepInEx.
+    static int _debugLeft = -1;
+    static readonly Dictionary<string, bool> _dbgFlags = new Dictionary<string, bool>();
+    static bool DbgFlag(string name)
+    {
+        bool v;
+        if (!_dbgFlags.TryGetValue(name, out v))
+        {
+            try { v = File.Exists(Path.Combine(Paths.ConfigPath, "Russificator." + name)); } catch { v = false; }
+            _dbgFlags[name] = v;
+        }
+        return v;
+    }
+
+    static void Debug(string what, string text, string result)
+    {
+        if (_debugLeft < 0)
+        {
+            _debugLeft = 0;
+            try { if (File.Exists(Path.Combine(Paths.ConfigPath, "Russificator.debug"))) _debugLeft = 400; } catch { }
+        }
+        if (_debugLeft <= 0) return;
+        _debugLeft--;
+        _log.LogInfo(what + ": " + (text ?? "<null>").Replace("\n", "\\n") + " => " + (result ?? "<null>").Replace("\n", "\\n"));
+    }
+
+    static void TextMeshPrefix(object __instance, ref string value)
+    {
+        if (_inside || _textMeshOff || value == null || value.Length < 2) return;
+        if (DbgFlag("noprefix")) return;
+        string before = value;
+        try
+        {
+            FindXua();
+            if (_xuaTranslator == null || !XuaTranslating())
+            {
+                Debug("TextMesh skip (xua " + (_xuaTranslator != null) + ")", value, null);
+                return;
+            }
+            if (HasCyrillic(value))
+            {
+                // перевод (от XUnity или живой): строки — не длиннее строк английского оригинала
+                State st0;
+                if (_states.TryGetValue(KeyOf(__instance), out st0) && st0.Original != null)
+                    value = FitLines(value, st0.Original);
+                return;
+            }
+            if (!HasLatinWord(value)) return;
+            StateOf(__instance).Original = value;
+            string tr, flat;
+            if (TryXua(value, out tr) || (Unwrap(value, out flat) && TryXua(flat, out tr)))
+                value = FitLines(tr, value);
+            Debug("TextMesh", before, value);
+        }
+        catch (Exception ex)
+        {
+            _textMeshOff = true;                 // сбой — эта часть плагина выключается, игра работает дальше
+            _log.LogWarning("TextMesh translation helper disabled: " + ex.Message);
+        }
+    }
+#endif
+
+#if !IL2CPP
+    // Текст сцены, заданный до установки перехватов (надпись на заставке), игра больше не меняет —
+    // ни XUnity, ни перехват его не видят. Раз в секунду: включённые TextMesh с английским текстом,
+    // у которого есть перевод в словаре XUnity, получают его. Только замена текста — без вызовов игры.
+    static float _nextScan;
+    static MethodInfo _findAll;
+    static PropertyInfo _tmText, _tmActive;
+
+    static void ScanTextMeshes()
+    {
+        if (_textMesh == null || _textMeshOff) return;
+        if (DbgFlag("noscan")) return;
+        float now = Time.realtimeSinceStartup;
+        if (now < _nextScan) return;
+        _nextScan = now + 1f;
+        try
+        {
+            FindXua();
+            if (_xuaTranslator == null || !XuaTranslating()) return;
+            if (_findAll == null)
+            {
+                _findAll = FindObjectsMethod(_textMesh);
+                _tmText = _textMesh.GetProperty("text");
+                Type comp = FindType("UnityEngine.Component");
+                PropertyInfo go = comp != null ? comp.GetProperty("gameObject") : null;
+                _tmActive = go != null ? go.PropertyType.GetProperty("activeInHierarchy") : null;
+                if (_findAll == null || _tmText == null) { _textMeshOff = true; return; }
+            }
+            Array all = _findAll.Invoke(null, new object[] { _textMesh }) as Array;
+            if (all == null) return;
+            int done = 0;
+            foreach (object tm in all)
+            {
+                string text = _tmText.GetValue(tm, null) as string;
+                if (text == null || text.Length < 2 || HasCyrillic(text) || !HasLatinWord(text)) continue;
+                string tr, flat;
+                if (!TryXua(text, out tr) && !(Unwrap(text, out flat) && TryXua(flat, out tr)))
+                {
+                    Debug("TextMesh scan miss", text, null);
+                    continue;
+                }
+                Debug("TextMesh scan", text, tr);
+                StateOf(tm).Original = text;
+                _tmText.SetValue(tm, FitLines(tr, text), null);
+                if (++done >= 50) break;
+            }
+        }
+        catch (Exception ex)
+        {
+            _textMeshOff = true;
+            _log.LogWarning("TextMesh scan disabled: " + ex.Message);
+        }
+    }
+#endif
+
+#if !IL2CPP
+    // ---------- 6. Текстовые компоненты, которых XUnity не знает (ex2D exSpriteFont) ----------
+    // XUnity их не видит: сеттер text перехватывается здесь, раз в секунду проверяются и тексты сцены.
+    // Перевод — из словаря XUnity, а если его там нет — запросом к XUnity (живой перевод), ответ
+    // ставится в тот же компонент, если игра за это время не сменила текст. Буквы для их растровых
+    // шрифтов дорисовывает русификатор. tk2dTextMesh сюда не входит: его шрифты кириллицей пока не
+    // дополняются — переведённый текст был бы пустым.
+    static readonly string[] ForeignTextTypes = { "exSpriteFont" };
+    static readonly List<Type> _foreign = new List<Type>();
+    static readonly Dictionary<Type, PropertyInfo> _foreignText = new Dictionary<Type, PropertyInfo>();
+    static readonly Dictionary<string, bool> _requested = new Dictionary<string, bool>();
+    static MethodInfo _xuaAsync;
+    static Type _xuaResult;
+    static PropertyInfo _resOk, _resText;
+    static bool _foreignOff;
+
+    static void HookForeign(Harmony harmony)
+    {
+        foreach (string name in ForeignTextTypes)
+        {
+            Type t = null;
+            foreach (System.Reflection.Assembly a in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try { t = a.GetType(name, false); } catch { }
+                if (t != null) break;
+            }
+            if (t == null || _foreignText.ContainsKey(t)) continue;
+            try
+            {
+                PropertyInfo text = t.GetProperty("text", BindingFlags.Instance | BindingFlags.Public);
+                MethodInfo setter = text != null ? text.GetSetMethod() : null;
+                if (setter == null || text.PropertyType != typeof(string)) continue;
+                harmony.Patch(setter, new HarmonyMethod(Own("ForeignPrefix")));
+                _foreign.Add(t);
+                _foreignText[t] = text;
+                _log.LogInfo(name + " hooks installed");
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(name + " hooks failed: " + ex.Message);
+            }
+        }
+    }
+
+    static void ForeignPrefix(object __instance, ref string value)
+    {
+        if (_inside || _foreignOff || value == null || value.Length < 2) return;
+        try
+        {
+            FindXua();
+            if (_xuaTranslator == null || !XuaTranslating()) return;
+            value = ForeignTranslate(__instance, value);
+        }
+        catch (Exception ex)
+        {
+            _foreignOff = true;
+            _log.LogWarning("Text component helper disabled: " + ex.Message);
+        }
+    }
+
+    // Перевод для компонента: готовый — сразу; нет в словаре — запрос, ответ придёт позже.
+    static string ForeignTranslate(object inst, string value)
+    {
+        string r = ForeignTranslateCore(inst, value);
+        Debug(inst.GetType().Name, value, r);
+        return r;
+    }
+
+    static string ForeignTranslateCore(object inst, string value)
+    {
+        if (HasCyrillic(value))
+        {
+            State st0;
+            if (_states.TryGetValue(KeyOf(inst), out st0) && st0.Original != null) return FitLines(value, st0.Original);
+            return value;
+        }
+        if (!HasLatinWord(value)) return value;
+        StateOf(inst).Original = value;
+        string tr, flat;
+        if (TryXua(value, out tr) || (Unwrap(value, out flat) && TryXua(flat, out tr))) return FitLines(tr, value);
+        RequestAsync(inst, value);
+        return value;
+    }
+
+    sealed class Pending
+    {
+        public object Target;
+        public string Original;
+        public PropertyInfo Prop;
+
+        public void Done(object result)
+        {
+            try
+            {
+                if (result == null || _resOk == null || !(bool)_resOk.GetValue(result, null)) return;
+                string tr = _resText.GetValue(result, null) as string;
+                if (tr == null || !HasCyrillic(tr) || !Alive(Target) || !XuaTranslating()) return;
+                if ((Prop.GetValue(Target, null) as string) != Original) return;   // игра уже сменила текст
+                _inside = true;
+                try { Prop.SetValue(Target, FitLines(tr, Original), null); }
+                finally { _inside = false; }
+            }
+            catch { }
+        }
+    }
+
+    static void RequestAsync(object inst, string text)
+    {
+        if (_requested.ContainsKey(text)) return;
+        if (_xuaAsync == null)
+        {
+            Type itf = FindType("XUnity.AutoTranslator.Plugin.Core.ITranslator");
+            _xuaResult = FindType("XUnity.AutoTranslator.Plugin.Core.TranslationResult");
+            if (itf == null || _xuaResult == null) return;
+            foreach (MethodInfo m in itf.GetMethods())
+                if (m.Name == "TranslateAsync" && m.GetParameters().Length == 2 && m.GetParameters()[0].ParameterType == typeof(string))
+                    _xuaAsync = m;
+            _resOk = _xuaResult.GetProperty("Succeeded");
+            _resText = _xuaResult.GetProperty("TranslatedText");
+            if (_xuaAsync == null) return;
+        }
+        if (_requested.Count > 2000) _requested.Clear();
+        _requested[text] = true;
+        PropertyInfo prop;
+        if (!_foreignText.TryGetValue(inst.GetType(), out prop))
+        {
+            foreach (KeyValuePair<Type, PropertyInfo> kv in _foreignText)
+                if (kv.Key.IsInstanceOfType(inst)) { prop = kv.Value; break; }
+        }
+        if (prop == null) return;
+        Pending p = new Pending { Target = inst, Original = text, Prop = prop };
+        Type action = _xuaAsync.GetParameters()[1].ParameterType;
+        Delegate cb = Delegate.CreateDelegate(action, p, typeof(Pending).GetMethod("Done"));
+        _xuaAsync.Invoke(_xuaTranslator, new object[] { text, cb });
+    }
+
+    static float _nextForeignScan;
+
+    // Тексты сцены, заданные до перехвата: раз в секунду — включённые компоненты с английским текстом.
+    static void ScanForeign()
+    {
+        if (_foreign.Count == 0 || _foreignOff) return;
+        float now = Time.realtimeSinceStartup;
+        if (now < _nextForeignScan) return;
+        _nextForeignScan = now + 1f;
+        try
+        {
+            FindXua();
+            if (_xuaTranslator == null || !XuaTranslating()) return;
+            if (_findAll == null)
+            {
+                _findAll = FindObjectsMethod(_foreign[0]);
+                if (_findAll == null) { _foreignOff = true; return; }
+            }
+            int done = 0;
+            foreach (Type t in _foreign)
+            {
+                PropertyInfo prop = _foreignText[t];
+                Array all = _findAll.Invoke(null, new object[] { t }) as Array;
+                if (all == null) continue;
+                foreach (object c in all)
+                {
+                    string text = prop.GetValue(c, null) as string;
+                    if (text == null || text.Length < 2 || HasCyrillic(text) || !HasLatinWord(text)) continue;
+                    string tr = ForeignTranslate(c, text);
+                    if (tr == text) continue;
+                    _inside = true;
+                    try { prop.SetValue(c, tr, null); }
+                    finally { _inside = false; }
+                    if (++done >= 50) return;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _foreignOff = true;
+            _log.LogWarning("Text component scan disabled: " + ex.Message);
+        }
+    }
+#endif
+
+    // UnityEngine.Object.FindObjectsOfType(Type) — из той же сборки, что и сам компонент (имя
+    // UnityEngine.Object встречается и в других сборках, их метод вернёт пустой список).
+    static MethodInfo FindObjectsMethod(Type component)
+    {
+        for (Type x = component; x != null; x = x.BaseType)
+            if (x.FullName == "UnityEngine.Object")
+                return x.GetMethod("FindObjectsOfType", BindingFlags.Static | BindingFlags.Public, null,
+                                   new Type[] { typeof(Type) }, null);
+        return null;
+    }
+
+#if !IL2CPP
+    // ---------- 7. Перестройка текстуры динамического шрифта ----------
+    // Русские буквы добавляются в текстуру шрифта по ходу игры; когда места нет, Unity перестраивает
+    // её целиком. Надпись, неактивная в этот момент (у пунктов меню выбранный и обычный вид — разные
+    // объекты), остаётся со старыми координатами букв и показывает мусор. После перестройки все
+    // TextMesh с этим шрифтом (и неактивные) строятся заново.
+    static readonly Dictionary<object, bool> _rebuiltFonts = new Dictionary<object, bool>();
+    static bool _rebuildHooked;
+    static MethodInfo _findAllIncl;
+    static PropertyInfo _tmFont;
+
+    static void HookFontRebuild()
+    {
+        if (_rebuildHooked) return;
+        _rebuildHooked = true;
+        try
+        {
+            Type font = FindType("UnityEngine.Font");
+            EventInfo ev = font != null ? font.GetEvent("textureRebuilt", BindingFlags.Static | BindingFlags.Public) : null;
+            if (ev == null) return;
+            ev.AddEventHandler(null, Delegate.CreateDelegate(ev.EventHandlerType,
+                typeof(RussificatorUnity).GetMethod("OnFontRebuilt", BindingFlags.Static | BindingFlags.NonPublic)));
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug("Font rebuild hook: " + ex.Message);
+        }
+    }
+
+    static void OnFontRebuilt(object font)
+    {
+        if (font != null) _rebuiltFonts[font] = true;
+        Debug("font texture rebuilt", font != null ? font.ToString() : null, null);
+    }
+
+    static void RefreshRebuilt()
+    {
+        if (_rebuiltFonts.Count == 0 || _textMesh == null || _textMeshOff) return;
+        Dictionary<object, bool> fonts = new Dictionary<object, bool>(_rebuiltFonts);
+        _rebuiltFonts.Clear();
+        try
+        {
+            if (_findAllIncl == null)
+            {
+                Type res = FindType("UnityEngine.Resources");
+                _findAllIncl = res != null ? res.GetMethod("FindObjectsOfTypeAll", BindingFlags.Static | BindingFlags.Public,
+                                                           null, new Type[] { typeof(Type) }, null) : null;
+                _tmFont = _textMesh.GetProperty("font");
+                if (_tmText == null) _tmText = _textMesh.GetProperty("text");
+                if (_findAllIncl == null || _tmFont == null || _tmText == null) return;
+            }
+            Array all = _findAllIncl.Invoke(null, new object[] { _textMesh }) as Array;
+            if (all == null) return;
+            int n = 0;
+            _inside = true;
+            try
+            {
+                foreach (object tm in all)
+                {
+                    object f = _tmFont.GetValue(tm, null);
+                    if (f == null || !fonts.ContainsKey(f)) continue;
+                    string text = _tmText.GetValue(tm, null) as string;
+                    if (string.IsNullOrEmpty(text)) continue;
+                    // тот же текст Unity не перестраивает — через другой и обратно
+                    _tmText.SetValue(tm, text + " ", null);
+                    _tmText.SetValue(tm, text, null);
+                    n++;
+                }
+            }
+            finally { _inside = false; }
+            Debug("TextMesh refreshed after font rebuild", n.ToString(), null);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug("Font rebuild refresh: " + ex.Message);
+        }
+    }
+#endif
+
+    static bool HasLatinWord(string s)
+    {
+        for (int i = 1; i < s.Length; i++)
+            if (IsLatin(s[i]) && IsLatin(s[i - 1])) return true;
+        return false;
+    }
+
+    static bool IsLatin(char c)
+    {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    }
+
+    static string[] Lines(string s)
+    {
+        return s.Replace("\r\n", "\n").Split('\n');
+    }
+
+    // Текст строки без тегов разметки (<color=…>, <b>) — для длины и для проверки начала строки.
+    static string Plain(string s)
+    {
+        StringBuilder sb = new StringBuilder(s.Length);
+        bool tag = false;
+        foreach (char c in s)
+        {
+            if (c == '<') { tag = true; continue; }
+            if (c == '>' && tag) { tag = false; continue; }
+            if (!tag) sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    const string PhraseEnd = ".!?:;…»\"')]>}|*-–—";
+
+    // Перенос посреди фразы: строка не кончается знаком конца фразы, следующая — со строчной буквы.
+    static bool SoftBreak(string prev, string next)
+    {
+        string p = Plain(prev).TrimEnd();
+        string n = Plain(next).TrimStart();
+        if (p.Length == 0 || n.Length == 0) return false;
+        if (PhraseEnd.IndexOf(p[p.Length - 1]) >= 0) return false;
+        return char.IsLetter(n[0]) && char.IsLower(n[0]);
+    }
+
+    static bool Unwrap(string text, out string flat)
+    {
+        flat = text;
+        string[] ls = Lines(text);
+        if (ls.Length < 2) return false;
+        string eol = text.Contains("\r\n") ? "\r\n" : "\n";
+        StringBuilder sb = new StringBuilder(ls[0].TrimEnd());
+        bool any = false;
+        for (int i = 1; i < ls.Length; i++)
+        {
+            if (SoftBreak(ls[i - 1], ls[i])) { sb.Append(' ').Append(ls[i].Trim()); any = true; }
+            else sb.Append(eol).Append(ls[i]);
+        }
+        flat = sb.ToString();
+        return any;
+    }
+
+    // Строки перевода — не длиннее самой длинной строки оригинала, если оригинал игра переносила сама.
+    static string FitLines(string tr, string orig)
+    {
+        string[] ol = Lines(orig);
+        if (ol.Length < 2) return tr;
+        bool soft = false;
+        int max = 0;
+        for (int i = 0; i < ol.Length; i++)
+        {
+            max = Math.Max(max, Plain(ol[i]).Trim().Length);
+            if (i > 0 && SoftBreak(ol[i - 1], ol[i])) soft = true;
+        }
+        if (!soft || max < 8) return tr;
+        string eol = orig.Contains("\r\n") ? "\r\n" : "\n";
+        StringBuilder outp = new StringBuilder();
+        string[] tl = Lines(tr);
+        for (int i = 0; i < tl.Length; i++)
+        {
+            if (i > 0) outp.Append(eol);
+            string line = tl[i];
+            if (Plain(line).Length <= max || line.IndexOf(' ') < 0)
+            {
+                outp.Append(line);
+                continue;
+            }
+            string[] words = line.Split(' ');
+            int len = 0;
+            for (int w = 0; w < words.Length; w++)
+            {
+                int wl = Plain(words[w]).Length;
+                if (len > 0 && len + 1 + wl > max)
+                {
+                    outp.Append(eol);
+                    len = 0;
+                }
+                else if (w > 0)
+                {
+                    outp.Append(' ');
+                    len++;
+                }
+                outp.Append(words[w]);
+                len += wl;
+            }
+        }
+        return outp.ToString();
+    }
+
     // ---------- 3. проверка, помещается ли перевод ----------
 
     static bool HasCyrillic(string s)
@@ -571,6 +1206,11 @@ public class RussificatorUnity : BaseUnityPlugin
     // Раз в кадр: проверяем в следующем кадре — к этому времени Unity уже расставит размеры рамок.
     public static void Tick()
     {
+#if !IL2CPP
+        RefreshRebuilt();
+        ScanTextMeshes();
+        ScanForeign();
+#endif
         if (_queue.Count == 0) return;
         int n = Math.Min(_queue.Count, 40);
         object[] batch = _queue.GetRange(0, n).ToArray();

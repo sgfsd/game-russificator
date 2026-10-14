@@ -431,7 +431,7 @@ def plan_atlas(boxes: Dict[str, "cyrillic.GlyphBox"], size: float, missing: Sequ
             pass
     if style is None:
         return aliases, [], None, size                  # не текстовый шрифт (значки, другая письменность)
-    return aliases, rest, GlyphRenderer(cyrillic.synth_font(style, rest)), size
+    return aliases, rest, GlyphRenderer(cyrillic.synth_font(style, rest, boxes)), size
 
 
 def patch_font(font: TmpFont, texture, materials: List, need: Iterable[str], source: Optional[bytes] = None,
@@ -610,6 +610,7 @@ def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, byte
     fonts = []
     material_trees: Dict[int, Tuple] = {}
     legacy = []
+    ex2d = []
     ttf = []
     for obj in env.objects:
         try:
@@ -617,6 +618,8 @@ def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, byte
                 tree = obj.read_typetree()
                 if TmpFont.match(tree):
                     fonts.append((obj, TmpFont(tree)))
+                elif is_ex2d_font(tree):
+                    ex2d.append((obj, tree))
             elif obj.type.name == "Font":
                 tree = obj.read_typetree()
                 if is_bitmap_font(tree):
@@ -632,7 +635,7 @@ def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, byte
     # 1) обычные шрифты (TTF/OTF внутри ассета Font): кириллица дописывается в сам шрифт по его меркам —
     #    ими рисуют UI Text, TextMesh, IMGUI и динамические шрифты TextMeshPro
     patched: Dict[int, bytes] = {}
-    checks: List[Tuple[int, bool, FontReport]] = []        # что перепроверить после сохранения
+    checks: List[Tuple[int, object, FontReport]] = []        # что перепроверить после сохранения
     for obj, tree in ttf:
         rep = FontReport(path.name, str(tree.get("m_Name", "font")))
         try:
@@ -703,10 +706,36 @@ def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, byte
             log.warning("Растровый шрифт %s не починен: %s", rep.name, exc)
             rep.error = str(exc)
             reports.append(rep)
+    # 4) растровые шрифты ex2D (exBitmapFont): текст exSpriteFont XUnity не видит — его переводит
+    #    плагин, а буквы для него — здесь
+    ex2d_textures: Dict[int, object] = {}             # одна текстура бывает у нескольких шрифтов
+    for obj, tree in ex2d:
+        rep = FontReport(path.name, str(tree.get("m_Name", "ex2D font")))
+        try:
+            pptr = ex2d_texture_pptr(tree) or {}
+            if int(pptr.get("m_FileID", 0)) != 0 or int(pptr.get("m_PathID", 0)) not in objects_by_id:
+                continue
+            tex_id = int(pptr["m_PathID"])
+            if tex_id not in ex2d_textures:
+                ex2d_textures[tex_id] = objects_by_id[tex_id].read()
+            texture = ex2d_textures[tex_id]
+            added = patch_ex2d_font(tree, texture, need)
+            if added:
+                obj.save_typetree(tree)
+                texture.save()
+                rep.added = added
+                changed = True
+                reports.append(rep)
+                checks.append((obj.path_id, "ex2d", rep))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Шрифт ex2D %s не починен: %s", rep.name, exc)
+            rep.error = str(exc)
+            reports.append(rep)
     if not changed:
         return reports
+    table = unitypy_io.object_table(env)
     data = env.file.save()
-    _verify(data, path, gen, checks, need)
+    _verify(data, path, gen, checks, need, table)
     write(path, data)
     return reports
 
@@ -719,7 +748,8 @@ def _cmap_of(data: bytes) -> Dict[int, int]:
         return {}
 
 
-def _verify(data: bytes, path: Path, gen, checks: List[Tuple[int, bool, FontReport]], need: Set[str]) -> None:
+def _verify(data: bytes, path: Path, gen, checks: List[Tuple[int, object, FontReport]], need: Set[str],
+            table: Optional[dict] = None) -> None:
     """Перечитать сохранённый файл и убедиться, что каждый исправленный шрифт покрывает нужные символы.
 
     ``checks`` — (path_id объекта, это TMP-шрифт, отчёт) для каждого изменённого шрифта. Проверка
@@ -728,10 +758,15 @@ def _verify(data: bytes, path: Path, gen, checks: List[Tuple[int, bool, FontRepo
     """
     with unitypy_io.load_assets(data) as env:
         env.path = str(path.parent)  # внешние ссылки (скрипты шрифтов) — из папки игры
+        if table is not None:
+            # остальные объекты файла — те же, с теми же скриптами (UnityPy умеет их перепутать в Unity 5)
+            problem = unitypy_io.same_object_table(table, unitypy_io.object_table(env))
+            if problem:
+                raise RuntimeError("проверка: " + problem)
         _verify_env(env, gen, checks, need)
 
 
-def _verify_env(env, gen, checks: List[Tuple[int, bool, FontReport]], need: Set[str]) -> None:
+def _verify_env(env, gen, checks: List[Tuple[int, object, FontReport]], need: Set[str]) -> None:
     if gen is not None:
         env.typetree_generator = gen
     objects = {o.path_id: o for o in env.objects}
@@ -740,7 +775,13 @@ def _verify_env(env, gen, checks: List[Tuple[int, bool, FontReport]], need: Set[
         if obj is None:
             raise RuntimeError(f"проверка: шрифт {rep.name} пропал из файла")
         tree = obj.read_typetree()
-        if is_tmp:
+        if is_tmp == "ex2d":
+            have = {int(c["id"]) for c in tree.get("charInfos", [])}
+            pptr = ex2d_texture_pptr(tree) or {}
+            tex = objects[int(pptr["m_PathID"])].read()
+            if tex.image.size != (tex.m_Width, tex.m_Height):
+                raise RuntimeError(f"проверка: текстура шрифта {rep.name} не читается")
+        elif is_tmp:
             fresh = TmpFont(tree)
             have = fresh.chars()
             pptr = fresh.atlas_pptr() or {}
@@ -884,6 +925,140 @@ def patch_legacy_font(tree: dict, texture, need: Iterable[str]) -> int:
         texture.set_image(Image.merge("RGBA", (a8, a8, a8, a8)), target_format=texture.m_TextureFormat)
     return len(glyphs) + len(aliases)
 
+
+# ---------- растровые шрифты ex2D (exBitmapFont: разметка BMFont + текстура) ----------
+
+#: буквы без выносных — по их низу находится базовая линия шрифта BMFont (yoffset — от верха строки)
+_EX2D_BASE_CHARS = "ABCDEFHIKLMNOPRSTUVWXZacemnorsuvwxz"
+
+
+def is_ex2d_font(tree: dict) -> bool:
+    return (isinstance(tree, dict) and isinstance(tree.get("charInfos"), list) and bool(tree["charInfos"])
+            and isinstance(tree.get("pageInfos"), list) and bool(tree["pageInfos"]))
+
+
+def ex2d_texture_pptr(tree: dict) -> Optional[dict]:
+    page = tree["pageInfos"][0] if tree.get("pageInfos") else None
+    return page.get("texture") if isinstance(page, dict) else None
+
+
+def _ex2d_base(chars: List[dict]) -> int:
+    bottoms = [int(c["yoffset"]) + int(c["height"]) for c in chars
+               if 0 < int(c["id"]) < 0x110000 and chr(int(c["id"])) in _EX2D_BASE_CHARS and int(c["height"]) > 0]
+    if not bottoms:
+        return int(max((int(c["yoffset"]) + int(c["height"]) for c in chars), default=0))
+    bottoms.sort()
+    return bottoms[len(bottoms) // 2]
+
+
+def ex2d_boxes(tree: dict, alpha) -> Dict[str, "cyrillic.GlyphBox"]:
+    """Глифы exBitmapFont: x, y — левый верхний угол в текстуре, yoffset — от верха строки до верха глифа."""
+    from ...fonts import cyrillic
+    base = _ex2d_base(tree["charInfos"])
+    out: Dict[str, cyrillic.GlyphBox] = {}
+    for c in tree["charInfos"]:
+        code = int(c["id"])
+        if not 0 < code < 0x110000:
+            continue
+        x, y, w, h = int(c["x"]), int(c["y"]), int(c["width"]), int(c["height"])
+        crop = alpha[y:y + h, x:x + w] >= 0.5 if w > 0 and h > 0 else None
+        mask = crop if crop is not None and crop.size and crop.any() else None
+        out[chr(code)] = cyrillic.GlyphBox(float(w), float(h), float(c["xoffset"]), float(base - int(c["yoffset"])),
+                                           float(c["xadvance"]), mask)
+    return out
+
+
+def patch_ex2d_font(tree: dict, texture, need: Iterable[str]) -> int:
+    """Дорисовать недостающие символы в шрифт ex2D (exBitmapFont): мерки — по его же буквам (пиксельный
+    шрифт — из его латиницы, клетка в клетку), двойники латиницы — готовыми глифами; текстура при
+    нехватке места растёт вниз, нормированные UV всех символов пересчитываются."""
+    import numpy as np
+    from PIL import Image
+
+    chars = tree["charInfos"]
+    have = {int(c["id"]) for c in chars}
+    missing = sorted({c for c in need if ord(c) not in have and not c.isspace()})
+    if not missing:
+        return 0
+    img = texture.image.convert("RGBA")
+    W, H = img.size
+    alpha = np.asarray(img.getchannel("A"), dtype=np.float32) / 255.0
+    boxes = ex2d_boxes(tree, alpha)
+    base = _ex2d_base(chars)
+    size = float(tree.get("size") or tree.get("lineHeight") or 16)
+    pixel = 1.0 if _binary(alpha) else None
+    aliases, rest, rend, size = plan_atlas(boxes, size, missing, None, pixel)
+    pad = 1
+    glyphs = [rend.render(c, size, pad, 1.0, sdf=False, xscale=1.0) for c in rest] if rend is not None else []
+    if pixel:
+        for g in glyphs:
+            if g.bitmap.size:
+                g.bitmap = (g.bitmap >= 0.5).astype(np.float32)
+
+    used = max((int(c["y"]) + int(c["height"]) for c in chars), default=0)
+    ink_rows = np.nonzero(alpha.max(axis=1) > 0)[0]
+    if len(ink_rows):                               # буквы другого шрифта с той же текстурой
+        used = max(used, int(ink_rows[-1]) + 1)
+    placements: Dict[str, Tuple[int, int]] = {}
+    for attempt in range(6):
+        shelf = _Shelf(W, used + 1, H)
+        placements, ok = {}, True
+        for g in glyphs:
+            if g.bitmap.size == 0:
+                continue
+            bh, bw = g.bitmap.shape
+            pos = shelf.place(bw, bh)
+            if pos is None:
+                ok = False
+                break
+            placements[g.char] = pos
+        if ok:
+            break
+        # места нет — текстура растёт вниз: старые буквы остаются там же (x, y — от верха)
+        grow = max(16, int(math.ceil(H * 0.5)))
+        alpha = np.vstack([alpha, np.zeros((grow, W), np.float32)])
+        H += grow
+        if H > 4096:
+            raise RuntimeError("текстура шрифта ex2D слишком велика")
+    else:
+        raise RuntimeError("не удалось разместить символы в текстуре шрифта ex2D")
+
+    by_code = {int(c["id"]): c for c in chars}
+    template = by_code.get(ord("H")) or chars[0]
+    for g in glyphs:
+        entry = copy.deepcopy(template)
+        entry["id"] = ord(g.char)
+        entry["xadvance"] = int(round(g.advance))
+        if g.char not in placements:
+            entry.update({"x": 0, "y": 0, "width": 0, "height": 0, "xoffset": 0, "yoffset": 0})
+        else:
+            px, py = placements[g.char]
+            bh, bw = g.bitmap.shape
+            region = alpha[py:py + bh, px:px + bw]
+            np.maximum(region, g.bitmap, out=region)
+            entry.update({"x": px, "y": py, "width": bw, "height": bh,
+                          "xoffset": int(round(g.bearing_x)) - pad,
+                          "yoffset": base - (int(round(g.bearing_y)) + pad)})
+        chars.append(entry)
+    for c, t in aliases.items():
+        src = by_code.get(ord(t))
+        if src is not None:
+            entry = copy.deepcopy(src)
+            entry["id"] = ord(c)
+            chars.append(entry)
+    for c in chars:                                 # UV нормированы по размеру текстуры — пересчёт для всех
+        if isinstance(c.get("uv0"), dict):
+            c["uv0"] = {"x": int(c["x"]) / W, "y": (H - int(c["y"]) - int(c["height"])) / H}
+    if glyphs:
+        rgba = np.asarray(img, dtype=np.uint8)
+        if rgba.shape[0] < H:
+            rgba = np.vstack([rgba, np.zeros((H - rgba.shape[0], W, 4), np.uint8)])
+        rgba = rgba.copy()
+        new_ink = alpha > (rgba[..., 3].astype(np.float32) / 255.0 + 1e-6)
+        rgba[new_ink, 0:3] = 255                    # буквы белые: цвет даёт материал и вершины ex2D
+        rgba[..., 3] = np.maximum(rgba[..., 3], np.round(alpha * 255).astype(np.uint8))
+        texture.set_image(Image.fromarray(rgba, "RGBA"), target_format=texture.m_TextureFormat)
+    return len(glyphs) + len(aliases)
 
 # ---------- вся игра ----------
 

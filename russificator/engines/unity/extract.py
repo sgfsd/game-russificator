@@ -345,8 +345,24 @@ def _walk_strings(node, col: _Collector, origin: str, depth: int, field: str = "
 def _maybe_add(v: str, field: str, col: _Collector, origin: str) -> None:
     if not looks_translatable(v, strict=True):
         return
-    if looks_like_sentence(v) or (field and _LABEL_FIELD_RE.search(field) and _ui_word(v)):
+    if (looks_like_sentence(v) or (field and _LABEL_FIELD_RE.search(field) and _ui_word(v))
+            or _format_text(v)):
         col.add(v, TextKind.OTHER, origin)
+
+
+#: вставка .NET String.Format: {0}, {1:N0}
+_FORMAT_SLOT_RE = re.compile(r"\{\d+(?:,-?\d+)?(?::[^{}]*)?\}")
+
+
+def _format_text(v: str) -> bool:
+    """Строка-формат для экрана («{0} / {1} completed», «Level {0}»): вставки String.Format и хотя бы
+    одно настоящее слово. Короткую фразу без вставок фильтр «предложения» отсеял бы, а это подпись,
+    которую игра покажет с числами."""
+    if not _FORMAT_SLOT_RE.search(v):
+        return False
+    rest = _FORMAT_SLOT_RE.sub(" ", v)
+    words = re.findall(r"[A-Za-z]{3,}", rest)
+    return bool(words) and not re.search(r"[a-z][A-Z]|_|\.\w", rest)
 
 
 # ---------- скрипты, которые не читаются по typetree ----------
@@ -576,7 +592,7 @@ def extract_code_strings(game: UnityGame, col: _Collector, warnings: List[str]) 
                                 "переведутся в игре на лету.")
     for s in strings:
         col.see(s, "code")
-        if looks_translatable(s, strict=True) and (looks_like_sentence(s) or _ui_word(s)):
+        if looks_translatable(s, strict=True) and (looks_like_sentence(s) or _ui_word(s) or _format_text(s)):
             col.add(s, TextKind.OTHER, "code")
             if _PREFIX_RE.fullmatch(s) and s not in col.prefixes and len(col.prefixes) < 300:
                 col.prefixes.append(s)

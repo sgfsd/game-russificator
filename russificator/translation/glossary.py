@@ -99,8 +99,13 @@ def ui_phrase(text: str) -> Optional[str]:
     """Готовый перевод UI-строки по точному совпадению (или None)."""
     core = text.strip()
     tr = ui_phrases().get(core.lower())
-    if tr is None:
-        return None
     lead = text[: len(text) - len(text.lstrip())]
     trail = text[len(text.rstrip()):]
+    if tr is None:
+        # слово в рамке из знаков: «-NEW-», «[ OK ]», «~Start~» — в словаре ищется само слово
+        m = re.fullmatch(r"([^\w\s]+\s*)(\w[\w' ]*\w|\w)(\s*[^\w\s]+)", core)
+        tr = ui_phrases().get(m.group(2).lower()) if m else None
+        if tr is None:
+            return None
+        return lead + m.group(1) + match_case(tr, m.group(2)) + m.group(3) + trail
     return lead + match_case(tr, core) + trail

@@ -49,6 +49,20 @@ class Translator(ABC):
     #: сколько батчей можно переводить одновременно
     parallel: int = 1
 
+    def memory_ns(self, source: str) -> str:
+        """Раздел памяти переводов для строки ``source``: у строк, которые переводчик стал переводить
+        иначе (новые правила), — свой раздел, чтобы старый перевод из памяти не вернулся."""
+        return self.cache_id
+
+    def rules_version(self) -> int:
+        """Версия правил перевода: переводы прошлых проектов с меньшей версией переделываются там,
+        где правила изменились (:meth:`redo`)."""
+        return 0
+
+    def redo(self, source: str, translation: str, old_version: int) -> bool:
+        """Перевод ``translation`` строки ``source``, сделанный по правилам ``old_version``, надо переделать."""
+        return False
+
     def prepare(self, status: StatusFn = _noop, cancel: Optional[threading.Event] = None) -> None:
         """Подготовить переводчик к работе (скачать, запустить, проверить)."""
 

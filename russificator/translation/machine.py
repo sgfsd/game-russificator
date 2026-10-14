@@ -38,6 +38,7 @@ from typing import Dict, List, Optional, Tuple
 from .. import net, paths
 from ..core.universal import Entry
 from . import markup
+from .markup import join_soft_wraps, rewrap
 from .base import StatusFn, Translator, TranslatorError, _noop
 from .glossary import match_case, ui_phrase
 
@@ -344,8 +345,41 @@ class MachineTranslator(Translator):
                                            max_decoding_length=min(512, max(len(p) for p in pieces) * 3 + 10))
         return [self._sp.decode(r.hypotheses[0]) for r in results]
 
+    def memory_ns(self, source: str) -> str:
+        if join_soft_wraps(source)[1] is not None:
+            return self.cache_id + ":wrap"
+        if _framed_phrase(source):
+            return self.cache_id + ":ui"
+        if _decap(source) != source:
+            return self.cache_id + ":dc"
+        return self.cache_id
+
+    def rules_version(self) -> int:
+        # 1 — фраза, разбитая на строки, переводится целиком; 2 — слово словаря интерфейса в рамке
+        # из знаков («-NEW-») берётся из словаря; 3 — оставшиеся английскими слова Заглавного
+        # Регистра и КАПСА переводятся повторно в обычном регистре
+        return 3
+
+    def redo(self, source: str, translation: str, old_version: int) -> bool:
+        return ((old_version < 1 and join_soft_wraps(source)[1] is not None)
+                or (old_version < 2 and _framed_phrase(source))
+                or (old_version < 3 and _decap(source) != source and _leftover(source, translation or "") > 0))
+
     def translate_texts(self, texts: List[str]) -> List[str]:
-        """Перевести произвольные строки (с защитой разметки). Для тестов и сервера перевода."""
+        """Перевести произвольные строки (с защитой разметки). Для тестов и сервера перевода.
+
+        Строки модель переводит по одной; фраза, разбитая игрой на строки ради вёрстки («insert↵coin»),
+        переводится целиком и раскладывается обратно на столько же строк."""
+        layouts = []
+        joined = []
+        for text in texts:
+            j, layout = join_soft_wraps(text)
+            joined.append(j)
+            layouts.append(layout)
+        done = self._translate_lines(joined)
+        return [rewrap(d, layout) if layout else d for d, layout in zip(done, layouts)]
+
+    def _translate_lines(self, texts: List[str]) -> List[str]:
         out: List[Optional[str]] = [None] * len(texts)
         plans: List[Tuple[int, List[Tuple[str, List[str], str, List[Tuple[str, str, str, bool]]]]]] = []
         queue: List[str] = []
@@ -379,6 +413,16 @@ class MachineTranslator(Translator):
             plans.append((i, lines))
 
         done = self._run(queue)
+        # Заглавный Регистр и КАПС модель принимает за имена и оставляет английскими («Sallow Cavern» →
+        # «Sallow Пещера», «LEVEL 7»), а то и дописывает мусор («Quarry of the Damned скачать»):
+        # такие строки переводятся ещё раз в обычном регистре — берётся вариант, где английского меньше
+        retry = [k for k, src in enumerate(queue) if _leftover(src, done[k]) and _decap(src) != src]
+        if retry:
+            again = self._run([_decap(queue[k]) for k in retry])
+            for k, alt in zip(retry, again):
+                if _leftover(queue[k], alt) < _leftover(queue[k], done[k]):
+                    alt = _recap_marked(queue[k], alt)
+                    done[k] = alt[:1].upper() + alt[1:] if queue[k][:1].isupper() else alt
 
         for i, lines in plans:
             result_lines = []
@@ -515,6 +559,46 @@ def _spaced(masked: str, sign: str) -> str:
     """Маркеры вставок отделены пробелами от соседних слов (для модели)."""
     s = re.sub(rf"(?<=\S)({re.escape(sign)}\d+)", r" \1", masked)
     return re.sub(rf"({re.escape(sign)}\d+)(?=[^\s\d])", r"\1 ", s)
+
+
+def _leftover(src: str, tr: str) -> int:
+    """Сколько слов оригинала (от 3 букв) осталось в переводе по-английски."""
+    words = {w.lower() for w in re.findall(r"[A-Za-z]{3,}", src)}
+    return sum(1 for w in re.findall(r"[A-Za-z]{3,}", tr) if w.lower() in words)
+
+
+def _decap(s: str) -> str:
+    """Та же строка в обычном регистре: слова капсом (от 3 букв) — строчными, слова с заглавной
+    — строчными, кроме первого слова и первого после конца фразы."""
+    out = []
+    start = True
+    for tok in re.split(r"(\s+)", s):
+        m = re.match(r"^([^A-Za-z]*)([A-Za-z][A-Za-z']*)(.*)$", tok)
+        if m:
+            lead, word, rest = m.groups()
+            if word.isupper() and len(word) >= 3:
+                word = word.capitalize() if start else word.lower()
+            elif word[0].isupper() and word[1:].islower() and not start:
+                word = word.lower()
+            tok = lead + word + rest
+            start = bool(re.search(r"[.!?]$", tok))
+        out.append(tok)
+    return "".join(out)
+
+
+def _recap_marked(src: str, tr: str) -> str:
+    """Слово капсом между маркерами разметки («<color>ESCAPE</color>» — выделение) и в переводе
+    остаётся капсом: перевод между теми же маркерами пишется заглавными."""
+    for m in re.finditer(r"([@#&*$]\d+)\s*([A-Z][A-Z' ]*[A-Z])\s*([@#&*$]\d+)", src):
+        a, b = re.escape(m.group(1)), re.escape(m.group(3))
+        tr = re.sub(a + r"(?!\d)(.*?)" + b + r"(?!\d)", lambda x: x.group(0).upper(), tr, count=1)
+    return tr
+
+
+def _framed_phrase(source: str) -> bool:
+    """Слово словаря интерфейса в рамке из знаков («-NEW-», «[ OK ]»), а не само по себе."""
+    from .glossary import ui_phrases
+    return ui_phrase(source) is not None and source.strip().lower() not in ui_phrases()
 
 
 def _no_additions(src: str, tr: str) -> str:

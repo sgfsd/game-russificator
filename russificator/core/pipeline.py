@@ -290,6 +290,7 @@ class Pipeline:
         # сменили машинный перевод на нейросеть — значит, хотят перевести заново и лучше
         translator_id = f"{type(self.translator).__name__}:{self.translator.cache_id}"
         project.meta["translator"] = translator_id
+        project.meta["rules"] = self.translator.rules_version()
         if not (work_dir / TranslationProject.PROJECT_FILE).exists():
             return
         try:
@@ -304,9 +305,22 @@ class Pipeline:
             return
         n = project.merge_translations(old)
         from ..translation.markup import normalize_layout
+        from .universal import EntryStatus
+        from ..translation.filters import is_transliteration
+        version = self.translator.rules_version()
+        old_version = int(old.meta.get("rules", 0) or 0)
         for e in project.entries:        # переводы прошлых версий программы — к нынешним правилам
-            if e.translation:
-                e.translation = normalize_layout(e.source, e.translation)
+            if not e.translation:
+                continue
+            if old_version < version and self.translator.redo(e.source, e.translation, old_version):
+                e.translation, e.status = None, EntryStatus.NEW      # правила изменились — переводится заново
+                n -= 1
+                continue
+            if is_transliteration(e.source, e.translation):           # «DAP» → «ДАП»: остаётся как в игре
+                e.translation, e.status = None, EntryStatus.SKIPPED
+                n -= 1
+                continue
+            e.translation = normalize_layout(e.source, e.translation)
         if n:
             self.info(f"Продолжаю прошлую работу: {n} строк уже переведено")
 
