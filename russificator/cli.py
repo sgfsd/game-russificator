@@ -11,7 +11,6 @@
     russificator export "C:/Games/MyGame" --out "D:/Русификаторы"   # архив для друзей
     russificator install "D:/Игра — русификатор.zip" "C:/Games/MyGame"
     russificator games                           # установленные игры (Steam, GOG, Epic…)
-    russificator order
 """
 
 from __future__ import annotations
@@ -82,8 +81,6 @@ def main(argv=None) -> int:
     p.add_argument("game_dir")
 
     sub.add_parser("games", help="установленные игры на компьютере")
-
-    sub.add_parser("order", help="заказать качественный перевод у автора")
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -181,10 +178,6 @@ def main(argv=None) -> int:
             print(f"{g.title:40.40}  {g.to_dict()['engine_title']:18.18}  {g.path}")
         return 0
 
-    if args.cmd == "order":
-        print("Нужен качественный ручной перевод? Напишите автору в Telegram: "
-              f"@{russificator.ORDER_TELEGRAM} — {russificator.ORDER_CONTACT}")
-        return 0
     return 0
 
 

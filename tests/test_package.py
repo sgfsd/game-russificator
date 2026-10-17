@@ -99,7 +99,8 @@ def test_mv_package_roundtrip_with_credit(mv_game, tmp_path):
     assert top + "Прочти.txt" in names and top + DATA_DIR + "/package.json" in names
     assert not any("www/data" in n for n in names)            # файлов игры в архиве нет
     readme = zipfile.ZipFile(z).read(top + "Прочти.txt").decode("utf-8-sig")
-    assert "@TRAPYCHINO" in readme and "Переведено строк" in readme
+    assert branding.GITHUB_URL in readme and "Переведено строк" in readme
+    assert "TRAPYCHINO" not in readme                        # без рекламы и заказов
 
     pkg = open_package(z)
     try:

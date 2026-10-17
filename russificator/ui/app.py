@@ -21,8 +21,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import russificator
-from .. import paths, settings
-from ..translation import ORDER_CONTACT, ORDER_TELEGRAM
+from .. import branding, paths, settings
+from ..translation import AUTHOR_CONTACT, AUTHOR_TELEGRAM
 
 log = logging.getLogger("russificator.ui")
 
@@ -63,6 +63,7 @@ class Api:
         self._last_progress = 0.0
         self._live = None                         # LiveServer живого перевода
         self._live_cancel = threading.Event()
+        self._detected: Dict[str, Any] = {}       # что определил detect() — для отчёта об ошибке
         from .games import Library
         self._library = Library(self._emit)
 
@@ -155,7 +156,8 @@ class Api:
                         "download_mb": machine.APPROX_SIZE_MB},
             "ram_gb": round(local_llm.total_ram_gb(), 1),
             "runtime_installed": local_llm.server_exe() is not None,
-            "order": {"telegram": ORDER_TELEGRAM, "url": ORDER_CONTACT},
+            "author": {"telegram": AUTHOR_TELEGRAM, "url": AUTHOR_CONTACT},
+            "issues_url": f"{branding.GITHUB_URL}/issues",
             "data_dir": str(paths.app_home()),
         }
 
@@ -177,6 +179,82 @@ class Api:
         return {"ram_gb": round(local_llm.total_ram_gb(), 1), "gpus": gpus,
                 "gpu_known": local_llm.server_exe() is not None,
                 "recommended": local_llm.recommend_preset(vram_gb=vram if vram is not None else 0)}
+
+    def bug_report(self) -> Dict[str, Any]:
+        """Отчёт об ошибке для issue на GitHub (markdown): версия, система, железо, способ перевода,
+        игра и движок, хвост журнала. Ключи API и домашняя папка из текста вычищены."""
+        from .. import report
+        from ..translation import local_llm, machine
+        from ..translation.cloud import PROVIDERS
+        cfg = self._cfg
+        hw = self.hardware()
+        gpus = [f"{g['name']} ({g['vram_gb']:.0f} ГБ)" for g in hw["gpus"]] or report.gpu_names()
+        mode = cfg.get("mode", "machine")
+        if mode == "local":
+            custom = cfg.get("local_custom_model") or ""
+            preset = local_llm.PRESET_BY_ID.get(cfg.get("local_model") or "") \
+                or local_llm.PRESET_BY_ID[hw["recommended"]]
+            model = f"свой файл {Path(custom).name}" if custom else preset.title
+            how = "локальная нейросеть (llama.cpp)"
+            ready = "да" if custom or local_llm.model_installed(preset) else "нет"
+            ready += "" if hw["gpu_known"] else ", llama.cpp не установлен"
+        elif mode == "cloud":
+            prov = PROVIDERS.get(cfg.get("cloud_provider") or "")
+            model = cfg.get("cloud_model") or (prov.default_model if prov else "")
+            how = f"нейросеть по API — {prov.title if prov else cfg.get('cloud_provider')}"
+            if cfg.get("cloud_provider") == "custom" or not prov:
+                how += " (свой адрес)"
+            ready = "да" if self._key(cfg.get("cloud_provider") or "") or (prov and not prov.needs_key) else "нет ключа"
+        else:
+            how = "машинный переводчик"
+            model = "OPUS-MT en→ru" if machine.big_installed() else "Argos en→ru"
+            ready = "да" if machine.is_installed() else "нет"
+        live = self._live_call("/status", timeout=0.3)
+        facts: Dict[str, Any] = {
+            "system": {
+                "Версия программы": f"{russificator.__version__} ({report.program_build()})",
+                "Windows": report.windows_name(),
+                "ОЗУ": f"{hw['ram_gb']:g} ГБ",
+                "Видеокарта": ", ".join(gpus) or "не определена",
+            },
+            "translation": {
+                "Способ": how,
+                "Модель": model,
+                "Модель установлена": ready,
+                "Видеокарта для нейросети": ("да" if cfg.get("local_gpu", True) else "нет") if mode == "local" else "",
+                "Живой перевод поверх экрана": f"включён, способ {cfg.get('live_mode', 'auto')}"
+                if live else "выключен",
+            },
+            "game": {},
+        }
+        game = cfg.get("game_dir") or ""
+        if game:
+            det = self._detected if self._detected.get("path") == game else {}
+            engine = det.get("engine") or ""
+            if not engine and Path(game).is_dir():
+                from ..library import quick_engine
+                engine = {"unity": "Unity", "renpy": "Ren'Py", "rpgmaker": "RPG Maker"}.get(
+                    quick_engine(Path(game)), "")
+            facts["game"] = {
+                "Название": Path(game).name,
+                "Папка": game,
+                "Движок": engine or "не определён",
+                "Как определён": det.get("details") or "",
+                "Русифицирована": self._russified(game),
+            }
+        secrets = [self._key(p) for p in set(self._session_keys) | set(cfg.get("cloud_keys") or {})]
+        logs = paths.logs_dir()
+        text = report.build(facts, logs / "russificator.log", logs / "russificator.prev.log", secrets)
+        return {"ok": True, "text": text}
+
+    @staticmethod
+    def _russified(game: str) -> str:
+        from ..core.backup import GameBackup
+        try:
+            b = GameBackup(Path(game))
+            return ("да" if b.check()[0] else "да, но файлы игры менялись после русификации") if b.exists else "нет"
+        except Exception:  # noqa: BLE001
+            return ""
 
     def save_settings(self, partial: Dict[str, Any]) -> Dict[str, Any]:
         partial = {k: v for k, v in (partial or {}).items() if k in settings.DEFAULTS and k != "cloud_keys"}
@@ -295,6 +373,7 @@ class Api:
             pass
         self._cfg["game_dir"] = str(p)
         settings.save(self._cfg)
+        self._detected = {"path": str(p), "engine": det.engine_name or plugin.title, "details": det.details}
         from ..core.package import can_export
         exportable, why = can_export(p)
         backup = GameBackup(p)

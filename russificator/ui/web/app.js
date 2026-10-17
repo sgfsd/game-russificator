@@ -82,7 +82,7 @@ async function boot() {
   const st = S.init.settings;
   $("#ver").textContent = S.init.version;
   $("#aboutVer").textContent = S.init.version;
-  $("#tgHandle").textContent = "@" + S.init.order.telegram;
+  $("#tgHandle").textContent = "@" + S.init.author.telegram;
   S.mode = ["machine", "local", "cloud"].includes(st.mode) ? st.mode : "machine";
   S.provider = st.cloud_provider || "deepseek";
   S.preset = st.local_model || null;
@@ -133,7 +133,7 @@ function showPage(name) {
 
 function bindUi() {
   $$(".nav-item").forEach((b) => b.addEventListener("click", () => showPage(b.dataset.page)));
-  $("#orderCta").addEventListener("click", openOrder);
+  $("#helpCta").addEventListener("click", openHelp);
   $$("[data-close]").forEach((b) => b.addEventListener("click", () => b.closest(".modal").classList.add("hidden")));
   $$(".modal").forEach((m) => m.addEventListener("mousedown", (e) => { if (e.target === m) m.classList.add("hidden"); }));
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") $$(".modal").forEach((m) => m.classList.add("hidden")); });
@@ -143,10 +143,7 @@ function bindUi() {
   $("#changeGame").addEventListener("click", pickGame);
 
   // способы
-  $$(".mode").forEach((m) => m.addEventListener("click", () => {
-    if (m.dataset.mode === "order") return openOrder();
-    selectMode(m.dataset.mode);
-  }));
+  $$(".mode").forEach((m) => m.addEventListener("click", () => selectMode(m.dataset.mode)));
 
   // машинный
   $("#mtDownload").addEventListener("click", async () => {
@@ -277,9 +274,12 @@ function bindUi() {
   $("#exportGo").addEventListener("click", runExport);
   $("#exportReveal").addEventListener("click", () => S.exportPath && api().reveal(S.exportPath));
 
-  // заказ
-  $("#openTg").addEventListener("click", () => api().open_url(S.init.order.url));
-  $("#copyTg").addEventListener("click", () => copyText("@" + S.init.order.telegram));
+  // помощь
+  $("#openIssues").addEventListener("click", () => api().open_url(S.init.issues_url));
+  $("#openTg").addEventListener("click", () => api().open_url(S.init.author.url));
+  $("#copyTg").addEventListener("click", () => copyText("@" + S.init.author.telegram));
+  $("#copyReport").addEventListener("click", copyReport);
+  $("#logReport").addEventListener("click", copyReport);
 
   // модели и настройки
   $("#clearMem").addEventListener("click", () => confirmBox("Очистить память переводов?",
@@ -1309,7 +1309,6 @@ async function openExport() {
   $("#exportGame").textContent = "«" + S.game.name + "»";
   $("#exportDir").textContent = d.dir;
   $("#exportCredit").checked = d.credit;
-  $$(".tgName").forEach((el) => { el.textContent = S.init.order.telegram; });
   $("#exportProgress").classList.add("hidden");
   $("#exportDone").classList.add("hidden");
   $("#exportMsgs").innerHTML = "";
@@ -1361,10 +1360,26 @@ function onExportDone(ev) {
   toast("Архив-русификатор готов");
 }
 
-/* ---------------- заказ перевода ---------------- */
+/* ---------------- помощь ---------------- */
 
-function openOrder() {
-  $("#orderModal").classList.remove("hidden");
+function openHelp() {
+  $("#helpModal").classList.remove("hidden");
+}
+
+/* Отчёт об ошибке: Python собирает markdown (версия, система, игра, хвост журнала — без ключей
+   и личных путей), здесь он только кладётся в буфер обмена. */
+async function copyReport(e) {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  try {
+    const r = await api().bug_report();
+    if (!r || !r.ok) { toast((r && r.error) || "Не получилось собрать отчёт — откройте журнал в папке данных", true); return; }
+    await copyText(r.text, "Отчёт скопирован — вставьте его в сообщение на GitHub или в Telegram");
+  } catch (err) {
+    toast("Не получилось собрать отчёт: " + err, true);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 /* ---------------- мелочи ---------------- */
@@ -1389,14 +1404,14 @@ function toast(text, isError = false) {
   toastTimer = setTimeout(() => t.classList.add("hidden"), isError ? 6000 : 3000);
 }
 
-async function copyText(text) {
+async function copyText(text, done = "") {
   try { await navigator.clipboard.writeText(text); }
   catch (e) {
     const ta = document.createElement("textarea");
     ta.value = text; document.body.appendChild(ta); ta.select();
     document.execCommand("copy"); ta.remove();
   }
-  toast("Скопировано: " + text);
+  toast(done || "Скопировано: " + text);
 }
 
 /* ---------------- полнота перевода (Unity) ---------------- */

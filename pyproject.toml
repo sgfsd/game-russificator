@@ -8,12 +8,12 @@ version = "2.4.0"
 description = "Универсальный авторусификатор PC-игр: Unity, Ren'Py, RPG Maker"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "LicenseRef-PolyForm-Noncommercial-1.0.0" }
+license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "TRAPYCHINO" }]
 keywords = ["translation", "localization", "unity", "renpy", "rpgmaker", "russian", "russificator"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: Other/Proprietary License",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Operating System :: Microsoft :: Windows",
     "Natural Language :: Russian",
     "Topic :: Games/Entertainment",

@@ -88,6 +88,46 @@ def test_closing_window_never_waits_for_the_window(api):
     assert not any("после закрытия" in c or "Живой перевод выключен" in c for c in calls)
 
 
+def test_bug_report_has_facts_and_no_secrets(api, tmp_path, monkeypatch):
+    """«Скопировать отчёт об ошибке»: в тексте версия, способ перевода, игра с движком и хвост журнала;
+    ключей API (и запомненных, и просто похожих на ключ в журнале) и домашней папки в нём нет."""
+    import russificator
+    home = tmp_path / "Users" / "Вася Пупкин"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("COMPUTERNAME", "DESKTOP-VASYA42")
+    monkeypatch.setattr(type(api), "_live_call", lambda self, path, timeout=0.6: None)
+    vn = _renpy(home / "Games" / "My VN")
+    assert api.detect(str(vn))["ok"]
+    remembered, session = "sk-remembered0123456789abcdef", "my-own-proxy-key-XYZ"
+    api.save_settings({"mode": "cloud", "cloud_provider": "deepseek", "cloud_model": "deepseek-chat"})
+    api.set_api_key("deepseek", remembered, remember=True)
+    api.set_api_key("custom", session, remember=False)
+    log = paths.logs_dir() / "russificator.log"
+    lines = [f"2026-10-17 12:00:{i % 60:02d} INFO russificator: строка {i}" for i in range(200)]
+    lines += [f"ERROR cloud: 401 for key {remembered} and {session}",
+              "ERROR cloud: headers {'Authorization': 'Bearer sk-or-v1-0123456789abcdef0123'}",
+              "WARNING google: ?key=AIzaSyA0123456789abcdefghijklmnopqrstu failed",
+              f"INFO game: {vn}\\game\\script.rpy (DESKTOP-VASYA42, vasya@mail.ru)",
+              "INFO tail: ``` в журнале"]
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (paths.logs_dir() / "russificator.prev.log").write_text("прошлый запуск\n" * 200, encoding="utf-8")
+
+    text = api.bug_report()["text"]
+
+    assert f"**Версия программы:** {russificator.__version__}" in text
+    assert "**Windows:**" in text and "**ОЗУ:**" in text and "**Видеокарта:**" in text
+    assert "DeepSeek" in text and "deepseek-chat" in text and "**Модель установлена:** да" in text
+    assert "**Название:** My VN" in text and "**Движок:** Ren'Py" in text
+    assert "строка 199" in text and "строка 119" not in text           # последние 80 строк, не весь файл
+    assert "russificator.prev.log): есть" in text
+    for secret in (remembered, session, "sk-or-v1-0123456789abcdef0123", "AIzaSyA0123456789",
+                   "Вася Пупкин", str(home), "DESKTOP-VASYA42", "vasya@mail.ru"):
+        assert secret not in text, secret
+    assert "%USERPROFILE%" in text and "<ключ удалён>" in text and "%COMPUTERNAME%" in text
+    assert "Bearer <ключ удалён>" in text                                # видно, что ключ был, но не какой
+    assert "\n````text\n" in text                                        # ``` в журнале не ломает блок
+
+
 def _unity(root: Path) -> Path:
     (root / "Game_Data" / "Managed").mkdir(parents=True)
     (root / "Game_Data" / "globalgamemanagers").write_bytes(b"x")

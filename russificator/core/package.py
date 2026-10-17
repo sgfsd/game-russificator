@@ -325,7 +325,7 @@ def installer_exe() -> Optional[Path]:
 
 def licenses(engine: str) -> List[Path]:
     base = Path(__file__).resolve().parents[1] / "resources" / "licenses"
-    names = ["GameRussificator-PolyForm-Noncommercial-1.0.0.txt"]
+    names = ["GameRussificator-GPL-3.0.txt"]
     if engine == "unity":
         names += ["BepInEx-LGPL-2.1.txt", "XUnity.AutoTranslator-MIT.txt"]
     return [base / n for n in names if (base / n).is_file()]
@@ -380,9 +380,9 @@ def readme_text(m: Dict[str, Any], has_installer: bool) -> str:
         "для игр на Unity, Ren'Py и RPG Maker. Скачать программу:",
         f"    {branding.RELEASES_URL}",
         "",
-        "Хотите качественный ручной перевод этой или другой игры — с редактурой, адаптацией",
-        f"юмора и имён, перерисовкой надписей? Пишите автору в Telegram: @{branding.TELEGRAM}",
-        f"    {branding.TELEGRAM_URL}",
+        "Перевод машинный: опечатки и неточности возможны. Если что-то не так с переводом",
+        "или с установкой — напишите в обсуждениях и ошибках на GitHub:",
+        f"    {branding.GITHUB_URL}/issues",
     ]
     return "\n".join(lines) + "\n"
 

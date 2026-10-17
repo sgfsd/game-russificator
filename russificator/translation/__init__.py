@@ -1,10 +1,8 @@
-"""Слой перевода: четыре способа перевести игру.
+"""Слой перевода: три способа перевести игру.
 
   1. ``machine`` — машинный переводчик офлайн (слабые/старые ПК);
   2. ``local``   — нейросеть Gemma 4 на своём компьютере (мощные ПК);
-  3. ``cloud``   — облачная нейросеть по API-ключу (любой провайдер);
-  4. заказ перевода у автора — см. :data:`ORDER_CONTACT` (в интерфейсе
-     отдельное окно, перевода программой не выполняется).
+  3. ``cloud``   — облачная нейросеть по API-ключу (любой провайдер).
 """
 
 from __future__ import annotations
@@ -13,8 +11,9 @@ from typing import Any, Dict
 
 from .base import Translator, TranslatorError
 
-ORDER_TELEGRAM = "TRAPYCHINO"
-ORDER_CONTACT = f"https://t.me/{ORDER_TELEGRAM}"
+#: автор программы — вопросы, ошибки, помощь с играми
+AUTHOR_TELEGRAM = "TRAPYCHINO"
+AUTHOR_CONTACT = f"https://t.me/{AUTHOR_TELEGRAM}"
 
 MODES = ("machine", "local", "cloud")
 

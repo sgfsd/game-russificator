@@ -1,0 +1,24 @@
+name: Вопрос, идея или другая проблема
+description: Поддержка нового движка, замечание по переводу, предложение — что угодно
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Пишите по любому поводу — вопросы и идеи здесь так же уместны, как сообщения об ошибках.
+  - type: textarea
+    id: body
+    attributes:
+      label: О чём речь
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Игра и движок
+      description: Если вопрос про конкретную игру
+      placeholder: не обязательно
+  - type: input
+    id: version
+    attributes:
+      label: Версия программы
+      placeholder: 2.4.0

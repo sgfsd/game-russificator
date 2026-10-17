@@ -8,7 +8,7 @@
 
 __version__ = "2.4.0"
 
-from .translation import ORDER_CONTACT, ORDER_TELEGRAM, create_translator  # noqa: E402,F401
+from .translation import AUTHOR_CONTACT, AUTHOR_TELEGRAM, create_translator  # noqa: E402,F401
 
 
 def detect_engine(game_dir):

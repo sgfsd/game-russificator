@@ -35,9 +35,9 @@
         <span class="i" data-icon="download"></span>
         <span><b id="updateTitle">Вышла новая версия</b><small id="updateSub">скачать с GitHub</small></span>
       </button>
-      <button class="order-cta" id="orderCta">
+      <button class="help-cta" id="helpCta">
         <span class="i" data-icon="pen"></span>
-        <span><b>Заказать перевод</b><small>ручная работа от автора</small></span>
+        <span><b>Помощь</b><small>вопросы и ошибки</small></span>
       </button>
       <div class="engines">Ren'Py · RPG Maker · Unity</div>
     </div>
@@ -102,12 +102,6 @@
               <b>Облачная нейросеть</b>
               <span class="mode-desc">Любой ПК. Нужен API-ключ провайдера.</span>
               <span class="mode-meta"><span class="q q5"></span>отличное качество</span>
-            </button>
-            <button class="mode mode-order" data-mode="order">
-              <span class="mode-ico"><span class="i" data-icon="pen"></span></span>
-              <b>Заказать у автора</b>
-              <span class="mode-desc">Ручной перевод с вычиткой и проверкой в игре.</span>
-              <span class="mode-meta"><span class="q q6"></span>студийное качество</span>
             </button>
           </div>
 
@@ -231,7 +225,8 @@
       </div>
 
       <div class="card log-card">
-        <div class="log-head"><span>Журнал</span></div>
+        <div class="log-head"><span>Журнал</span>
+          <button class="btn ghost sm" id="logReport" title="Готовый текст для сообщения об ошибке: версия, система, игра и журнал — без ключей и личных путей"><span class="i" data-icon="copy"></span>Скопировать отчёт об ошибке</button></div>
         <div class="log" id="log"></div>
       </div>
 
@@ -487,7 +482,7 @@
       </div>
       <div class="card about">
         <b>Русификатор игр <span id="aboutVer"></span></b>
-        <p class="muted small">Открытый код, бесплатно для некоммерческого использования (PolyForm Noncommercial); коммерческое — по лицензии от автора. Всё работает на вашем компьютере, без серверов и аккаунтов.
+        <p class="muted small">Свободная программа с открытым кодом под лицензией GNU GPL v3. Всё работает на вашем компьютере, без серверов и аккаунтов.
           Машинный перевод — модель OPUS-MT (Helsinki-NLP, CC-BY 4.0), нейросеть — Gemma 4 (Apache 2.0) на llama.cpp (MIT),
           шрифт — PT Sans (SIL OFL 1.1).</p>
       </div>
@@ -495,30 +490,36 @@
   </main>
 </div>
 
-<!-- ============ окно заказа ============ -->
-<div class="modal hidden" id="orderModal">
-  <div class="modal-card order">
+<!-- ============ окно помощи ============ -->
+<div class="modal hidden" id="helpModal">
+  <div class="modal-card help">
     <button class="modal-x" data-close><span class="i" data-icon="x"></span></button>
-    <div class="order-hero">
-      <div class="order-badge"><span class="i" data-icon="pen"></span></div>
-      <h2>Перевод «как от студии»</h2>
-      <p>Машинный перевод — это быстро. Но если хочется, чтобы игра звучала по-настоящему по-русски, — закажите перевод у автора программы.</p>
+    <div class="help-hero">
+      <div class="help-badge"><span class="i" data-icon="pen"></span></div>
+      <h2>Что-то не получается?</h2>
+      <p>Пишите — разберёмся. Программу делает один человек, и каждое сообщение читается.</p>
     </div>
     <ul class="perks">
-      <li><span class="i" data-icon="check"></span>Живой перевод и редактура — без машинных ошибок и «Игры в джойстик»</li>
-      <li><span class="i" data-icon="check"></span>Адаптация юмора, имён, отсылок и характеров персонажей</li>
-      <li><span class="i" data-icon="check"></span>Перевод надписей на текстурах, подбор и отрисовка шрифтов</li>
-      <li><span class="i" data-icon="check"></span>Проверка в самой игре: ничего не вылезает и не ломается</li>
+      <li><span class="i" data-icon="check"></span>Игра не определяется, перевод не встраивается, «квадратики» вместо букв</li>
+      <li><span class="i" data-icon="check"></span>Живой перевод не видит игру или перекрывает нужное</li>
+      <li><span class="i" data-icon="check"></span>Новый движок или игра, которую хочется поддержать</li>
+      <li><span class="i" data-icon="check"></span>Идеи, замечания и просто вопросы «а можно ли…»</li>
     </ul>
+    <div class="help-actions">
+      <button class="btn big" id="openIssues"><span class="i" data-icon="link"></span>Ошибки и обсуждения на GitHub</button>
+      <button class="btn ghost big" id="copyReport"><span class="i" data-icon="copy"></span>Скопировать отчёт об ошибке</button>
+      <p class="muted small center">Версия, система, игра и журнал одним текстом — без ключей и личных путей.
+        Вставьте его в сообщение и допишите, что случилось.</p>
+    </div>
     <div class="tg-box">
       <div>
-        <div class="muted small">Telegram</div>
+        <div class="muted small">Или в Telegram — автору</div>
         <div class="tg-handle" id="tgHandle">@TRAPYCHINO</div>
       </div>
       <button class="icon-btn" id="copyTg" title="Скопировать"><span class="i" data-icon="copy"></span></button>
     </div>
     <button class="btn tg big" id="openTg"><span class="i" data-icon="send"></span>Написать в Telegram</button>
-    <p class="muted small center">Напишите название игры — обсудим объём, сроки и цену.</p>
+    <p class="muted small center">Если дело в ошибке — приложите отчёт и скриншот того, что было на экране.</p>
   </div>
 </div>
 
@@ -589,7 +590,7 @@
       <label class="switch"><input type="checkbox" id="exportCredit" checked><span></span>
         <div><b>Надпись о программе в игре</b>
           <div class="muted small">Небольшая полупрозрачная строка в главном меню: «Автоперевод: Русификатор игр ·
-            ручной перевод — tg @<span class="tgName"></span>». Во время игры её нет.</div></div>
+            github.com/sgfsd/game-russificator». Во время игры её нет.</div></div>
       </label>
       <div class="dl hidden" id="exportProgress"><div class="bar"><div class="bar-fill"></div></div><div class="dl-text muted"></div></div>
       <div class="export-done hidden" id="exportDone">

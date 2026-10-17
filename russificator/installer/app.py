@@ -190,10 +190,9 @@ class App:
                  font=self.f_small, fg=C["muted"], bg=C["bg2"]).pack(anchor="w")
         links = tk.Frame(fin, bg=C["bg2"])
         links.pack(anchor="w", pady=(px(4), 0))
-        self._link(links, f"Ручной перевод на заказ — Telegram @{branding.TELEGRAM}", branding.TELEGRAM_URL,
-                   C["tg"]).pack(side="left")
-        tk.Label(links, text="  ·  ", font=self.f_small, fg=C["faint"], bg=C["bg2"]).pack(side="left")
         self._link(links, "Скачать программу", branding.RELEASES_URL, C["accent_hi"]).pack(side="left")
+        tk.Label(links, text="  ·  ", font=self.f_small, fg=C["faint"], bg=C["bg2"]).pack(side="left")
+        self._link(links, "Ошибки и вопросы", f"{branding.GITHUB_URL}/issues", C["tg"]).pack(side="left")
 
         # --- тело
         self.body = tk.Frame(root, bg=C["bg"])

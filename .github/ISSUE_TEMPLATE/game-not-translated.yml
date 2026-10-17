@@ -1,0 +1,70 @@
+name: Игра не переводится
+description: Русификация не запускается, не доходит до конца или перевод не появился в игре
+labels: ["баг"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо, что пишете. Чем точнее данные, тем выше шанс, что проблему удастся
+        воспроизвести и починить сразу для всех похожих игр.
+  - type: input
+    id: game
+    attributes:
+      label: Игра
+      description: Название и, если знаете, где куплена (Steam, GOG, itch.io…)
+      placeholder: Crawl (Steam)
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Движок
+      description: Программа показывает его рядом с игрой
+      options:
+        - Unity (Mono)
+        - Unity (IL2CPP)
+        - Ren'Py
+        - RPG Maker MV / MZ
+        - RPG Maker XP / VX / VX Ace
+        - Другой или не определился
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Способ перевода
+      options:
+        - Машинный переводчик (офлайн)
+        - Нейросеть на компьютере
+        - Облачная нейросеть
+        - Живой перевод поверх игры
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Версия программы
+      description: Видна внизу слева в окне программы
+      placeholder: 2.4.0
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: Что произошло
+      description: Что вы нажали, что ожидали и что получилось вместо этого
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Отчёт об ошибке
+      description: >
+        Нажмите в программе «Скопировать отчёт об ошибке» (окно «Помощь» или над журналом
+        русификации) и вставьте сюда — там версия, система, игра, движок и конец журнала,
+        без API-ключей и личных путей.
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: Скриншот
+      description: Если дело в тексте на экране («квадратики», обрезка, мусор) — покажите, как это выглядит
