@@ -76,7 +76,9 @@ jobs:
 
       - name: Архив
         shell: pwsh
-        run: Compress-Archive -Path dist\Russificator -DestinationPath Russificator-win64.zip
+        run: |
+          python tools/release_readme.py dist\Russificator
+          Compress-Archive -Path dist\Russificator -DestinationPath Russificator-win64.zip
 
       - uses: actions/upload-artifact@v4
         with:

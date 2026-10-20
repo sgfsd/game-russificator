@@ -381,10 +381,17 @@ def readme_text(m: Dict[str, Any], has_installer: bool) -> str:
         f"    {branding.RELEASES_URL}",
         "",
         "Перевод машинный: опечатки и неточности возможны. Если что-то не так с переводом",
-        "или с установкой — напишите в обсуждениях и ошибках на GitHub:",
-        f"    {branding.GITHUB_URL}/issues",
-    ]
+        "или с установкой — напишите:",
+    ] + contacts_lines()
     return "\n".join(lines) + "\n"
+
+
+def contacts_lines() -> List[str]:
+    """Куда писать автору — одинаково в «Прочти.txt» архивов «для друзей» и самой программы."""
+    return [
+        f"    GitHub (ошибки и вопросы):  {branding.GITHUB_URL}/issues",
+        f"    Telegram:                   {branding.TELEGRAM_URL}  (@{branding.TELEGRAM})",
+    ]
 
 
 # ====================================================================== чтение

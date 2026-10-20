@@ -100,7 +100,8 @@ def test_mv_package_roundtrip_with_credit(mv_game, tmp_path):
     assert not any("www/data" in n for n in names)            # файлов игры в архиве нет
     readme = zipfile.ZipFile(z).read(top + "Прочти.txt").decode("utf-8-sig")
     assert branding.GITHUB_URL in readme and "Переведено строк" in readme
-    assert "TRAPYCHINO" not in readme                        # без рекламы и заказов
+    assert branding.TELEGRAM_URL in readme                   # контакты автора: GitHub и Telegram
+    assert "заказ" not in readme.lower()                     # без рекламы и заказов
 
     pkg = open_package(z)
     try:
@@ -425,3 +426,13 @@ def test_mv_originals_for_alt_t(mv_game):
     assert data["c"] == {"RU Yes": "Yes", "RU No": "No"}
     restore_backups(mv_game)
     assert not (mv_game / "www/js/plugins/Russificator_orig.json").exists()
+
+
+def test_release_readme_has_contacts(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "release_readme", Path(__file__).resolve().parents[1] / "tools" / "release_readme.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    text = mod.write(tmp_path).read_text(encoding="utf-8-sig")
+    assert branding.GITHUB_URL in text and branding.TELEGRAM_URL in text

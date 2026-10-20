@@ -192,7 +192,9 @@ class App:
         links.pack(anchor="w", pady=(px(4), 0))
         self._link(links, "Скачать программу", branding.RELEASES_URL, C["accent_hi"]).pack(side="left")
         tk.Label(links, text="  ·  ", font=self.f_small, fg=C["faint"], bg=C["bg2"]).pack(side="left")
-        self._link(links, "Ошибки и вопросы", f"{branding.GITHUB_URL}/issues", C["tg"]).pack(side="left")
+        self._link(links, "Ошибки и вопросы", f"{branding.GITHUB_URL}/issues", C["accent_hi"]).pack(side="left")
+        tk.Label(links, text="  ·  ", font=self.f_small, fg=C["faint"], bg=C["bg2"]).pack(side="left")
+        self._link(links, f"Telegram @{branding.TELEGRAM}", branding.TELEGRAM_URL, C["tg"]).pack(side="left")
 
         # --- тело
         self.body = tk.Frame(root, bg=C["bg"])
