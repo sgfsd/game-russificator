@@ -28,14 +28,16 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from functools import lru_cache
 import re
 import struct
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from ...core.universal import Entry, TextKind
-from ...translation.filters import looks_like_sentence, looks_technical, looks_translatable
-from . import unitypy_io
+from ...translation.filters import (halfwidth, looks_like_sentence, looks_spoken, looks_technical,
+                                    looks_translatable)
+from . import direct, text_assets, unitypy_io
 from .detect import UnityGame
 
 log = logging.getLogger("russificator.unity.extract")
@@ -98,25 +100,41 @@ class _Collector:
         self.pages: List[Entry] = []       # фразы страниц встроенного браузера
         #: все встреченные строки до отбора -> где встретились (только для проверки полноты перевода)
         self.seen: Optional[Dict[str, str]] = None
+        #: строки, найденные уверенно (не только «для словаря»): их можно вписывать и в данные игры
+        self.confident: set = set()
 
     def see(self, text: str, origin: str) -> None:
         if self.seen is not None and isinstance(text, str) and text.strip() and len(text) <= 20000:
             self.seen.setdefault(text, origin)
 
-    def add(self, text: str, kind: TextKind, origin: str) -> None:
+    def add(self, text: str, kind: TextKind, origin: str, display_only: bool = False) -> None:
+        """``display_only`` — строка найдена по смелому признаку (подпись строчными в текстовом поле, английский
+        вариант рядом с переводами на другие языки): она идёт только в словарь XUnity, который меняет лишь
+        то, что игра показывает, и в данные игры (прямой перевод) не вписывается."""
         # текст не нормализуем: ключ XUnity должен совпасть с тем, что игра выводит на экран
         self.see(text, origin)
         if not text.strip() or len(text) > MAX_TEXT or _TECH_RE.search(text) or looks_technical(text):
             return
+        if not display_only:
+            self.confident.add(text)
         prev = self.items.get(text)
         if prev is None or (prev[0] == TextKind.OTHER and kind != TextKind.OTHER):
             self.items[text] = (kind, origin)
+
+    def add_prefix(self, p: str) -> None:
+        """Подпись, к которой игра приклеивает текст («Pro Tip: », «Narrator:: »): сама переводится как
+        строка, а для склейки XUnity получает правило-разделитель (см. ``xunity.prefix_rules``)."""
+        if p in self.prefixes or len(self.prefixes) >= 1000:
+            return
+        self.prefixes.append(p)
+        self.add(p, TextKind.UI, "prefix")
 
     def entries(self) -> List[Entry]:
         out = []
         for text, (kind, origin) in self.items.items():
             out.append(Entry(id=text_key(text), source=text, kind=kind, target_key=text_key(text),
-                             scene=origin, max_length=None))
+                             scene=origin, max_length=None,
+                             notes={} if text in self.confident else {"display_only": True}))
         return out + self.pages
 
 
@@ -162,12 +180,8 @@ def _foreign_bundle(path: Path, bundles: List[Path]) -> bool:
 
 
 def _is_bundle(path: Path) -> bool:
-    try:
-        with path.open("rb") as fh:
-            head = fh.read(8)
-        return head.startswith((b"UnityFS", b"UnityWeb", b"UnityRaw"))
-    except OSError:
-        return False
+    """Бандл Unity — и под простой защитой (ключ XOR, байты впереди), см. ``unitypy_io.layout``."""
+    return unitypy_io.layout(path) is not None
 
 
 def _typetree_generator(game: UnityGame, warnings: List[str]):
@@ -198,12 +212,14 @@ def extract_assets(game: UnityGame, col: _Collector, warnings: List[str], progre
     except ImportError:
         warnings.append("UnityPy не установлен — заранее переведено будет меньше, остальное переведётся на лету.")
         return
+    unitypy_io.use_game_version(game.version)
     gen = _typetree_generator(game, warnings)
     files = serialized_files(game)
+    donors = None
     for i, f in enumerate(files):
         progress(f"Чтение ассетов: {f.name}", i / max(1, len(files)))
         try:
-            env = UnityPy.load(str(f))
+            env = unitypy_io.open_env(f)
         except Exception as exc:  # noqa: BLE001
             log.debug("не открыт %s: %s", f.name, exc)
             continue
@@ -223,9 +239,14 @@ def extract_assets(game: UnityGame, col: _Collector, warnings: List[str], progre
                         try:
                             tree = obj.read_typetree()
                         except Exception:  # noqa: BLE001
-                            # typetree не сошёлся с данными — берём строки из сырых байтов
-                            _from_raw(obj, col, f.name)
-                            continue
+                            # генератор ошибся в структуре скрипта — она же есть в бандлах игры (донор);
+                            # иначе строки берутся из сырых байтов
+                            if donors is None:
+                                donors = _donors(files)
+                            tree = direct.read_structured(obj, donors) if donors else None
+                            if tree is None:
+                                _from_raw(obj, col, f.name)
+                                continue
                         if "m_glyphInfoList" in tree or "m_GlyphTable" in tree:
                             has_font = True
                             continue
@@ -251,6 +272,16 @@ def extract_assets(game: UnityGame, col: _Collector, warnings: List[str], progre
             unitypy_io.release(env)   # файлы игры не остаются открытыми
         if has_font:
             col.font_files.append(f)
+
+
+def _donors(files: List[Path]) -> dict:
+    """Структуры скриптов из бандлов игры (бандлы всегда хранят их в себе), см. ``direct.typetree_donors``."""
+    try:
+        return direct.typetree_donors([p for p in files if "StreamingAssets" in p.parts
+                                       or p.suffix.lower() in (".bundle", ".unity3d")])
+    except Exception as exc:  # noqa: BLE001
+        log.debug("структуры скриптов из бандлов не прочитаны: %s", exc)
+        return {}
 
 
 #: ассеты с именами людей (титры, спонсоры, тестеры) — имена не переводятся
@@ -295,15 +326,39 @@ def _from_text_asset(obj, col: _Collector, origin: str) -> None:
     else:
         return
     text = text_assets.decode(raw)
+    name = getattr(data, "m_Name", "") or ""
+    where = f"{origin}:{name}"
     if text:
-        name = getattr(data, "m_Name", "") or ""
-        where = f"{origin}:{name}"
         text_assets.extract(text, lambda s: col.add(s, TextKind.OTHER, where), lambda s: col.see(s, where),
-                            tables=not NAMES_ASSET_RE.search(name))
+                            tables=not NAMES_ASSET_RE.search(name), prefix=col.add_prefix)
+    elif text is None and not NAMES_ASSET_RE.search(name):
+        _from_binary_table(raw, col, where)
+
+
+def _from_binary_table(raw: bytes, col: _Collector, origin: str) -> None:
+    """Двоичная таблица строк (Luban, BinaryWriter, protobuf): фразы и строки-форматы — как из любых данных,
+    английский вариант многоязычной таблицы (рядом китайский, японский…) — и одним словом («Skip»)."""
+    for s, near_foreign in text_assets.binary_texts(raw):
+        col.see(s, origin)
+        if not looks_translatable(s, strict=True):
+            if near_foreign:
+                _add_display(s, col, origin)
+            continue
+        if looks_like_sentence(s) or _format_text(s):
+            col.add(s, TextKind.OTHER, origin)
+        elif near_foreign and (_NAME_RE.fullmatch(s) or _english_words(s)):
+            # английская колонка таблицы: и подпись («Basic Settings»), и имя («Su Lianyan»)
+            col.add(s, TextKind.OTHER, origin, display_only=True)
+
+
+#: имя или название из слов с заглавной: «Su Lianyan», «Jinling City»
+_NAME_RE = re.compile(r"[A-Z][a-z']+(?:[ -][A-Z][a-z']+){0,3}")
 
 
 def _from_monobehaviour(tree: dict, col: _Collector, origin: str) -> Optional[str]:
     """Собрать текст скрипта. Для компонента текста вернуть его поле (m_Text/m_text/mText)."""
+    for grids in direct.utage_grid_lists(tree):
+        _from_utage_grids(grids, col, origin)
     for field, marker in TEXT_COMPONENT_FIELDS.items():
         val = tree.get(field)
         if isinstance(val, str) and (marker in tree or (field == "mText" and NGUI_ALT in tree)):
@@ -313,6 +368,20 @@ def _from_monobehaviour(tree: dict, col: _Collector, origin: str) -> Optional[st
             return field
     _walk_strings(tree, col, origin, depth=0)
     return None
+
+
+def _from_utage_grids(grids: list, col: _Collector, origin: str) -> None:
+    """Книга сценария UTAGE: колонка для экрана (English, иначе Text) — реплики и имена персонажей,
+    которые игра заведомо показывает: берутся и «Y-You…!», и «female» (имя из таблицы Localize)."""
+    from .direct import utage_grids
+    for rows, column in utage_grids(grids):
+        for r in rows:
+            cells = r.get("strings") if isinstance(r, dict) else None
+            if isinstance(cells, list) and column < len(cells) and isinstance(cells[column], str):
+                v = cells[column]
+                col.see(v, origin)
+                if looks_spoken(v):
+                    col.add(v, TextKind.OTHER, origin)
 
 
 #: поля скриптов, где короткая строка — скорее всего видимое название («Motion Sensor»)
@@ -325,6 +394,9 @@ def _walk_strings(node, col: _Collector, origin: str, depth: int, field: str = "
     if depth > 6:
         return
     if isinstance(node, dict):
+        english = _english_of_languages(node)
+        if english is not None:
+            _add_display(english, col, origin)
         for k, v in node.items():
             if k in SKIP_FIELDS:
                 continue
@@ -334,6 +406,11 @@ def _walk_strings(node, col: _Collector, origin: str, depth: int, field: str = "
             elif isinstance(v, (dict, list)):
                 _walk_strings(v, col, origin, depth + 1, k)
     elif isinstance(node, list):
+        strings = [v for v in node[:64] if isinstance(v, str)]
+        if 3 <= len(strings) <= 40 and len(strings) == len(node) and _multilingual(strings):
+            for v in strings:
+                if v.isascii():
+                    _add_display(v, col, origin)    # английский вариант среди переводов строки
         for v in node[:5000]:
             if isinstance(v, str):
                 col.see(v, origin)
@@ -342,10 +419,99 @@ def _walk_strings(node, col: _Collector, origin: str, depth: int, field: str = "
                 _walk_strings(v, col, origin, depth + 1, field)
 
 
+#: письменности, по которым видно, что рядом лежат переводы строки на другие языки
+_FOREIGN_SCRIPT_RE = re.compile(r"[Ѐ-ӿͰ-Ͽ֐-ۿ฀-๿぀-ヿ"
+                                r"㐀-鿿가-힯]")
+#: поле с английским текстом: en, english, en_US, textEn, text_en
+_EN_FIELD_RE = re.compile(r"^(?:m_)?(?:en|eng|english|en[_-]?(?:us|gb)|text[_-]?en|en[_-]?text|english[_-]?text)$",
+                          re.I)
+#: поля других языков рядом с английским: ja, zh_CN, korean, french…
+_LANG_FIELD_RE = re.compile(r"^(?:m_)?(?:ja|jp|zh|cn|tw|ko|kr|ru|fr|de|es|it|pt|pl|tr|th|ar|uk|japanese|chinese|"
+                            r"korean|russian|french|german|spanish|italian|portuguese|polish|turkish|thai|arabic)"
+                            r"(?:[_-]?\w{2,4})?$", re.I)
+#: поля, в которых строка — текст для экрана по самому названию поля (UGUI Dropdown, свои кнопки и подписи)
+_TEXT_FIELDS = {"m_Text", "m_text", "text", "Text", "mText", "label", "Label", "m_Label", "title", "Title", "m_Title",
+                "caption", "Caption", "displayName", "DisplayName", "m_DisplayName", "displayText", "DisplayText",
+                "description", "Description", "m_Description", "tooltip", "Tooltip", "subtitle", "Subtitle",
+                "buttonText", "ButtonText", "header", "Header", "message", "Message"}
+
+
+def _multilingual(strings: List[str]) -> bool:
+    """Список строк — одна фраза на нескольких языках (японский, корейский, тайский… и латиница рядом)."""
+    foreign = sum(1 for v in strings if _FOREIGN_SCRIPT_RE.search(v))
+    latin = sum(1 for v in strings if v.isascii() and re.search(r"[A-Za-z]{2}", v))
+    return foreign >= 2 and latin >= 1
+
+
+def _english_of_languages(node: dict) -> Optional[str]:
+    """Английская строка из записи «язык -> текст» ({"en": …, "ja": …, "ko": …})."""
+    en = [v for k, v in node.items() if isinstance(v, str) and _EN_FIELD_RE.match(str(k))]
+    if len(en) != 1:
+        return None
+    others = sum(1 for k, v in node.items() if isinstance(v, str) and _LANG_FIELD_RE.match(str(k)))
+    return en[0] if others >= 1 else None
+
+
+def _add_display(v: str, col: _Collector, origin: str) -> None:
+    """Строка, которую место в данных выдаёт за текст для экрана: только в словарь (см. ``_Collector.add``).
+    Признак смелый, поэтому строка ещё должна быть английской: слова — из словаря английского (турецкий
+    вариант «Kilitli.» рядом с английским, ромадзи «syuugou» отсеиваются), одно слово — без цифр и
+    служебных знаков («girl2», «CGSample12», «*Jump»)."""
+    if len(v) > 400 or not looks_spoken(v) or _format_text(v) or not _english_words(v):
+        return
+    col.add(v, TextKind.OTHER, origin, display_only=True)
+
+
+def _english_words(v: str) -> bool:
+    core = re.sub(r"[：，；！？]", lambda m: halfwidth(m.group(0)) + " ", v).strip()   # «WorkBench：Cultivate»
+    if re.search(r"[=_{}<>\[\]\|@#$^]", core):
+        return False                      # «time=0.5 x=200», «<tag>» — параметры и разметка, не фраза
+    if " " not in core and not re.fullmatch(r"[\"'«“(]?[A-Za-z][A-Za-z'-]*[.!?…,:;)\"'»”]*", core):
+        return False
+    words = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z']+", core)]
+    if not words:
+        return False
+    lex = _lexicon()
+    if not lex:
+        return True                       # словаря нет — признак места остаётся единственным
+    known = sum(1 for w in words if _known_word(w, lex) or _known_word(w.split("'")[0], lex))
+    return known >= max(1, 0.6 * len(words)) and any(len(w) >= 3 and _known_word(w, lex) for w in words)
+
+
+#: в словаре (SCOWL) только основы: нет «is», «recover», «refine» — словоформы проверяются по основе
+_FUNCTION_WORDS = frozenset("is are was were be been am has had does did an the of to in on at by for with "
+                            "and or not no it its this that".split())
+_SUFFIXES = ("ing", "ers", "ed", "es", "er", "ly", "s", "d")
+_PREFIXES = ("re", "un", "dis", "pre", "over", "out", "mis")
+
+
+def _known_word(w: str, lex, depth: int = 0) -> bool:
+    if w in lex or w in _FUNCTION_WORDS:
+        return True
+    for suf in _SUFFIXES:
+        stem = w[:-len(suf)]
+        if w.endswith(suf) and len(stem) >= 3 and (stem in lex or stem + "e" in lex):
+            return True
+    if depth == 0:
+        return any(w.startswith(p) and len(w) - len(p) >= 3 and _known_word(w[len(p):], lex, 1) for p in _PREFIXES)
+    return False
+
+
+@lru_cache(maxsize=1)
+def _lexicon() -> frozenset:
+    from ...overlay.words import lexicon
+    return frozenset(lexicon())
+
+
 def _maybe_add(v: str, field: str, col: _Collector, origin: str) -> None:
+    if field in _TEXT_FIELDS or _EN_FIELD_RE.match(field or ""):
+        # текстовое поле: и подпись строчными («abel face», «sure»), если не идентификатор — в словарь
+        if len(v.split()) <= 6 and not looks_translatable(v, strict=True):
+            _add_display(v, col, origin)
+            return
     if not looks_translatable(v, strict=True):
         return
-    if (looks_like_sentence(v) or (field and _LABEL_FIELD_RE.search(field) and _ui_word(v))
+    if (looks_like_sentence(v) or (field and _LABEL_FIELD_RE.search(field) and (_ui_word(v) or _lower_label(v)))
             or _format_text(v)):
         col.add(v, TextKind.OTHER, origin)
 
@@ -612,6 +778,14 @@ def _ui_word(s: str) -> bool:
             and not any(re.search(r"[a-z][A-Z]", w) for w in words))
 
 
+def _lower_label(s: str) -> bool:
+    """Подпись строчными из двух-четырёх слов («abel face», «arma outfits» — названия в галерее, игра
+    показывает их капсом через стиль шрифта). Одно слово строчными в таком поле — скорее ключ."""
+    words = s.split()
+    return (2 <= len(words) <= 4 and all(re.fullmatch(r"[A-Za-z][a-z']*", w) for w in words)
+            and any(len(w) >= 3 for w in words))
+
+
 def il2cpp_literals(meta: Path) -> List[str]:
     """Строковые литералы из global-metadata.dat (только чтение).
 
@@ -733,7 +907,7 @@ def loose_text_files(game: UnityGame) -> List[Path]:
             size = p.stat().st_size
         except OSError:
             continue
-        if size < 8 or size > 8 * 1024 * 1024 or _foreign_language(p):
+        if size < 8 or size > text_assets.MAX_SIZE or _foreign_language(p):
             continue
         out.append(p)
         total += size

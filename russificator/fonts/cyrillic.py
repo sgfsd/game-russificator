@@ -990,8 +990,49 @@ def _same_below(font: sfnt.Font, g_acc: int, g_base: int, top: float) -> bool:
     return union > 0 and (a & b).sum() / union > 0.7
 
 
+def fullwidth_letters(latin: Sequence[float], russian: Sequence[float], em: float) -> bool:
+    """Русские буквы шрифта — полноширинные: каждая стоит в клетке иероглифа (ширина ≈ кегль, у всех
+    одинаковая), а латиница обычная, пропорциональная. Так кириллицу кладут китайские и японские шрифты
+    по кодировкам GB2312/GBK/JIS (FangZhengLiBian в CardCultivation: «п» шириной 256 при кегле 256, «n» —
+    144). Текст из таких букв выходит вразрядку «Э т о  к а р т а» — их надо рисовать заново по меркам
+    латиницы того же шрифта."""
+    if len(latin) < 20 or len(russian) < 10 or em <= 0:
+        return False
+    lat, rus = _median(latin), _median(russian)
+    return (rus >= 0.85 * em and rus >= 1.35 * lat
+            and max(russian) - min(russian) <= 0.05 * max(russian))
+
+
+def fullwidth_font(font: sfnt.Font) -> bool:
+    """Кириллица шрифта ``font`` полноширинная (см. :func:`fullwidth_letters`)."""
+    latin = [font.advance(c) for c in LATIN_UPPER + LATIN_LOWER if font.has(c)]
+    russian = [font.advance(c) for c in RUSSIAN if font.has(c)]
+    return fullwidth_letters([v for v in latin if v], [v for v in russian if v], font.upem)
+
+
 def missing(font: sfnt.Font, need: Iterable[str]) -> List[str]:
-    return sorted({c for c in need if not c.isspace() and ord(c) not in font.cmap})
+    """Символы ``need``, которых в шрифте нет, — и буквы, которые в таблице шрифта есть, но нарисованы
+    пустыми (Dimbo в The Game of Life 2: «к» и «Й» с шириной, но без контура — в игре на их месте
+    дырка «Классичес ий») или полноширинными (китайский шрифт, см. :func:`fullwidth_letters`). Такие
+    буквы рисуются заново, таблица шрифта указывает на новый глиф."""
+    out = set()
+    need = list(need)
+    full = any(c in RUSSIAN for c in need) and fullwidth_font(font)
+    for c in need:
+        if c.isspace():
+            continue
+        g = font.cmap.get(ord(c))
+        if g is None or (c.isalpha() and 0 <= g < font.num_glyphs and _blank(font, g)) or (full and c in RUSSIAN):
+            out.add(c)
+    return sorted(out)
+
+
+def _blank(font: sfnt.Font, gid: int) -> bool:
+    try:
+        box = font.bbox(gid)
+    except Exception:  # noqa: BLE001 — нечитаемый глиф: пусть остаётся как в игре
+        return False
+    return box is None or box[3] - box[1] <= 0 or box[2] - box[0] <= 0
 
 
 def twin_of(ch: str, style: Style) -> Optional[str]:

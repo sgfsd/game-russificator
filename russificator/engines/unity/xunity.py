@@ -215,7 +215,10 @@ def tmp_font_bundle(game: UnityGame) -> Optional[str]:
     """Какой готовый TMP-шрифт XUnity подходит к версии Unity (или None)."""
     if not game.uses_tmp:
         return None
-    if game.major >= 2019:
+    # только своя версия Unity: бандл, собранный под 2019, в Unity 2020.3 роняет игру при запуске
+    # (Handshakes / Lost Relic Jam: вылет в AssetBundle.LoadAllAssets) — игра с квадратиками вместо
+    # части букв лучше игры, которая не открывается
+    if game.major == 2019:
         return "arialuni_sdf_u2019"
     if game.major == 2018:
         return "arialuni_sdf_u2018"
@@ -515,8 +518,11 @@ def _rule(kind: str, regex: str, value: str) -> str:
 #: плейсхолдер .NET String.Format: {0}, {1,-8}, {2:N0}
 _FMT_RE = re.compile(r"\{(\d+)(,-?\d+)?(:[^{}]*)?\}")
 _NUMERIC_FMT = re.compile(r":[NnDdFfCcPpEeGgXxRr0#.,%]")
-#: сколько правил-шаблонов писать (каждое правило XUnity проверяет для нового текста)
-MAX_TEMPLATE_RULES = 400
+#: вставка, которая переносится в перевод как есть (имя игрока в реплике Ink: «Hello, {0:v}.»)
+VERBATIM_SLOT = ":v"
+#: сколько правил-шаблонов писать: XUnity проверяет их только для текста, которого нет в словаре, а
+#: регулярка, начинающаяся со слова, отсекается на первых буквах — тысячи правил не тормозят
+MAX_TEMPLATE_RULES = 3000
 
 
 def template_rules(pairs: Dict[str, str]) -> List[str]:
@@ -530,8 +536,8 @@ def template_rules(pairs: Dict[str, str]) -> List[str]:
     """
     scored = []
     for src, tr in pairs.items():
-        if "{" not in src or not tr or len(src) > 300:
-            continue
+        if "{" not in src or not tr or len(src) > 300 or '"' in src or '"' in tr:
+            continue                      # кавычки в правиле XUnity читает как границы регулярки
         items = list(_FMT_RE.finditer(src))
         if not items or len(items) > 6:
             continue
@@ -551,6 +557,8 @@ def template_rules(pairs: Dict[str, str]) -> List[str]:
             parts.append(_flex_ws(_net_regex_escape(src[pos:m.start()].replace("{{", "{").replace("}}", "}"))))
             if m.group(3) and _NUMERIC_FMT.match(m.group(3)):
                 parts.append(r"([-+]?[\d\s.,\u00a0]*\d[%]?)")
+            elif m.group(3) == VERBATIM_SLOT:
+                parts.append(r"([\S\s]+?)")     # \u0438\u043c\u044f \u0438\u0433\u0440\u043e\u043a\u0430 \u0438 \u043f\u0440\u043e\u0447\u0438\u0435 \u0437\u043d\u0430\u0447\u0435\u043d\u0438\u044f \u0441\u0446\u0435\u043d\u0430\u0440\u0438\u044f \u2014 \u043a\u0430\u043a \u0435\u0441\u0442\u044c
             else:
                 parts.append(r"([\S\s]+?)")
                 numeric = False
@@ -574,13 +582,73 @@ def template_rules(pairs: Dict[str, str]) -> List[str]:
     return [r for _, r in scored[:MAX_TEMPLATE_RULES]]
 
 
+def template_fragments(pairs: Dict[str, str]) -> Dict[str, str]:
+    """Хвосты шаблонов с одной вставкой с краю: ``{0} points!`` -> ``{0} очков!`` даёт ``points!`` ->
+    ``очков!``. Общее правило «число + слово» (:func:`number_rules`) делит «370 points!» на число и слово
+    и переводит слово отдельно — без этой строки в словаре слово уходило в живой перевод и выходило
+    «370 точки!». Хвост из перевода всего шаблона согласован с числом и важнее перевода слова в отрыве."""
+    out: Dict[str, str] = {}
+    for src, tr in pairs.items():
+        items = list(_FMT_RE.finditer(src))
+        if len(items) != 1 or not tr or "\n" in src:
+            continue
+        m = items[0]
+        slot = m.group(0)
+        if m.start() == 0 and src[m.end():m.end() + 1] == " " and tr.startswith(slot + " "):
+            frag, frag_tr = src[m.end():].strip(), tr[len(slot):].strip()
+        elif m.end() == len(src) and src[m.start() - 1:m.start()] == " " and tr.endswith(" " + slot):
+            frag, frag_tr = src[:m.start()].strip(), tr[:-len(slot)].strip()
+        else:
+            continue
+        if re.search(r"[A-Za-z]{3}", frag) and frag_tr and "{" not in frag and "{" not in frag_tr:
+            out[frag] = frag_tr
+    return out
+
+
 def number_rules() -> List[str]:
     """Правила XUnity «число + слово»: игра склеивает число со словом из словаря («+2 Vitality», «-1
     Agility», «Level 7», «Gold: 50») — целиком такой строки нет нигде. Число остаётся как есть, слово
     переводится по словарю (или живым переводом). Ставятся после точных строк и шаблонов."""
     num = r"[-+\u2212]?\d+(?:[.,]\d+)?%?"
     return [_rule("sr", rf"^({num}\s+)(\p{{L}}[\S\s]*)$", "$1$2"),
+            # \u00ab1 - Title\u00bb, \u00ab2. Check This Box\u00bb, \u00ab3) Options\u00bb \u2014 \u043d\u043e\u043c\u0435\u0440 \u043f\u0443\u043d\u043a\u0442\u0430 \u0441\u043f\u0438\u0441\u043a\u0430 \u043f\u0435\u0440\u0435\u0434 \u043f\u043e\u0434\u043f\u0438\u0441\u044c\u044e
+            _rule("sr", rf"^({num}\s*[-\u2013\u2014.)]\s+)(\p{{L}}[\S\s]*)$", "$1$2"),
             _rule("sr", rf"^(\p{{L}}[\S\s]*?)(:?\s+{num})$", "$1$2")]
+
+
+def label_rules() -> List[str]:
+    """\u041f\u0440\u0430\u0432\u0438\u043b\u043e XUnity \u00ab\u043f\u043e\u0434\u043f\u0438\u0441\u044c + \u0434\u0432\u043e\u0435\u0442\u043e\u0447\u0438\u0435\u00bb: \u0438\u0433\u0440\u0430 \u043f\u0440\u0438\u043a\u043b\u0435\u0438\u0432\u0430\u0435\u0442 \u00ab:\u00bb \u043a \u043f\u043e\u0434\u043f\u0438\u0441\u0438 \u0438\u0437 \u0434\u0430\u043d\u043d\u044b\u0445 (\u00abPause\u00bb \u2192 \u00abPause:\u00bb \u0432
+    \u0441\u043f\u0438\u0441\u043a\u0435 \u043a\u043b\u0430\u0432\u0438\u0448) \u2014 \u0442\u0430\u043a\u043e\u0439 \u0441\u0442\u0440\u043e\u043a\u0438 \u043d\u0435\u0442 \u043d\u0438\u0433\u0434\u0435. \u041f\u043e\u0434\u043f\u0438\u0441\u044c \u043f\u0435\u0440\u0435\u0432\u043e\u0434\u0438\u0442\u0441\u044f \u043f\u043e \u0441\u043b\u043e\u0432\u0430\u0440\u044e, \u0434\u0432\u043e\u0435\u0442\u043e\u0447\u0438\u0435 \u2014 \u043a\u0430\u043a \u0432 \u0438\u0433\u0440\u0435."""
+    return [_rule("sr", r"^(\p{L}[^\n:]{0,40}?):$", "$1:"),      # без пустых групп-вставок
+            # «Loading...», «Quit?», «Continue!» — знак, приклеенный кодом к подписи из словаря
+            _rule("sr", r"^(\p{L}[^\n.…!?]{0,40}?)(\s*(?:\.{1,3}|…|[!?]{1,3}))$", "$1$2"),
+            # «> Start», «• Item», «- Option» — маркер пункта меню перед подписью
+            _rule("sr", r"^([-–—•·>*~]{1,3}\s*)(\p{L}[^\n]{0,60})$", "$1$2"),
+            # «< Easy >», «‹ Normal ›» — переключатель значения стрелками
+            _rule("sr", r"^([<‹«]\s*)(\p{L}[^\n<>‹›«»]{0,40}?)(\s*[>›»])$", "$1$2$3")]
+
+
+def case_variants(pairs: Dict[str, str]) -> Dict[str, str]:
+    """\u041a\u0410\u041f\u0421-\u0432\u0430\u0440\u0438\u0430\u043d\u0442\u044b \u043a\u043e\u0440\u043e\u0442\u043a\u0438\u0445 \u0441\u0442\u0440\u043e\u043a \u0441\u043b\u043e\u0432\u0430\u0440\u044f: \u0438\u0433\u0440\u044b \u043f\u043e\u043a\u0430\u0437\u044b\u0432\u0430\u044e\u0442 \u0438\u043c\u044f \u0438\u043b\u0438 \u043f\u043e\u0434\u043f\u0438\u0441\u044c \u0438 \u043a\u0430\u043a \u0435\u0441\u0442\u044c, \u0438 \u0447\u0435\u0440\u0435\u0437
+    ToUpper() (\u00abTom\u00bb \u0432 \u0441\u043f\u0438\u0441\u043a\u0435, \u00abTOM\u00bb \u0432 \u0437\u0430\u0433\u043e\u043b\u043e\u0432\u043a\u0435) \u2014 \u0441\u0442\u0440\u043e\u043a\u0438 \u043a\u0430\u043f\u0441\u043e\u043c \u043d\u0435\u0442 \u0432 \u0434\u0430\u043d\u043d\u044b\u0445, \u0430 \u043f\u0435\u0440\u0435\u0432\u043e\u0434 \u0438\u0437\u0432\u0435\u0441\u0442\u0435\u043d:
+    \u00ab\u0422\u041e\u041c\u00bb. \u0421\u0442\u0440\u043e\u043a\u0438 \u0441 \u0440\u0430\u0437\u043c\u0435\u0442\u043a\u043e\u0439 \u0438 \u0448\u0430\u0431\u043b\u043e\u043d\u044b \u043d\u0435 \u0442\u0440\u043e\u0433\u0430\u044e\u0442\u0441\u044f (\u0442\u0435\u0433\u0438 \u0438 \u0432\u0441\u0442\u0430\u0432\u043a\u0438 \u043a\u0430\u043f\u0441\u043e\u043c \u043d\u0435 \u0442\u0435 \u0436\u0435 \u0441\u0430\u043c\u044b\u0435)."""
+    out: Dict[str, str] = {}
+    for src, tr in pairs.items():
+        if not tr or tr == src or len(src) > 40 or len(src.split()) > 6 or not re.search(r"[a-z]", src):
+            continue
+        if any(c in src for c in "<>{}[]\\\n=") or any(c in tr for c in "<>{}[]\\\n"):
+            continue
+        up = src.upper()
+        if up in out:
+            continue
+        # строка капсом уже переведена сама по себе — переводчик капс понимает хуже («DAVID MOST» →
+        # «ДЭВИДА БОЛЬШИНСТВО»), а та же строка обычным регистром переведена правильно: берётся она
+        if up not in pairs or (pairs[up] and pairs[up] != tr.upper() and re.search(r"[a-z]", src[1:])):
+            out[up] = tr.upper()
+        low = src.lower()                 # ToLower(): «options», «tom» — строчными, если такой строки нет
+        if low != src and low not in pairs and low not in out and re.search(r"[A-Z]", src):
+            out[low] = tr.lower()
+    return out
 
 
 def paragraph_rules() -> List[str]:

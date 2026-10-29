@@ -87,6 +87,8 @@ class UnityPlugin(EnginePlugin):
             raise RuntimeError("Не найден .exe игры — перевод Unity-игр поддерживается для Windows-версий.")
         backup = project.backup
         self._il2cpp = game.backend == "il2cpp"
+        from . import unitypy_io
+        unitypy_io.use_game_version(game.version)
         for note in xunity.install(game, backup, self.status, self.cancel):
             project.warnings.append(note)
         done = [e for e in project.entries
@@ -99,9 +101,11 @@ class UnityPlugin(EnginePlugin):
         font_files = [Path(p) for p in project.meta.get("unity_font_files", []) if Path(p).is_file()]
         problems: List[str] = []
         reports: List[_tmp.FontReport] = []
+        variants = xunity.case_variants(pairs)          # «TOM» → «ТОМ»: буквы капсом тоже нужны шрифтам
         if font_files:
             gen = _extract._typetree_generator(game, [])
-            reports, problems = _tmp.fix_game(font_files, gen, list(pairs.values()), backup, self.status)
+            reports, problems = _tmp.fix_game(font_files, gen, list(pairs.values()) + list(variants.values()),
+                                              backup, self.status)
             project.meta["unity_fonts"] = [{"file": r.file, "name": r.name, "added": r.added, "error": r.error}
                                            for r in reports]
         fixed = sum(1 for r in reports if r.added)
@@ -127,10 +131,25 @@ class UnityPlugin(EnginePlugin):
             from ...core import launcher
             xunity.write_plugin_config(game, backup, launcher.serve_command(game.root))
         rules = (xunity.prefix_rules(project.meta.get("unity_prefixes") or [], pairs) + xunity.template_rules(pairs)
-                 + xunity.number_rules() + xunity.paragraph_rules())
+                 + xunity.number_rules() + xunity.label_rules() + xunity.paragraph_rules())
         project.meta["unity_template_rules"] = len(rules)
-        n = xunity.write_translations(game, backup, pairs, rules)
+        n = xunity.write_translations(game, backup, {**pairs, **variants, **xunity.template_fragments(pairs)}, rules)
         project.meta["unity_static_translations"] = n
+        # фразы — прямо в данные игры: их увидят и компоненты, которых XUnity не знает (UTAGE и пр.)
+        self.status("Перевод в данных игры…", None)
+        try:
+            from . import direct
+            # строки «только для словаря» (найдены по смелым признакам) в данные игры не вписываются
+            display_only = {e.source for e in project.entries if (e.notes or {}).get("display_only")}
+            drep = direct.apply(game, {s: t for s, t in pairs.items() if s not in display_only}, backup,
+                                self.status)
+            project.meta["unity_direct"] = {"files": drep.files, "strings": drep.strings,
+                                            "ambiguous": drep.skipped_ambiguous}
+            if drep.errors:
+                project.warnings.append("Часть файлов игры не изменена (перевод в них — на лету): "
+                                        + "; ".join(drep.errors[:5]))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Прямой перевод в данных игры не выполнен: %s", exc)
         project.meta["unity_backend"] = game.backend
         resized = xunity.write_resizer(game, backup, xunity.resize_rules(project.meta.get("unity_ui") or [], pairs))
         project.meta["unity_resized"] = resized

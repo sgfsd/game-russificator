@@ -40,6 +40,7 @@ from ..core.universal import Entry
 from . import markup
 from .markup import join_soft_wraps, rewrap
 from .base import StatusFn, Translator, TranslatorError, _noop
+from .filters import spelled_in_cyrillic
 from .glossary import match_case, ui_phrase
 
 log = logging.getLogger("russificator.machine")
@@ -357,13 +358,23 @@ class MachineTranslator(Translator):
     def rules_version(self) -> int:
         # 1 — фраза, разбитая на строки, переводится целиком; 2 — слово словаря интерфейса в рамке
         # из знаков («-NEW-») берётся из словаря; 3 — оставшиеся английскими слова Заглавного
-        # Регистра и КАПСА переводятся повторно в обычном регистре
-        return 3
+        # Регистра и КАПСА переводятся повторно в обычном регистре; 4 — оставшиеся английскими слова
+        # обычного регистра — повтор с другим концом фразы; 5 — подписи по словарю интерфейса (и в
+        # несколько строк, и с «!»/«:»), пословный перевод Заглавного Регистра, полноширинные знаки и
+        # слова вида «WorkBench»
+        return 5
 
     def redo(self, source: str, translation: str, old_version: int) -> bool:
         return ((old_version < 1 and join_soft_wraps(source)[1] is not None)
                 or (old_version < 2 and _framed_phrase(source))
-                or (old_version < 3 and _decap(source) != source and _leftover(source, translation or "") > 0))
+                or (old_version < 3 and _decap(source) != source and _leftover(source, translation or "") > 0)
+                or (old_version < 4 and self.stale(source, translation or ""))
+                or (old_version < 5 and _redo_v5(source, translation or "")))
+
+    def stale(self, source: str, translation: str) -> bool:
+        """Запомненный перевод с непереведённым обычным словом оригинала («Кто cares») или сделанный до
+        правил версии 5 («REPLAY» → «ВОСПРОИЗВЕСТИ», «Главная Блюда»): переводится заново."""
+        return _leftover_common(source, translation) > 0 or _redo_v5(source, translation)
 
     def translate_texts(self, texts: List[str]) -> List[str]:
         """Перевести произвольные строки (с защитой разметки). Для тестов и сервера перевода.
@@ -398,7 +409,7 @@ class MachineTranslator(Translator):
             lines = []
             for line in text.split("\n"):
                 masked, originals, sign = markup.mask(line, self._signs())
-                masked = self._mask_unknown(masked, originals, sign)
+                masked = self._mask_unknown(_for_model(masked), originals, sign)
                 sentences = []
                 # маркер, приклеенный к слову («&0Warning:»), мешает модели перевести само слово:
                 # ей он даётся через пробел, а после перевода приклеивается обратно (unmask)
@@ -423,6 +434,35 @@ class MachineTranslator(Translator):
                 if _leftover(queue[k], alt) < _leftover(queue[k], done[k]):
                     alt = _recap_marked(queue[k], alt)
                     done[k] = alt[:1].upper() + alt[1:] if queue[k][:1].isupper() else alt
+        # слово обычного регистра модель тоже бывает оставляет английским («Who cares lemme go» → «Кто
+        # cares…»): та же фраза с точкой в конце (или без конечного знака) переводится иначе — берётся
+        # вариант, где английского меньше, конечный знак — как в оригинале
+        retry = [k for k, src in enumerate(queue) if _leftover(src, done[k])]
+        if retry:
+            variants = [_repunct(queue[k]) for k in retry]
+            again = self._run(variants)
+            for k, alt in zip(retry, again):
+                if _leftover(queue[k], alt) < _leftover(queue[k], done[k]):
+                    done[k] = _unrepunct(queue[k], alt)
+        # незнакомое модели слово со строчной она пишет кириллицей («dang» → «дэнг», «nope» → «ноуп»): с
+        # заглавной и точкой («Dang.») это уже реплика, и модель её переводит («Черт.»)
+        retry = [k for k, src in enumerate(queue)
+                 if src[:1].islower() and len(src.split()) <= 3 and spelled_in_cyrillic(src, done[k])]
+        if retry:
+            again = self._run([_repunct(queue[k][:1].upper() + queue[k][1:]) for k in retry])
+            for k, alt in zip(retry, again):
+                if not spelled_in_cyrillic(queue[k], alt) and re.search("[а-яё]", alt.lower()):
+                    alt = _unrepunct(queue[k], alt)
+                    done[k] = alt[:1].lower() + alt[1:]
+        # подпись Заглавным Регистром модель переводит пословно, перенося заглавные: «Main Dish» →
+        # «Главная Блюда», «Fire Cloud Sparrow» → «Огненное Облако Воробей» (по-русски слова внутри
+        # строчные) — та же подпись обычным регистром переводится связно («Главное блюдо»)
+        retry = [k for k, src in enumerate(queue) if _title_label(src) and _inner_capitals(done[k])]
+        if retry:
+            again = self._run([_decap(queue[k]) for k in retry])
+            for k, alt in zip(retry, again):
+                if _inner_capitals(alt) < _inner_capitals(done[k]) and not _leftover(queue[k], alt):
+                    done[k] = alt[:1].upper() + alt[1:]
 
         for i, lines in plans:
             result_lines = []
@@ -561,10 +601,71 @@ def _spaced(masked: str, sign: str) -> str:
     return re.sub(rf"({re.escape(sign)}\d+)(?=[^\s\d])", r"\1 ", s)
 
 
+#: полноширинная пунктуация китайской раскладки: «WorkBench：Cultivate»
+_FULLWIDTH_PUNCT_RE = re.compile(r"\s*([！，：；？])\s*")
+_COMPOUND_RE = re.compile(r"(?<![\w@#&*$])[A-Z]?[a-z]+[A-Z][a-z]+(?![\w])")
+
+
+def _for_model(line: str) -> str:
+    """Строка в том виде, в каком модель её понимает: полноширинные знаки — обычными с пробелом после
+    («WorkBench：Cultivate» → «WorkBench: Cultivate»), обычное слово с заглавной в середине — как в
+    словаре («WorkBench» → «Workbench»: иначе модель оставляет его английским)."""
+    if _FULLWIDTH_PUNCT_RE.search(line):
+        out = _FULLWIDTH_PUNCT_RE.sub(lambda m: unicodedata.normalize("NFKC", m.group(1)) + " ", line)
+        line = out[:-1] if out.endswith(" ") and not line.endswith(" ") else out
+    return _COMPOUND_RE.sub(lambda m: m.group(0)[0] + m.group(0)[1:].lower()
+                            if markup.plain_compound(m.group(0)) else m.group(0), line)
+
+
+def _redo_v5(source: str, translation: str) -> bool:
+    """Перевод, который правила версии 5 сделали бы иначе."""
+    ready = ui_phrase(source)
+    if ready is not None:
+        return ready != translation
+    if _title_label(source) and _inner_capitals(translation):
+        return True
+    return _for_model(source) != source and _leftover(source, translation) > 0
+
+
+def _title_label(src: str) -> bool:
+    """Подпись Заглавным Регистром из 2–5 слов без знака конца фразы («Main Dish», «Auto Stack Radius»)."""
+    words = re.findall(r"[A-Za-z][A-Za-z'-]*", src)
+    return (2 <= len(words) <= 5 and len(src.split()) <= 6 and "\n" not in src and not re.search(r"[.!?…]\s*$", src)
+            and all(w[0].isupper() and not w.isupper() for w in words))
+
+
+def _inner_capitals(tr: str) -> int:
+    """Сколько слов перевода не в начале написано с заглавной (кириллица; аббревиатуры не в счёт)."""
+    words = re.findall(r"[А-ЯЁа-яё][а-яё]+", tr)
+    return sum(1 for w in words[1:] if w[0].isupper())
+
+
+def _leftover_common(src: str, tr: str) -> int:
+    """Сколько слов оригинала, написанных строчными (не имён и не аббревиатур), осталось в переводе."""
+    words = {w for w in re.findall(r"(?<![A-Za-z'])[a-z]{3,}(?![A-Za-z'])", src)}
+    return sum(1 for w in re.findall(r"[A-Za-z]{3,}", tr) if w in words)
+
+
 def _leftover(src: str, tr: str) -> int:
     """Сколько слов оригинала (от 3 букв) осталось в переводе по-английски."""
     words = {w.lower() for w in re.findall(r"[A-Za-z]{3,}", src)}
     return sum(1 for w in re.findall(r"[A-Za-z]{3,}", tr) if w.lower() in words)
+
+
+_END_RE = re.compile(r"[.!?…]+$")
+
+
+def _repunct(s: str) -> str:
+    """Та же фраза с другим концом: без конечного знака — с точкой, со знаком — без него."""
+    m = _END_RE.search(s)
+    return s[:m.start()] if m and m.start() > 0 else s + "."
+
+
+def _unrepunct(src: str, tr: str) -> str:
+    """Конец перевода варианта из :func:`_repunct` — как у оригинала."""
+    m = _END_RE.search(src)
+    body = _END_RE.sub("", tr.rstrip())
+    return body + (m.group(0) if m else "")
 
 
 def _decap(s: str) -> str:

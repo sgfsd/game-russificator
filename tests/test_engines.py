@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import pickle
+import re
 import shutil
 import struct
 import zlib
@@ -75,6 +76,202 @@ def test_rpyc_from_real_renpy_813():
     assert ("ui", "Game saved") in texts                    # _("…") в Python
     assert chars == {"e": "Eileen", "m": "Mary"}
     assert rpyc.font_references(stmts) == ["fonts/LatinOnly.ttf"]
+
+
+def _sl_node(cls: str, **attrs):
+    """Узел дерева .rpyc в том виде, в каком его распаковывает rpyc (заглушка класса Ren'Py)."""
+    from russificator.engines.renpy import rpyc
+    module, name = cls.rsplit(".", 1)
+    node = rpyc._SafeUnpickler.find_class(rpyc._SafeUnpickler(io.BytesIO(b"")), module, name)()
+    node.__dict__.update(attrs)
+    return node
+
+
+def test_rpyc_screen_expressions_give_their_strings():
+    """_("…") внутри выражений экрана — тоже текст для игрока: «empty slot» у FileTime,
+    шаблон «Page {}» у FilePageNameInputValue; литерал-аргумент текста берётся целиком."""
+    from russificator.engines.renpy import rpyc
+    tree = [
+        _sl_node("renpy.sl2.slast.SLDisplayable", positional=[
+            'FileTime(slot, format=_("{#file_time}%A, %B %d %Y, %H:%M"), empty=_("empty slot"))'], keyword=[]),
+        _sl_node("renpy.sl2.slast.SLDisplayable", positional=['_("{#quick_page}Quick")'],
+                 keyword=[("action", 'FilePage("quick")'), ("hovered", 'Notify("Quick saves here")')]),
+        _sl_node("renpy.sl2.slast.SLDefault", variable="page_name_value", expression=(
+            'FilePageNameInputValue(pattern=_("Page {}"), auto=_("Automatic saves"), quick=_("Quick saves"))')),
+        _sl_node("renpy.sl2.slast.SLIf", entries=[('persistent.flashing', None)]),
+        _sl_node("renpy.ast.ArgumentInfo", arguments=[(None, '_("Pick a card")'), ("style", '"card"')]),
+    ]
+    found, _ = rpyc.extract_texts(tree, "screens.rpy")
+    texts = [f.text for f in found]
+    for s in ("empty slot", "{#quick_page}Quick", "Quick saves here", "Page {}", "Automatic saves",
+              "Quick saves", "Pick a card"):
+        assert texts.count(s) == 1, s
+    assert "quick" not in texts and "card" not in texts and "persistent.flashing" not in texts
+
+
+def test_renpy_show_text_splash_is_extracted():
+    """Заставки «show text …» (предупреждение, вступление) — текст, а не картинка: в .rpyc строка
+    лежит частями имени картинки text, в исходнике — после «show text»."""
+    from russificator.engines.renpy import rpy_parse, rpyc
+    warning = "{size=72}WARNING{/size}\n\nThis is a horror game."
+    tree = [
+        _sl_node("renpy.ast.Show", linenumber=1,
+                 imspec=(("text", "_", '("{size=72}WARNING{/size}\\n\\nThis is a horror game.")'), None, None, [],
+                         None, None, None)),
+        _sl_node("renpy.ast.Show", linenumber=2, imspec=(("text", '"Welcome home."'), None, None, [], None, None, None)),
+        _sl_node("renpy.ast.Show", linenumber=3, imspec=(("bg", "forest"), None, None, [], None, None, None)),
+        _sl_node("renpy.ast.Show", linenumber=4, imspec=(None, 'Text(_("Chapter one"))', None, [], None, None, None)),
+    ]
+    found, _ = rpyc.extract_texts(tree, "script.rpy")
+    assert [(f.kind, f.text) for f in found] == [
+        ("narration", warning), ("narration", "Welcome home."), ("narration", "Chapter one")]
+
+    src = 'label start:\n    show text _("{size=72}WARNING{/size}\\n\\nThis is a horror game.") at truecenter\n' \
+          '    show text "Welcome home."\n    show bg forest\n'
+    found, _ = rpy_parse.extract_texts(src, "script.rpy")
+    assert [(f.kind, f.text) for f in found] == [("narration", warning), ("narration", "Welcome home.")]
+
+
+def _run_hook(tmp_path, table, translations=None):
+    """Выполнить хук Ren'Py на подставных объектах движка. Возвращает (пространство имён, Cfg, класс
+    переводчика строк, класс Text)."""
+    from russificator.engines.renpy.plugin import hook_script
+    code = hook_script({}).split("init 999 python:", 1)[1].replace("\n    ", "\n")
+
+    class StringTranslator:
+        def translate(self, old):
+            return (translations or {}).get(old, old)
+
+    class Cfg:
+        say_menu_text_filter = None
+        replace_text = None
+        underlay: list = []
+        interact_callbacks: list = []
+        font_replacement_map: dict = {}
+        gamedir = str(tmp_path)
+        savedir = None
+
+    class Render:
+        def __init__(self, w, h):
+            self.width, self.height, self.zoomed = w, h, None
+
+        def blit(self, r, pos):
+            self.child = r
+
+        def zoom(self, x, y):
+            self.zoomed = (x, y)
+
+    class Text:
+        """Ширина текста — 10 px на знак видимого текста (теги не в счёт)."""
+        def __init__(self, text, style=None, substitute=None, **props):
+            self.text_parameter = [text]
+            self.style = style or type("Style", (), {"font": "f.ttf", "size": 20, "bold": False,
+                                                     "italic": False, "kerning": 0})()
+
+        def size(self, width=4096, height=4096, st=0, at=0):
+            visible = re.sub(r"\{[^{}]*\}", "", ns["Translator"]().translate(self.text_parameter[0])
+                             if not ns["_ru_measure"][0] else self.text_parameter[0])
+            return float(len(visible) * 10), 20.0
+
+        def render(self, width, height, st, at):
+            w, h = self.size(width, height)
+            return Render(w, h)
+
+    class Translation:
+        pass
+    Translation.StringTranslator = StringTranslator
+
+    class RenPy:
+        translation = Translation
+        text = type("m", (), {"text": type("m", (), {"Text": Text})})
+
+        @staticmethod
+        def open_file(name):
+            return io.BytesIO(json.dumps(table).encode("utf-8"))
+
+        @staticmethod
+        def Keymap(**kw):
+            return kw
+
+    class RevertableList(list):
+        pass
+
+    class RevertableDict(dict):
+        pass
+
+    class RevertableSet(set):
+        pass
+
+    # в скриптах Ren'Py list/dict/set — «откатываемые» подклассы: isinstance(обычный список, list) ложно
+    ns = {"config": Cfg, "renpy": RenPy, "Text": Text, "Translator": StringTranslator,
+          "list": RevertableList, "dict": RevertableDict, "set": RevertableSet}
+    RenPy.Render = Render
+    exec(code, ns)
+    return ns, Cfg, StringTranslator, Text
+
+
+def test_renpy_hook_translates_screen_text_before_substitution(tmp_path):
+    """Строки экранов переводит штатный переводчик строк Ren'Py — до подстановки [переменных]
+    и .format(): config.replace_text видит уже «Name: sdf» и «Page 1», которых нет в словаре."""
+    table = {"{size=24}Name: [player_name]{/size}": "{size=24}Имя: [player_name]{/size}",
+             "Page {}": "Страница {}", "{#quick_page}Quick": "{#quick_page}Быстрые"}
+    ns, cfg, stl_cls, _ = _run_hook(tmp_path, table, {"Start": "Начать (перевод игры)"})
+    stl = stl_cls()
+    assert stl.translate("{size=24}Name: [player_name]{/size}") == "{size=24}Имя: [player_name]{/size}"
+    assert stl.translate("Page {}").format(1) == "Страница 1"
+    assert stl.translate("{#quick_page}Quick") == "{#quick_page}Быстрые"
+    assert stl.translate("Start") == "Начать (перевод игры)"   # свой перевод игры важнее
+    assert stl.translate("Unknown") == "Unknown"
+    cfg.underlay[0]["alt_K_t"].__globals__["_ru_on"][0] = False  # Alt+T — оригинал
+    assert stl.translate("Page {}") == "Page {}"
+
+
+def test_renpy_hook_journals_untranslated_strings(tmp_path):
+    """Строка, которую игра показала, а словаря для неё нет, попадает в журнал (папка игры, иначе
+    папка сохранений) — следующая русификация возьмёт её в словарь. Числа, русский текст и
+    строки без слов в журнал не идут; журнал копится между запусками игры."""
+    from russificator.engines.renpy.plugin import MISSED_FILE, RenPyPlugin
+    ns, cfg, stl_cls, _ = _run_hook(tmp_path, {"Known": "Известно"})
+    stl = stl_cls()
+    cfg.name = "My Game Demo"                                    # название игры — не в журнал
+    for s in ("Known", "Built by code: [n] coins", "42", "Уже по-русски", "{w}", "My Game Demo"):
+        stl.translate(s)
+    ns["config"].say_menu_text_filter("A line the extractor missed.")
+    ns["_ru_jstate"]["at"] = 0.0
+    for cb in cfg.interact_callbacks:
+        cb()
+    data = json.loads((tmp_path / MISSED_FILE).read_text(encoding="utf-8"))
+    assert data["strings"] == ["Built by code: [n] coins", "A line the extractor missed."]
+
+    ns2, cfg2, stl_cls2, _ = _run_hook(tmp_path, {})      # второй запуск игры — журнал дополняется
+    stl_cls2().translate("Another one")
+    ns2["_ru_jstate"]["at"] = 0.0
+    cfg2.interact_callbacks[0]()
+    data = json.loads((tmp_path / MISSED_FILE).read_text(encoding="utf-8"))
+    assert data["strings"][-1] == "Another one" and len(data["strings"]) == 3
+
+    work = tmp_path / "work"
+    game = tmp_path / "Game"
+    (game / "game").mkdir(parents=True)
+    (game / "game" / MISSED_FILE).write_text(json.dumps(data), encoding="utf-8")
+    assert RenPyPlugin().harvest_live(game, work) == 3          # перед откатом — в проект
+    assert RenPyPlugin().harvest_live(game, work) == 0
+
+
+def test_renpy_hook_shrinks_label_wider_than_original(tmp_path):
+    """Пункт меню, чей перевод шире английского оригинала, ужимается до его ширины; влезающий —
+    не трогается; без списка «fit» в словаре хук ничего не ужимает."""
+    from russificator.engines.renpy.plugin import META_KEY
+    table = {"Join our Discord": "Присоединяйтесь к нашему Discord", "Start": "Начать",
+             "Load": "Загрузить", META_KEY: {"fit": ["Join our Discord", "Load"]}}
+    ns, cfg, stl_cls, text_cls = _run_hook(tmp_path, table)
+    long = text_cls("Join our Discord").render(1920, 1080, 0, 0)    # 320 px при оригинале 160
+    assert long.child.zoomed and abs(long.width - 240) < 1           # запас: 4 буквы шрифта (20 px)
+    load = text_cls("Load").render(1920, 1080, 0, 0)                # 90 px при оригинале 40: в запасе
+    assert not hasattr(load, "child") and load.width == 90
+    short = text_cls("Start").render(1920, 1080, 0, 0)
+    assert not hasattr(short, "child") and short.width == 60
+    assert "Join our Discord" not in ns["_ru_missed"]                 # замер оригинала — не пропуск
 
 
 def test_rpa_archive_roundtrip(tmp_path):
@@ -366,7 +563,7 @@ def test_mv_extract_inject_wrap_and_font(mv_game):
     assert [c["code"] for c in lst][-4:] == [102, 402, 0, 0]          # ветвления на месте
     assert lst[len(lines) + 1]["parameters"][0] == ["RU Yes", "RU No"]
     sysj = json.loads((mv_game / "www/data/System.json").read_text(encoding="utf-8"))
-    assert sysj["terms"]["commands"] == ["RU Fight"] and sysj["gameTitle"] == "RU My Game"
+    assert sysj["terms"]["commands"] == ["RU Fight"] and sysj["gameTitle"] == "My Game"
     css = (mv_game / "www/fonts/gamefont.css").read_text(encoding="utf-8")
     assert "unicode-range" in css and "PT_Sans" in css                  # кириллица из PT Sans
     assert "russificator-preload" in (mv_game / "www/index.html").read_text(encoding="utf-8")
@@ -670,3 +867,50 @@ def test_renpy_font_gets_own_cyrillic(tmp_path):
     assert (root / "game" / "russificator" / "LatinOnly-ru.ttf").is_file()
     assert not (root / "game" / "russificator" / "PT_Sans-Web-Regular.ttf").exists()
     restore_backups(root)
+
+
+def test_mv_scroll_text_keeps_its_layout():
+    """Бегущая строка (титры, вступление): абзацы переводятся по отдельности, строки титров не
+    склеиваются в кашу, пустые строки на месте, непереведённый абзац (имена) — как был."""
+    from russificator.engines.rpgmaker import layout, mv_mz
+    lines = ["Five Nights", "( Hold To Speed Up )", "", "", "Programs used :", "",
+             "Blender --- Render", "Photoshop --- Edit", "", "Yukari Moscow"]
+    cmds = [{"code": 105, "indent": 0, "parameters": [2, False]}] + \
+        [{"code": 405, "indent": 0, "parameters": [ln]} for ln in lines] + [{"code": 0, "parameters": []}]
+    found: list = []
+    mv_mz._event_list(cmds, "Map001.json|ev1|p0", found)
+    texts = [e.source for e in found]
+    assert texts == ["Five Nights\n( Hold To Speed Up )", "Programs used :",
+                     "Blender --- Render\nPhotoshop --- Edit", "Yukari Moscow"]
+    tr = {"Five Nights\n( Hold To Speed Up )": "Пять ночей\n( Зажмите, чтобы ускорить )",
+          "Programs used :": "Программы:", "Blender --- Render\nPhotoshop --- Edit": "Blender — рендер\nPhotoshop — правка"}
+    keys = {}
+    for e in found:
+        if e.source in tr:
+            e.translation = tr[e.source]
+            keys[e.target_key] = e
+    out, n = mv_mz._apply_list(cmds, "Map001.json|ev1|p0", keys, layout.DEFAULTS["mv"])
+    got = [c["parameters"][0] for c in out if c.get("code") == 405]
+    assert n == 3
+    assert got == ["Пять ночей", "( Зажмите, чтобы ускорить )", "", "", "Программы:", "",
+                   "Blender — рендер", "Photoshop — правка", "", "Yukari Moscow"]
+
+
+def test_mv_message_keeps_list_breaks():
+    from russificator.engines.rpgmaker.mv_mz import join_lines
+    assert join_lines(["Hello there, how are", "you today?"]) == "Hello there, how are you today?"
+    assert join_lines(["Pick one:", "- Attack", "- Run"]) == "Pick one:\n- Attack\n- Run"
+
+
+@pytest.mark.parametrize("key,value,text", [
+    ("Menu Order", "Quit: toTitle, Save: save", False),     # порядок меню: плагин делает split(": ")
+    ("Show Gold Window", "no", False),                      # флаг: плагин сравнивает == "yes"
+    ("Text Alignment", "left", False),
+    ("Island Name", "Coral Bay", True),                     # «is» в начале слова — не флаг «Is …»
+    ("Name", "Quit", True),
+    ("Yes Text", "Yes", True),                              # явная надпись кнопки
+    ("Help Text", "Press Z to talk", True),
+])
+def test_plugin_params_settings_are_not_text(key, value, text):
+    from russificator.engines.rpgmaker.plugin_text import is_text
+    assert is_text(key, value) is text

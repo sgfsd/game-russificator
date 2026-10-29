@@ -31,6 +31,17 @@ _NOT_TEXT_KEY = re.compile(r"file|image|img|picture|\bpic|icon|face|sound|\bse\b
                            r"index|frame|animation|sprite|json|regex|pattern|mode|type|style|position|layer|scale|"
                            r"skin|note\s*tag|notetag|element|state|class|troop|weapon|armor|armour|actor|enemy|"
                            r"map|region|terrain|tile|event|common|param", re.I)
+#: ключи-настройки: порядок/ключевые слова команд, флаги «Show …», «Enable …», «Use …»
+_SETTING_KEY = re.compile(r"order|keyword|setting|config|^\s*(?:show|hide|enable|disable|use|allow|is|has|auto)\b", re.I)
+#: значение-флаг или выбор из списка: так плагин и сравнивает (== "yes"), перевод его сломает
+_FLAG_VALUES = {"yes", "no", "on", "off", "true", "false", "enable", "enabled", "disable", "disabled",
+                "left", "right", "center", "centre", "top", "bottom", "middle", "none", "auto", "default",
+                "show", "hide", "normal", "always", "never", "horizontal", "vertical", "all"}
+#: ключ — явно надпись: тогда и «Yes»/«No» — текст кнопки
+_STRONG_TEXT_KEY = re.compile(r"(?:text|name|label|vocab|caption|title|message|msg|string|word|term|command|cmd)\s*\d*\s*$",
+                              re.I)
+#: настройка «надпись: команда, надпись: команда» (порядок меню): правая часть — идентификатор
+_CONFIG_PAIRS = re.compile(r"^\s*[^:,]+:\s*[A-Za-z_$][\w=.$-]*(?:\s*,\s*[^:,]+:\s*[A-Za-z_$][\w=.$-]*)+\s*$")
 _CODE_VALUE = re.compile(r"[;{}]|=>|\bfunction\b|\bthis\.|\$game|\$data|\bvar\b|\blet\b|\bconst\b|\breturn\b|"
                          r"Math\.|\|\||&&|===?|!==?|\w+\(.*\)$")
 
@@ -40,8 +51,12 @@ def is_text(key: str, value: str) -> bool:
     v = value.strip()
     if not v or len(v) > 1000 or v.lower() in ("true", "false", "null", "none", "auto"):
         return False
-    if not key or not _TEXT_KEY.search(key) or _NOT_TEXT_KEY.search(key):
+    if not key or not _TEXT_KEY.search(key) or _NOT_TEXT_KEY.search(key) or _SETTING_KEY.search(key):
         return False
+    if v.lower() in _FLAG_VALUES and not _STRONG_TEXT_KEY.search(key):
+        return False                  # «Show Gold Window» = «no»: плагин сравнивает == "yes"
+    if _CONFIG_PAIRS.match(v):
+        return False                  # «Quit: toTitle, Save: save» — порядок меню, а не надпись
     if _CODE_VALUE.search(v) or looks_technical(v) or re.fullmatch(r"[\d\s.,%+\-*/#()]+", v):
         return False
     return looks_translatable(v)

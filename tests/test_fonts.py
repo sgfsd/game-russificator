@@ -343,3 +343,29 @@ def test_pixel_letters_are_single_outlines():
     # две клетки, касающиеся углом, — два отдельных контура
     two = cyrillic._cell_contours(np.array([[True, False], [False, True]]), 0, 2, 100, 0, 0)
     assert len(two) == 2 and all(len(c) == 4 for c in two)
+
+
+def test_fullwidth_cyrillic_of_cjk_font_is_redrawn_proportional():
+    """Китайский шрифт кладёт кириллицу в клетку иероглифа (FangZhengLiBian, CardCultivation): «п» шириной
+    в кегль при латинской «n» вдвое уже — текст выходит вразрядку. Такие буквы рисуются заново по меркам
+    латиницы, и шрифт перестаёт быть «полноширинным»."""
+    donor = sfnt.Font(cyrillic.donor_bytes(False))
+    em = donor.upem
+
+    def contours(c):
+        g = donor.gid(c)
+        return [[(x, y, on) for x, y, on in cn] for cn in donor.contours(g)] if g else []
+
+    def advance(c):
+        return em if c in cyrillic.RUSSIAN else donor.advance(c) or em // 2   # кириллица — в клетке «кегль»
+
+    data = _font_from(contours, advance, LATIN + cyrillic.RUSSIAN)
+    font = sfnt.Font(data)
+    assert cyrillic.fullwidth_font(font)
+    assert set(cyrillic.missing(font, "Привет")) == set("Привет")
+    new = sfnt.Font(cyrillic.add_cyrillic(data, cyrillic.RUSSIAN))
+    assert not cyrillic.fullwidth_font(new)
+    assert new.advance("п") < 0.75 * em and new.advance("A") == font.advance("A")
+    # моноширинный шрифт (и латиница, и кириллица в одной клетке) — не китайский случай
+    assert not cyrillic.fullwidth_letters([600.0] * 30, [600.0] * 30, 1000)
+    assert cyrillic.fullwidth_letters([500.0 + i for i in range(30)], [1000.0] * 30, 1000)

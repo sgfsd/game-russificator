@@ -20,6 +20,8 @@ _STRING = r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\''
 # реплика: [персонаж [атрибуты]] "текст" [with …] / рассказчик: "текст"
 _SAY_RE = re.compile(rf'^(?P<who>[A-Za-z_]\w*(?:\s+[\w\-]+)*?)?\s*(?P<str>{_STRING})(?P<tail>\s.*)?$')
 _MENU_ITEM_RE = re.compile(rf'^(?P<str>{_STRING})\s*(?:if\s+.+)?:\s*$')
+#: show text "…" / show text _("…") — заставки и предупреждения, показанные как картинка
+_SHOW_TEXT_RE = re.compile(rf'^(?:show|scene)\s+text\s+(?P<arg>(?:__?\(\s*)?(?:{_STRING})\s*\)?)')
 _SCREEN_TEXT_RE = re.compile(rf'^(?:text|textbutton|label|tooltip)\s+(?P<arg>(?:__?\(\s*)?(?:{_STRING})\s*\)?)')
 
 _NOT_SPEAKERS = {"scene", "show", "hide", "play", "queue", "stop", "voice", "jump", "call", "image", "define",
@@ -81,6 +83,13 @@ def extract_texts(source: str, filename: str) -> Tuple[List[FoundText], Dict[str
                 if name:
                     characters[m.group(1)] = name
                     found.append(FoundText(name, "name", None, filename, no))
+            continue
+        tm = _SHOW_TEXT_RE.match(stripped)
+        if tm:
+            lm = _LITERAL_RE.match(tm.group("arg"))
+            val = _literal(lm.group(1)) if lm else None
+            if val and val.strip():
+                found.append(FoundText(val, "narration", None, filename, no))
             continue
         for um in _UNDERSCORE_RE.finditer(stripped):
             val = _literal(um.group(1))

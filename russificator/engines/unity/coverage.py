@@ -217,10 +217,15 @@ def classify(texts: Dict[str, str], seen: Dict[str, str], found: Optional[set] =
     ``found`` — что нынешний поиск уже берёт в словарь."""
     idx = _Index(seen)
     found = found or set()
+    # XUnity сравнивает без пробелов и переводов строк по краям, а КАПС-вариант короткой строки
+    # словаря («TOM» для «Tom») пишется в словарь сам (xunity.case_variants)
+    trimmed = {s.strip() for s in found}
+    upper = {s.upper() for s in trimmed if len(s) <= 40}
     out: List[Miss] = []
     for text, tr in texts.items():
         origin = idx.find(text)
-        if text in found:
+        core = text.strip()
+        if text in found or core in trimmed or (core.isupper() and core in upper):
             out.append(Miss(text, tr, "found", origin or ""))
             continue
         if origin and _NAMES_RE.search(origin):

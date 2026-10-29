@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from typing import List, Tuple
+from functools import lru_cache
+from typing import Iterator, List, Tuple
 
 _PARTS = [
     r"\{\{|\}\}|\[\[",                               # экранированные скобки Ren'Py
@@ -35,15 +36,55 @@ _PARTS = [
     r"%%",
     r"%\d+",                                          # %1 %2 (термины RPG Maker MV)
     r"\$\{[^}\n]{0,60}\}",                            # ${var}
+    # идентификаторы и названия: код, плагины, бренды — не переводятся и не ломаются переводчиком
+    # («HIME_PreTitleEvents» → «heme_PreTitleСобытия», «MikuMikuDance» → «Показать»)
+    r"(?<![\w$])\$?[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\$?(?![\w$])",   # snake_case, SRD_HUDMaker
+    # MikuMikuDance, YouTube, iPhone — но не обычное слово с заглавной в середине (см. plain_compound)
+    r"(?P<camel>(?<![\w$])[A-Za-z]*[a-z][A-Z][A-Za-z0-9]*(?![\w$]))",
 ]
 
 MARKUP_RE = re.compile("|".join(f"(?:{p})" for p in _PARTS))
 _LETTERS_RE = re.compile(r"[A-Za-zА-Яа-яЁё]")
 
 
+@lru_cache(maxsize=1)
+def _lexicon() -> frozenset:
+    try:
+        from ..overlay.words import lexicon
+        return frozenset(lexicon())
+    except Exception:  # noqa: BLE001 — без словаря все такие слова остаются названиями
+        return frozenset()
+
+
+def plain_compound(word: str) -> bool:
+    """Обычное английское слово, записанное с заглавной в середине: «WorkBench», «FireBall», «HotKey» —
+    в словаре английского есть «workbench», «fireball». Это текст игры, его переводят. Бренды и имена из
+    кода («YouTube», «PlayStation», «GameObject») в словаре не найдутся и остаются как есть."""
+    return word.isalpha() and word.lower() in _lexicon()
+
+
+def markup_matches(text: str) -> Iterator["re.Match"]:
+    """Вставки строки по порядку (совпадения :data:`MARKUP_RE` без обычных слов вида «WorkBench»)."""
+    for m in MARKUP_RE.finditer(text or ""):
+        camel = m.group("camel")
+        if camel and plain_compound(camel):
+            continue
+        yield m
+
+
 def tokens(text: str) -> List[str]:
     """Все служебные вставки строки (в порядке появления)."""
-    return MARKUP_RE.findall(text or "")
+    return [m.group(0) for m in markup_matches(text)]
+
+
+def _replace(text: str, repl) -> str:
+    out, pos = [], 0
+    for m in markup_matches(text):
+        out.append(text[pos:m.start()])
+        out.append(repl(m))
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def same_markup(source: str, translation: str) -> bool:
@@ -59,7 +100,7 @@ def missing_markup(source: str, translation: str) -> List[str]:
 
 def plain_text(text: str) -> str:
     """Текст без служебных вставок."""
-    return MARKUP_RE.sub(" ", text or "")
+    return _replace(text or "", lambda m: " ")
 
 
 def has_words(text: str) -> bool:
@@ -80,7 +121,7 @@ def mask(text: str, signs: str = "@#") -> Tuple[str, List[str], str]:
         found.append(m.group(0))
         return f"{sign}{len(found) - 1}"
 
-    masked = MARKUP_RE.sub(repl, text)
+    masked = _replace(text, repl)
     return masked, found, sign
 
 
@@ -244,7 +285,7 @@ def normalize_layout(source: str, translation: str) -> str:
     src_end = source.rstrip()[-1:] if source.strip() else ""
     if src_end and src_end not in ".!?…:;" and re.search(r"(?<!\.)\.\s*$", translation):
         translation = re.sub(r"\.(\s*)$", r"\1", translation)
-    found = list(MARKUP_RE.finditer(source))
+    found = list(markup_matches(source))
     for a, b in zip(found, found[1:]):
         if a.end() == b.start():
             translation = re.sub(re.escape(a.group(0)) + r"\s+" + re.escape(b.group(0)),
@@ -256,7 +297,7 @@ def split_by_markup(text: str) -> List[Tuple[bool, str]]:
     """Разбить строку на куски [(это_вставка, текст)] — для пофрагментного перевода."""
     out: List[Tuple[bool, str]] = []
     pos = 0
-    for m in MARKUP_RE.finditer(text):
+    for m in markup_matches(text):
         if m.start() > pos:
             out.append((False, text[pos:m.start()]))
         out.append((True, m.group(0)))

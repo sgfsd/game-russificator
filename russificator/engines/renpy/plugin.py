@@ -28,7 +28,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from ...core.plugin_api import Detection, EnginePlugin, ExportPlan
 from ...core.universal import Entry, EntryStatus, ExtractionResult, TextKind, TranslationProject
+from ...translation import markup
 from ...translation.filters import looks_translatable
+from ...translation.length import relative_limit
+from . import common as _common
 from . import detect as _detect
 from . import rpy_parse, rpyc
 from .archive import RpaArchive, open_archives
@@ -37,9 +40,19 @@ log = logging.getLogger("russificator.renpy")
 
 KIND = {"dialogue": TextKind.DIALOGUE, "narration": TextKind.NARRATION, "choice": TextKind.CHOICE,
         "name": TextKind.CHARACTER_NAME, "ui": TextKind.UI}
-MAX_LENGTHS = {TextKind.CHOICE: 70, TextKind.UI: 40, TextKind.CHARACTER_NAME: 24}
+#: где ширина места ограничена: перевод сильно длиннее оригинала просим сократить. Лимит — от длины
+#: самого оригинала (места под него в игре хватало): (во сколько раз, плюс знаков). Кнопки и подписи
+#: не переносятся — им запас меньше; варианты выбора переносятся по строкам. То, что всё равно не
+#: влезло, хук ужимает при показе до ширины оригинала.
+LIMITS = {TextKind.UI: (1.25, 4), TextKind.CHARACTER_NAME: (1.3, 4), TextKind.CHOICE: (1.4, 8)}
 
 TL_FILE = "russificator_tl.json"
+#: строки, которые игра показала, а словаря для них не нашлось (пишет хук во время игры)
+MISSED_FILE = "russificator_missed.json"
+#: они же, сохранённые в проекте перед откатом (откат удаляет файл из папки игры)
+LIVE_FILE = "renpy_missed.json"
+#: служебный ключ словаря: переводы, которые длиннее места оригинала (хук ужимает их при показе)
+META_KEY = "\u0000russificator"
 HOOK_FILE = "zz_russificator.rpy"
 FONT_DIR = "russificator"
 _TAG_RE = re.compile(r"(?<!\{)\{[^{}]*\}")
@@ -124,9 +137,16 @@ class RenPyPlugin(EnginePlugin):
         if broken:
             warnings.append(f"Не удалось разобрать скриптов: {broken} (текст из них останется на английском).")
 
+        engine = _common.engine_texts(game_root)       # «Are you sure you want to quit?» и пр. — из движка
+        texts += engine
         entries = self._entries(texts, characters)
+        known = {e.source for e in entries}
+        live = self._live_entries(project, game_root, known)
+        entries += live
         for e in entries:
             project.add_entry(e)
+        project.meta["renpy_engine_strings"] = len({t.text for t in engine})
+        project.meta["renpy_live_found"] = len(live)
         project.meta["renpy_fonts"] = sorted(fonts)
         project.meta["renpy_characters"] = characters
         return ExtractionResult(entries, warnings=warnings)
@@ -152,9 +172,84 @@ class RenPyPlugin(EnginePlugin):
                 speaker = characters.get(t.who or "", t.who) if t.who else None
                 key = hashlib.sha1(f"{file}:{t.line}:{n}:{t.text}".encode("utf-8")).hexdigest()[:14]
                 entries.append(Entry(id=f"rp{key}", source=t.text, kind=kind, speaker=speaker, scene=file,
-                                     neighbors=neighbors, max_length=MAX_LENGTHS.get(kind),
-                                     target_key="rt:" + hashlib.sha1(t.text.encode("utf-8")).hexdigest()[:16]))
+                                     neighbors=neighbors,
+                                     max_length=relative_limit(t.text, *LIMITS[kind]) if kind in LIMITS else None,
+                                     target_key="rt:" + hashlib.sha1(t.text.encode("utf-8")).hexdigest()[:16],
+                                     notes={"fits_at_runtime": True}))
         return entries
+
+    # ---------- найденное во время игры ----------
+
+    @staticmethod
+    def _missed_files(game_root: Path) -> List[Path]:
+        """Журналы хука: в папке игры, а если она была только для чтения — в папке сохранений Ren'Py
+        (там журнал знает, какой игры он: поле gamedir)."""
+        out = [game_root / MISSED_FILE]
+        import os
+        appdata = os.environ.get("APPDATA")
+        if appdata and (Path(appdata) / "RenPy").is_dir():
+            for p in (Path(appdata) / "RenPy").glob(f"*/{MISSED_FILE}"):
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                    if Path(str(data.get("gamedir", ""))).resolve() == game_root.resolve():
+                        out.append(p)
+                except Exception:  # noqa: BLE001
+                    continue
+        return [p for p in out if p.is_file()]
+
+    @staticmethod
+    def _read_missed(path: Path) -> List[str]:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return []
+        items = data.get("strings", []) if isinstance(data, dict) else []
+        return [s for s in items if isinstance(s, str)]
+
+    def harvest_live(self, game_dir: Path, work_dir: Path) -> int:
+        """Перед откатом: строки из журнала хука — в проект (откат удалит журнал вместе с русификацией)."""
+        game_root = _detect.find_game_dir(Path(game_dir))
+        if game_root is None:
+            return 0
+        store = Path(work_dir) / LIVE_FILE
+        try:
+            have = json.loads(store.read_text(encoding="utf-8")) if store.is_file() else []
+        except Exception:  # noqa: BLE001
+            have = []
+        seen, before = set(have), len(have)
+        for p in self._missed_files(game_root):
+            for s in self._read_missed(p):
+                if s not in seen:
+                    seen.add(s)
+                    have.append(s)
+        added = len(have) - before
+        if added:
+            store.parent.mkdir(parents=True, exist_ok=True)
+            store.write_text(json.dumps(have, ensure_ascii=False, indent=0), encoding="utf-8")
+        return added
+
+    def _live_entries(self, project: TranslationProject, game_root: Path, known: set) -> List[Entry]:
+        """Строки, которые игра показала, а поиск не нашёл (собраны хуком во время игры): они входят
+        в следующий словарь — так любой пропуск извлечения закрывается после первой же игры."""
+        texts: List[str] = []
+        store = Path(project.work_dir) / LIVE_FILE
+        if store.is_file():
+            try:
+                texts += [s for s in json.loads(store.read_text(encoding="utf-8")) if isinstance(s, str)]
+            except Exception:  # noqa: BLE001
+                pass
+        for p in self._missed_files(game_root):
+            texts += self._read_missed(p)
+        out: List[Entry] = []
+        for text in dict.fromkeys(texts):
+            if text in known or _FILE_RE.match(text.strip()) or not looks_translatable(text):
+                continue
+            kind = TextKind.NARRATION if len(text) > 60 and " " in text else TextKind.UI
+            key = hashlib.sha1(text.encode("utf-8")).hexdigest()
+            out.append(Entry(id=f"rl{key[:14]}", source=text, kind=kind, scene="live",
+                             max_length=relative_limit(text, *LIMITS[kind]) if kind in LIMITS else None,
+                             target_key="rt:" + key[:16], notes={"fits_at_runtime": True}))
+        return out
 
     # ---------- внедрение ----------
 
@@ -167,9 +262,14 @@ class RenPyPlugin(EnginePlugin):
         if not table:
             project.warnings.append("Нет переведённых строк — внедрение пропущено.")
             return
+        translations = list(table.values())
+        fit = overflowing(project.entries)
+        if fit:
+            table[META_KEY] = {"fit": fit}
         backup.write_text(game_root / TL_FILE, json.dumps(table, ensure_ascii=False, indent=0, sort_keys=True))
+        backup.write_text(game_root / MISSED_FILE, json.dumps({"version": 1, "strings": []}))
 
-        font_map, font_notes = self._fonts(game_root, project, backup, list(table.values()))
+        font_map, font_notes = self._fonts(game_root, project, backup, translations)
         project.warnings.extend(font_notes)
         backup.write_text(game_root / HOOK_FILE, hook_script(font_map))
         project.meta["renpy_translations"] = len(table)
@@ -278,7 +378,7 @@ class RenPyPlugin(EnginePlugin):
     def export_plan(self, game_dir: Path, project: TranslationProject, credit: Optional[str]) -> ExportPlan:
         """Всё, что русификатор добавил в игру, — новые файлы: их и копируем (словарь по тексту
         строк подходит и к другой версии игры). Надпись о программе — отдельным экраном."""
-        plan = ExportPlan(method="files")
+        plan = ExportPlan(method="files", exclude=[MISSED_FILE])   # журнал пропусков — только свой
         game_root = _detect.find_game_dir(Path(game_dir))
         if game_root is None or not credit:
             return plan
@@ -314,6 +414,20 @@ def build_table(entries: List[Entry]) -> Dict[str, str]:
             if s and d and s != src:
                 table.setdefault(s, d)
     return table
+
+
+def overflowing(entries: List[Entry]) -> List[str]:
+    """Подписи и кнопки, чей перевод заметно длиннее оригинала. Сколько у них места на самом деле,
+    знает только игра — хук ужимает их при показе, если они шире английского оригинала."""
+    out = set()
+    for e in entries:
+        if e.kind not in (TextKind.UI, TextKind.CHARACTER_NAME) or not e.translation \
+                or e.status not in (EntryStatus.TRANSLATED, EntryStatus.APPROVED):
+            continue
+        src, tr = markup.plain_text(e.source).strip(), markup.plain_text(e.translation).strip()
+        if src and len(tr) > len(src) * 1.1:
+            out.add(e.source)
+    return sorted(out)
 
 
 def credit_block(credit: str, font_name: str) -> str:
@@ -374,6 +488,7 @@ init 999 python:
             return {{}}
 
     _ru_tl = _ru_load()
+    _ru_meta = _ru_tl.pop(u"\\u0000russificator", None) or {{}}
     _ru_prev_say = config.say_menu_text_filter
 
     # Русская реплика длиннее английской и может не влезть в окно диалога
@@ -422,6 +537,7 @@ init 999 python:
 
     # Alt+T — перевод / оригинал (интерфейс сразу, реплика — со следующей)
     _ru_on = [True]
+    _ru_measure = [False]        # замер ширины английского оригинала — без перевода
 
     def _ru_toggle():
         _ru_on[0] = not _ru_on[0]
@@ -436,6 +552,70 @@ init 999 python:
     except Exception:
         pass
 
+    # Журнал: строки, которые игра показала, а словаря для них нет (поиск текста их пропустил —
+    # собраны кодом игры, лежат в необычном месте). Следующая русификация берёт их в словарь,
+    # так любой пропуск закрывается после первой же игры. Пишется в папку игры, а если она
+    # только для чтения — в папку сохранений.
+    import collections as _ru_coll, io as _ru_io, os as _ru_os, re as _ru_re, time as _ru_time
+    _ru_missed = _ru_coll.OrderedDict()
+    _ru_jstate = _ru_coll.OrderedDict([("dirty", False), ("at", 0.0)])
+    _ru_latin = _ru_re.compile(r"[A-Za-z]{{2}}")
+    _ru_cyr = _ru_re.compile(u"[\\u0400-\\u04ff]")
+
+    def _ru_journals():
+        out = []
+        try:
+            out.append(_ru_os.path.join(config.gamedir, "{MISSED_FILE}"))
+            if config.savedir:
+                out.append(_ru_os.path.join(config.savedir, "{MISSED_FILE}"))
+        except Exception:
+            pass
+        return out
+
+    for _ru_p in _ru_journals():
+        try:
+            with _ru_io.open(_ru_p, encoding="utf-8") as _ru_f:
+                for _ru_s in _ru_json.loads(_ru_f.read()).get("strings", []):
+                    _ru_missed[_ru_s] = True
+        except Exception:
+            pass
+
+    def _ru_miss(s):
+        try:
+            # название игры (заголовок окна) — имя продукта, его не переводим
+            if s in (getattr(config, "name", None), getattr(config, "window_title", None)):
+                return
+            if (s not in _ru_missed and len(_ru_missed) < 20000 and len(s) < 4000
+                    and _ru_latin.search(s) and not _ru_cyr.search(s)):
+                _ru_missed[s] = True
+                _ru_jstate["dirty"] = True
+        except Exception:
+            pass
+
+    def _ru_flush(*args, **kwargs):
+        try:
+            now = _ru_time.time()
+            if not _ru_jstate["dirty"] or now - _ru_jstate["at"] < 5:
+                return
+            _ru_jstate["dirty"], _ru_jstate["at"] = False, now
+            data = _ru_json.dumps({{"version": 1, "gamedir": config.gamedir, "strings": list(_ru_missed)}})
+            if not isinstance(data, type(u"")):
+                data = data.decode("ascii")
+            for p in _ru_journals():
+                try:
+                    with _ru_io.open(p, "w", encoding="utf-8") as f:
+                        f.write(data)
+                    return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    try:
+        config.interact_callbacks.append(_ru_flush)
+    except Exception:
+        pass
+
     def _ru_say(s):
         if _ru_prev_say is not None:
             s = _ru_prev_say(s)
@@ -444,9 +624,93 @@ init 999 python:
         t = _ru_tl.get(s, s)
         if t is not s:
             t = _ru_fit(s, t)
+        else:
+            _ru_miss(s)
         return t
 
     config.say_menu_text_filter = _ru_say
+
+    # Текст экранов и _("…") переводит штатный переводчик строк Ren'Py: он видит строку
+    # такой, как она записана в скрипте, — до подстановки [переменных], вместе с тегами
+    # ({{size=24}}Name: [player_name]{{/size}}, {{#quick_page}}Quick) и до .format() у
+    # шаблонов вроде _("Page {{}}"). config.replace_text ниже получает уже готовый текст
+    # («Name: sdf», «Page 1»), разрезанный по тегам, — он ловит только остатки.
+    try:
+        _ru_stl = renpy.translation.StringTranslator
+        _ru_prev_translate = _ru_stl.translate
+
+        def _ru_translate(self, old):
+            new = _ru_prev_translate(self, old)
+            if new != old or not _ru_on[0] or _ru_measure[0]:
+                return new
+            t = _ru_tl.get(old)
+            if t is None:
+                _ru_miss(old)
+                return new
+            return t
+
+        _ru_stl.translate = _ru_translate
+    except Exception:
+        pass
+
+    # Кнопка или подпись, чей перевод длиннее оригинала (список — в словаре): если Ren'Py рисует
+    # её шире, чем рисовал английский текст тем же стилем, надпись ужимается до ширины оригинала —
+    # под неё в игре было место, а за ним может быть край экрана или соседняя кнопка.
+    _ru_fitset = set(_ru_meta.get("fit", ()))
+    _ru_strs = (type(""), type(u""))
+    _ru_enw = _ru_coll.OrderedDict()
+
+    def _ru_en_width(text, src, width, height):
+        key = (src, id(text.style), int(width))
+        w = _ru_enw.get(key)
+        if w is None:
+            _ru_measure[0] = True
+            try:
+                # Text(style=готовый стиль) даёт несобранный стиль — берём то, от чего зависит ширина
+                st = text.style
+                en = Text(src, substitute=False, font=st.font, size=st.size, bold=st.bold,
+                          italic=st.italic, kerning=getattr(st, "kerning", 0) or 0).size(width, height)[0]
+                # место под надпись обычно шире её самой: запас — четыре буквы этого шрифта или
+                # четверть ширины; ужимается только то, что вылезает и за него
+                w = max(en * 1.25, en + 4 * float(st.size or 0))
+            finally:
+                _ru_measure[0] = False
+            _ru_enw[key] = w
+            if len(_ru_enw) > 3000:
+                _ru_enw.popitem(last=False)
+        return w
+
+    try:
+        _ru_Text = renpy.text.text.Text
+        _ru_prev_render = _ru_Text.render
+
+        def _ru_render(self, width, height, st, at):
+            rv = _ru_prev_render(self, width, height, st, at)
+            try:
+                if not _ru_fitset or not _ru_on[0] or _ru_measure[0]:
+                    return rv
+                # не isinstance(src, list): в скриптах Ren'Py list — это RevertableList
+                src = getattr(self, "text_parameter", None)
+                if src is None or isinstance(src, _ru_strs) or len(src) != 1:
+                    return rv
+                if not isinstance(src[0], _ru_strs) or src[0] not in _ru_fitset:
+                    return rv
+                room = _ru_en_width(self, src[0], width, height)
+                if rv.width <= room:
+                    return rv
+                k = max(0.6, room / float(rv.width))
+                inner = renpy.Render(rv.width, rv.height)
+                inner.blit(rv, (0, 0))
+                inner.zoom(k, k)
+                out = renpy.Render(rv.width * k, rv.height * k)
+                out.blit(inner, (0, 0))
+                return out
+            except Exception:
+                return rv
+
+        _ru_Text.render = _ru_render
+    except Exception:
+        pass
 
     if hasattr(config, "replace_text"):
         _ru_prev_replace = config.replace_text
@@ -454,7 +718,7 @@ init 999 python:
         def _ru_replace(s):
             if _ru_prev_replace is not None:
                 s = _ru_prev_replace(s)
-            if not _ru_on[0]:
+            if not _ru_on[0] or _ru_measure[0]:
                 return s
             return _ru_tl.get(s, s)
 

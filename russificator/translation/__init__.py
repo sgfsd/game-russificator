@@ -29,7 +29,7 @@ def create_translator(mode: str, options: Dict[str, Any], game_title: str = "") 
                                use_gpu=bool(options.get("local_gpu", True)),
                                threads=int(options.get("threads") or 0),
                                custom_model=options.get("local_custom_model", ""),
-                               game_title=game_title)
+                               game_title=game_title, fit_vram=bool(options.get("local_fit_vram")))
     if mode == "cloud":
         from .cloud import CloudTranslator
         return CloudTranslator(options.get("cloud_provider", "custom"), options.get("api_key", ""),

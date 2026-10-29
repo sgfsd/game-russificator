@@ -42,9 +42,16 @@ def _add_translator_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--model", default="", help="имя модели провайдера")
     p.add_argument("--parallel", type=int, default=4, help="одновременных запросов к API")
     p.add_argument("--font", default="", help="свой шрифт .ttf/.otf с кириллицей")
+    p.add_argument("--keep-translations", action="store_true",
+                   help="сменив способ перевода, оставить уже сделанные переводы (дополнить, а не переводить заново)")
 
 
 def main(argv=None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:   # консоль Windows (cp1251/cp866): символ вне кодировки — «?», а не падение после работы
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parser = argparse.ArgumentParser(prog="russificator",
                                      description="Универсальный авторусификатор игр (Unity, Ren'Py, RPG Maker)")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -61,6 +68,9 @@ def main(argv=None) -> int:
     p.add_argument("game_dir")
 
     p = sub.add_parser("coverage", help="полнота перевода Unity-игры: что игра показала, а найдено заранее не было")
+    p.add_argument("game_dir")
+
+    p = sub.add_parser("report", help="отчёт о переводе игры: откуда строки, что не перевелось, подозрительные переводы")
     p.add_argument("game_dir")
 
     p = sub.add_parser("play", help="запустить игру с живым переводом (Unity; способ перевода — из настроек)")
@@ -113,6 +123,12 @@ def main(argv=None) -> int:
         if rep.get("file"):
             print("Отчёт сохранён:", rep["file"])
         return 0
+
+    if args.cmd == "report":
+        from russificator import stand
+        text = stand.build(Path(args.game_dir))
+        print(text or "Игра ещё не русифицирована — отчёта нет.")
+        return 0 if text else 1
 
     if args.cmd == "restore":
         from russificator.core.pipeline import project_dir
@@ -211,7 +227,8 @@ def _run(args) -> int:
             print(f"\n{ev['message']}")
 
     cancel = threading.Event()
-    pipeline = Pipeline(translator, PipelineOptions(font_path=Path(args.font) if args.font else None),
+    pipeline = Pipeline(translator, PipelineOptions(font_path=Path(args.font) if args.font else None,
+                                                        reuse_translations=bool(getattr(args, "keep_translations", False))),
                         on_event=on_event, cancel=cancel)
     try:
         result = pipeline.run(args.game_dir)

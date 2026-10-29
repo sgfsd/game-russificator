@@ -980,6 +980,19 @@ class Api:
         from .. import play
         return play._game_exe(game)
 
+    def translation_report(self, path: str) -> Dict[str, Any]:
+        """Отчёт о переводе игры (markdown для чата/issue): откуда строки, что не перевелось, что досталось
+        живому переводу, подозрительные переводы, шрифты (см. ``stand.py``)."""
+        from .. import stand
+        try:
+            text = stand.build(Path(path))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Отчёт о переводе не собран")
+            return {"ok": False, "error": _err(exc)}
+        if not text:
+            return {"ok": False, "error": "Игра ещё не русифицирована — отчёта нет."}
+        return {"ok": True, "text": text}
+
     # ---------- полнота перевода (Unity) ----------
 
     def coverage_last(self, path: str) -> Dict[str, Any]:

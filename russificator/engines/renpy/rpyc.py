@@ -233,27 +233,101 @@ def extract_texts(stmts, filename: str) -> Tuple[List[FoundText], Dict[str, str]
                         found.append(FoundText(val, "ui", None, filename, line))
                 for val in display_strings(src):
                     found.append(FoundText(val, "ui", None, filename, line))
-        elif ".sl2." in cls or "screenlang" in cls:
-            for arg in getattr(node, "positional", None) or []:
-                if isinstance(arg, str):
-                    m = _LITERAL_RE.match(arg)
-                    if m:
-                        val = _literal(m.group(1))
-                        if val and val.strip():
-                            found.append(FoundText(val, "ui", None, filename, line))
-            # свойства экранов: tooltip "…", hovered Notify("…"), action Confirm("…", …)
-            for kw in getattr(node, "keyword", None) or []:
-                if not (isinstance(kw, (list, tuple)) and len(kw) == 2 and isinstance(kw[1], str)):
-                    continue
-                if kw[0] in ("tooltip", "alt", "caption", "prompt"):
-                    m = _LITERAL_RE.match(kw[1])
-                    val = _literal(m.group(1)) if m else None
-                    if val and val.strip():
-                        found.append(FoundText(val, "ui", None, filename, line))
-                for val in display_strings(kw[1]):
-                    found.append(FoundText(val, "ui", None, filename, line))
+        elif cls.endswith(("ast.Show", "ast.Scene")):
+            for val in shown_texts(node):
+                found.append(FoundText(val, "narration", None, filename, line))
+        elif ".sl2." in cls or "screenlang" in cls or cls.endswith("ast.ArgumentInfo"):
+            for val in screen_strings(node):
+                found.append(FoundText(val, "ui", None, filename, line))
     found.sort(key=lambda f: f.line)
     return found, characters
+
+
+def shown_texts(node) -> List[str]:
+    """Текст, показанный как картинка: ``show text "…"`` / ``show text _("…")`` (заставки,
+    предупреждения) и ``show expression Text("…")``.
+
+    У ``show text`` строка — параметр картинки ``text`` (ParameterizedText): в .rpyc это части
+    имени после ``text`` — ``('text', '"…"')`` или ``('text', '_', '("…")')``.
+    """
+    imspec = getattr(node, "imspec", None)
+    if not isinstance(imspec, (list, tuple)) or not imspec:
+        return []
+    out: List[str] = []
+    name = imspec[0]
+    if isinstance(name, (list, tuple)) and len(name) >= 2 and name[0] == "text":
+        m = _LITERAL_RE.match("".join(str(c) for c in name[1:]))
+        val = _literal(m.group(1)) if m else None
+        if val and val.strip():
+            out.append(val)
+    expr = imspec[1] if len(imspec) > 1 else None
+    if isinstance(expr, str):
+        for m in _UNDERSCORE_RE.finditer(expr):
+            val = _literal(m.group(1))
+            if val and val.strip() and val not in out:
+                out.append(val)
+        out += [v for v in display_strings(expr) if v not in out]
+    return out
+
+
+#: свойства экранов, где строка-литерал сама по себе — текст для игрока
+_TEXT_KEYWORDS = ("tooltip", "alt", "caption", "prompt")
+
+
+def _node_strings(value) -> List[str]:
+    """Строки-выражения в атрибутах узла (без захода во вложенные узлы — их обходят отдельно)."""
+    out: List[str] = []
+    stack = [value]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, str):
+            out.append(v)
+        elif isinstance(v, (list, tuple)):
+            stack.extend(reversed(v))
+        elif isinstance(v, dict):
+            stack.extend(v.values())
+    return out
+
+
+def screen_strings(node) -> List[str]:
+    """Текст для игрока в узле экрана.
+
+    Литерал целиком — у позиционных аргументов (``text "…"``, ``textbutton _("…")``) и у
+    свойств вроде ``tooltip "…"``. В любом другом выражении узла — строки в ``_()``/``__()``
+    и аргументы вызовов, выводящих текст: ``FileTime(slot, empty=_("empty slot"))``,
+    ``default v = FilePageNameInputValue(pattern=_("Page {}"))``, ``use card(_("…"))``,
+    ``hovered Notify("…")``.
+    """
+    out: List[str] = []
+
+    def add(val: Optional[str]) -> None:
+        if val and val.strip() and val not in out:
+            out.append(val)
+
+    def scan(expr: str, literal_ok: bool) -> None:
+        if literal_ok:
+            m = _LITERAL_RE.match(expr)
+            if m:
+                add(_literal(m.group(1)))
+                return
+        for m in _UNDERSCORE_RE.finditer(expr):
+            add(_literal(m.group(1)))
+        for val in display_strings(expr):
+            add(val)
+
+    for arg in getattr(node, "positional", None) or []:
+        if isinstance(arg, str):
+            scan(arg, True)
+    for kw in getattr(node, "keyword", None) or []:
+        if isinstance(kw, (list, tuple)) and len(kw) == 2 and isinstance(kw[1], str):
+            scan(kw[1], kw[0] in _TEXT_KEYWORDS)
+    for k, v in vars(node).items():
+        if k in ("next", "positional", "keyword"):
+            continue
+        for s in _node_strings(v):
+            if "(" in s:
+                scan(s, False)
+    return out
 
 
 def font_references(stmts) -> List[str]:

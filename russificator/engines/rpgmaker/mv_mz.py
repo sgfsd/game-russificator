@@ -165,6 +165,18 @@ def _event_list(cmds: List[Any], prefix: str, out: List[Entry]) -> None:
                 p = cmds[j].get("parameters") or [""]
                 lines.append(str(p[0]) if p else "")
                 j += 1
+            if code == 105:
+                # бегущая строка — титры, стихи, вступление: строки и пустые строки — это вёрстка.
+                # Каждый абзац — отдельная запись (абзац из одних имён останется как есть).
+                for k, (para, _blank) in enumerate(scroll_paragraphs(lines)):
+                    text = join_lines(para, scroll=True)
+                    if text.strip():
+                        key = f"{prefix}|c{i}|scroll|{k}"
+                        out.append(Entry(id=_eid(key), source=text, kind=TextKind.NARRATION, target_key=key,
+                                         neighbors=context[-2:], notes={"lines": len(para)}))
+                        context.append(text)
+                i = j
+                continue
             if code == 101:
                 name = params[4] if len(params) > 4 and isinstance(params[4], str) else ""
                 if name.strip():
@@ -208,10 +220,58 @@ def _event_list(cmds: List[Any], prefix: str, out: List[Entry]) -> None:
         i += 1
 
 
-def join_lines(lines: List[str]) -> str:
-    """Строки окна сообщения -> одна фраза (переносы внутри предложения — просто пробелы)."""
-    parts = [ln.strip() for ln in lines if ln.strip()]
-    return " ".join(parts)
+#: строка — пункт списка: «- …», «• …», «1) …», «2. …»
+_LIST_ITEM_RE = re.compile(r"^(?:[-•*·]|\d{1,2}[.)]|\(\d{1,2}\))\s")
+#: строка титров или таблицы: «Blender --- Render», «Имя -- роль», колонки через табуляцию
+_TABLE_RE = re.compile(r"\s-{2,}\s|\t| {3,}\S")
+_SENTENCE_END_RE = re.compile(r"[.!?…:;\"»)\]]\s*$|\\[{}!|.^]\s*$")
+
+
+def _keeps_break(prev: str, nxt: str, scroll: bool) -> bool:
+    """Перенос строки — часть вёрстки (оставить), а не просто конец строки окна (заменить пробелом)."""
+    a, b = prev.strip(), nxt.strip()
+    if not a or not b or a.endswith(":") or _LIST_ITEM_RE.match(b) or _TABLE_RE.search(a) or _TABLE_RE.search(b):
+        return True
+    if scroll:
+        # бегущая строка: каждая строка своя, кроме продолжения фразы со строчной буквы
+        return not (not _SENTENCE_END_RE.search(a) and b[:1].islower())
+    return False
+
+
+def join_lines(lines: List[str], scroll: bool = False) -> str:
+    """Строки окна -> текст для перевода. Перенос внутри фразы — пробел (переводчик видит фразу
+    целиком, а не обрывки по 40 знаков); перенос вёрстки (список, «Имя --- роль», строка на «:»,
+    пустая строка, строки бегущего текста) остаётся переносом."""
+    out = ""
+    prev = None
+    for ln in lines:
+        cur = ln.strip()
+        if prev is None:
+            out = cur
+        elif _keeps_break(prev, ln, scroll):
+            out += "\n" + cur
+        elif cur:
+            out = f"{out} {cur}" if out and not out.endswith("\n") else out + cur
+        prev = ln
+    return out.strip("\n") if not scroll else out
+
+
+def scroll_paragraphs(lines: List[str]) -> List[Tuple[List[str], int]]:
+    """Абзацы бегущей строки: (строки абзаца, сколько пустых строк после него). Пустые строки в
+    начале — абзац без строк."""
+    out: List[Tuple[List[str], int]] = []
+    cur: List[str] = []
+    blank = 0
+    for ln in lines:
+        if ln.strip():
+            if blank and (cur or not out):
+                out.append((cur, blank))
+                cur, blank = [], 0
+            cur.append(ln)
+        else:
+            blank += 1
+    out.append((cur, blank))
+    return out
 
 
 def _system(sysdata: Dict[str, Any], out: List[Entry]) -> None:
@@ -220,7 +280,7 @@ def _system(sysdata: Dict[str, Any], out: List[Entry]) -> None:
             out.append(Entry(id=_eid(key), source=val, kind=kind, target_key=key,
                              max_length=16 if kind == TextKind.UI else None))
 
-    add("System.json|gameTitle", sysdata.get("gameTitle"), TextKind.SYSTEM)
+    # название игры — имя продукта (на логотипе оно латиницей): не переводится, как и в Ren'Py/Unity
     add("System.json|currencyUnit", sysdata.get("currencyUnit"), TextKind.UI)
     terms = sysdata.get("terms") or {}
     for group in ("basic", "commands", "params"):
@@ -341,14 +401,25 @@ def _apply_list(cmds: List[Any], prefix: str, keys: Dict[str, Entry],
             if name_e is not None and len(params) > 4:
                 params[4] = name_e.translation
                 count += 1
-            e = keys.get(f"{prefix}|c{i}|{'msg' if code == 101 else 'scroll'}")
             out.append(cmd)
+            if code == 105:
+                n = _apply_scroll(block, f"{prefix}|c{i}", keys, box or layout.DEFAULTS["mv"], out)
+                count += n
+                i = j
+                continue
+            e = keys.get(f"{prefix}|c{i}|msg")
             if e is not None and block:
                 box = box or layout.DEFAULTS["mv"]
                 # окно не уже, чем английские строки оригинала (игра могла расширить окно)
                 english = max(layout.text_width(str((b.get("parameters") or [""])[0]), box) for b in block)
                 lines = layout.wrap(e.translation, box, face=code == 101 and bool((e.notes or {}).get("face")),
                                     scroll=code == 105, min_width=english)
+                originals = [str((b.get("parameters") or [""])[0]) for b in block]
+                lead = 0
+                while lead < len(originals) and not originals[lead].strip():
+                    lead += 1                   # пустые строки сверху — автор центрировал текст по высоте
+                if lead < len(originals):
+                    lines = [""] * lead + lines
                 if code == 101 and len(_orig["m"]) < 200000:
                     _orig["m"]["\n".join(lines)] = "\n".join(str((b.get("parameters") or [""])[0]) for b in block)
                 for line in lines:
@@ -396,6 +467,37 @@ def _apply_list(cmds: List[Any], prefix: str, keys: Dict[str, Entry],
         out.append(cmd)
         i += 1
     return out, count
+
+
+def _apply_scroll(block: List[Any], prefix: str, keys: Dict[str, Entry], box: layout.Box,
+                  out: List[Any]) -> int:
+    """Бегущая строка: переведённые абзацы — по ширине экрана, непереведённые и пустые строки — как были."""
+    if not block:
+        return 0
+    lines = [str((b.get("parameters") or [""])[0]) for b in block]
+    proto = block[0]
+    count = 0
+    pos = 0
+    for k, (para, blank) in enumerate(scroll_paragraphs(lines)):
+        e = keys.get(f"{prefix}|scroll|{k}")
+        if para and e is not None:
+            english = max(layout.text_width(ln, box) for ln in para)
+            new_lines = layout.wrap(e.translation, box, scroll=True, min_width=english)
+            count += 1
+        else:
+            new_lines = para
+        if not para and k == 0:
+            new_lines = []
+        for line in new_lines:
+            new = dict(proto)
+            new["parameters"] = [line]
+            out.append(new)
+        for _ in range(blank):
+            new = dict(proto)
+            new["parameters"] = [""]
+            out.append(new)
+        pos += len(para) + blank
+    return count
 
 
 def _plugins_inject(game_root: Path, keys: Dict[str, Entry], backup, warnings: List[str]) -> int:

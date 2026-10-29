@@ -25,11 +25,12 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ..core.universal import Entry, EntryStatus, TranslationProject
-from . import filters, markup
+from ..core.universal import Entry, EntryStatus, TextKind, TranslationProject
+from . import filters, keys, markup, terms
 from .base import Translator, TranslatorError
 from .glossary import GlossaryBuilder, apply_glossary
-from .length import validate_length
+from . import edges
+from .length import over_limit, validate_length, was_trimmed
 from .memory import TranslationMemory
 
 log = logging.getLogger("russificator.service")
@@ -83,6 +84,10 @@ class TranslationService:
         auto = builder.result()
         auto.update(project.glossary)
         project.glossary = auto
+        # термины игры — одним переводом на всю игру (см. terms.py); уже известные не переводятся заново
+        if not self.cancel.is_set():
+            project.glossary.update(terms.build(project.entries, self.tr,
+                                                {**project.glossary, **project.forced_glossary}))
         glossary = {**project.glossary, **project.forced_glossary}
 
         groups: Dict[Key, List[Entry]] = {}
@@ -105,24 +110,52 @@ class TranslationService:
                 stats.from_memory += 1
             else:
                 pending[key] = group
+        # клавиши и подсказки управления — раньше памяти: прошлые версии запоминали «SPACE» → «КОСМОС»
+        self._translate_hints(pending, glossary, stats)
         if self.memory is not None and pending:
             by_ns: Dict[str, List[Key]] = {}
             for key in pending:
                 by_ns.setdefault(self.tr.memory_ns(key[0]), []).append(key)
             hits = {}
+            refit: Dict[Key, str] = {}
             for ns, keys in by_ns.items():
                 hits.update(self.memory.get_many(ns, keys))
-            hits = {k: v for k, v in hits.items() if not filters.is_transliteration(k[0], v)}
+            stale = getattr(self.tr, "stale", None)          # переводчик сам знает свой прошлый брак
+            hits = {k: v for k, v in hits.items()           # обрезанное прошлым жёстким лимитом — заново
+                    if not filters.is_transliteration(k[0], v) and not was_trimmed(k[0], v)
+                    and not (stale is not None and stale(k[0], v))}
             for key, tr in hits.items():
+                if tr == key[0] and filters.is_name_word(key[0]):
+                    continue                             # имя («Tom») прошлые версии оставляли латиницей
                 if tr == key[0]:                         # запомнено «оставить как есть» (инициалы, буквы)
                     for e in pending.pop(key):
                         e.status = EntryStatus.SKIPPED
                     stats.skipped += 1
                     continue
                 tr = markup.normalize_layout(key[0], tr)    # записи прошлых версий — тоже в порядок
+                checked, why = edges.check(key[0], tr, pending[key][0].speaker)
+                if why:                                    # мусор прошлых версий — переводится заново
+                    continue
+                tr = edges.fix(key[0], checked)
                 if markup.same_markup(key[0], tr):
-                    self._assign(pending.pop(key), tr, True)
+                    group = pending.pop(key)
+                    ok = True
+                    if over_limit(group[0], tr):           # запомнено до лимитов по месту оригинала
+                        ok, shorter = validate_length(group[0], tr, self.tr)
+                        if shorter != tr:
+                            tr = shorter
+                            refit[key] = tr
+                    self._assign(group, tr, ok)
                     stats.from_memory += 1
+            if refit:
+                try:
+                    by_ns_fit: Dict[str, Dict[Key, str]] = {}
+                    for key, tr in refit.items():
+                        by_ns_fit.setdefault(self.tr.memory_ns(key[0]), {})[key] = tr
+                    for ns, part in by_ns_fit.items():
+                        self.memory.put_many(ns, part)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Сокращённые переводы не сохранены в память: %s", exc)
 
         stats.unique_total = len(pending)
         if stats.from_memory:
@@ -132,6 +165,7 @@ class TranslationService:
                          f"К переводу {stats.unique_total} уникальных строк"
                          + (f" (ещё {stats.from_memory} взято из памяти)" if stats.from_memory else ""))
         if not batches:
+            self._polish(project, glossary)
             stats.seconds = time.monotonic() - started
             return stats
 
@@ -184,6 +218,7 @@ class TranslationService:
             if len(stats.failed_examples) < 15:
                 stats.failed_examples.append(key[0][:80])
         self._failed = {}
+        self._polish(project, glossary)
         project.save()
         stats.seconds = time.monotonic() - started
         if fatal is not None:
@@ -191,6 +226,30 @@ class TranslationService:
         if self.cancel.is_set():
             raise TranslationCancelled()
         return stats
+
+    def _translate_hints(self, pending: Dict[Key, List[Entry]], glossary: Dict[str, str],
+                         stats: ServiceStats) -> None:
+        """Клавиши и подсказки управления: «SPACE» → «ПРОБЕЛ», «ESC» — как есть, подсказка из колонок
+        («TAB Cancel    SPACE Confirm») — по колонкам, клавиша в колонке остаётся (см. ``keys``)."""
+        plans = {k: p for k in pending for p in [keys.plan(k[0])] if p}
+        if not plans:
+            return
+        texts = sorted({t for p in plans.values() for t in keys.to_translate(p)})
+        done: Dict[str, str] = {}
+        todo = [Entry(id=f"hint{n}", source=t, kind=TextKind.UI) for n, t in enumerate(texts)]
+        step = max(1, self.tr.max_batch_items)
+        for i in range(0, len(todo), step):
+            try:
+                out = self.tr.translate(todo[i:i + step], glossary) or {}
+            except Exception as exc:  # noqa: BLE001
+                log.info("Подсказки управления не переведены по частям: %s", exc)
+                return
+            done.update({e.source: out[e.id] for e in todo[i:i + step] if out.get(e.id)})
+        for key, pieces in plans.items():
+            tr = keys.assemble(pieces, done)
+            if tr is not None:
+                group = pending.pop(key)
+                self._accept([key], {key: group}, {group[0].id: tr}, glossary, stats)
 
     # ---------- спасение непереведённого ----------
 
@@ -274,6 +333,10 @@ class TranslationService:
                 tr = fixed if fixed and markup.same_markup(rep.source, fixed) else None
                 if tr is None:
                     log.info("Разметка потеряна в «%s»: %s", rep.source[:60], lost)
+            if tr and tr.strip():
+                tr, why = edges.check(rep.source, tr, rep.speaker)
+                if why:
+                    log.info("Перевод «%s» отброшен: %s", rep.source[:60], why)
             if not tr or not tr.strip():
                 self._failed[key] = group   # решается в конце прохода: повтор, куски, запасной переводчик
                 continue
@@ -283,7 +346,8 @@ class TranslationService:
                 stats.skipped += 1
                 to_memory[key] = rep.source              # в следующий раз — сразу «как есть»
                 continue
-            tr = _keep_edges(rep.source, apply_glossary(tr, forced) if forced else tr)
+            used = {k: v for k, v in forced.items() if k.lower() in rep.source.lower()}
+            tr = edges.fix(rep.source, apply_glossary(tr, used) if used else tr)
             ok, final = validate_length(rep, tr, self.tr)
             if not ok:
                 stats.shortened += 1
@@ -300,6 +364,16 @@ class TranslationService:
             except Exception as exc:  # noqa: BLE001
                 log.warning("Память переводов недоступна: %s", exc)
         return len(keys)
+
+    @staticmethod
+    def _polish(project: TranslationProject, glossary: Dict[str, str]) -> None:
+        """Термины и жанровые слова — и в переводах из памяти и прошлых запусков (см. ``terms.polish``)."""
+        try:
+            n = terms.polish(project, glossary)
+            if n:
+                log.info("Термины игры поправлены в %d переводах", n)
+        except Exception as exc:  # noqa: BLE001 — доводка не должна ронять перевод
+            log.warning("Термины игры не применены: %s", exc)
 
     @staticmethod
     def _assign(group: List[Entry], translation: str, approved: bool) -> None:
@@ -340,13 +414,6 @@ def translate_by_segments(translator: Translator, entry: Entry, glossary: Dict[s
         trail = text[len(text.rstrip()):]
         plan[li][ci] = (False, lead + tr.strip() + trail)
     return "\n".join("".join(t for _, t in chunks) for chunks in plan)
-
-
-def _keep_edges(source: str, translation: str) -> str:
-    """Сохранить ведущие/хвостовые пробелы и переводы строк оригинала."""
-    lead = source[: len(source) - len(source.lstrip())]
-    trail = source[len(source.rstrip()):]
-    return lead + translation.strip() + trail
 
 
 def _eta(seconds: float) -> str:

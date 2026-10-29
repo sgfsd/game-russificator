@@ -1034,6 +1034,7 @@ function openGame(g, fresh = false) {
   const links = [["folder-open", "Открыть папку", "folder"]];
   if (g.russified && g.engine === "unity") links.push(["link", "Ярлык на рабочий стол", "shortcut"]);
   if (g.engine === "unity" && (g.russified || g.live)) links.push(["search", "Полнота перевода", "coverage"]);
+  if (g.russified) links.push(["copy", "Скопировать отчёт о переводе", "trreport"]);
   links.push(["image", "Сменить обложку", "cover"]);
   if (g.cover_custom) links.push(["undo", "Обычная обложка", "cover_reset"]);
   if (g.hidden) {
@@ -1069,6 +1070,10 @@ async function gameAction(act, g) {
   } else if (act === "coverage") {
     close();
     openCoverage(g);
+  } else if (act === "trreport") {
+    const r = await api().translation_report(g.path);
+    if (!r || !r.ok) toast((r && r.error) || "Не получилось собрать отчёт", true);
+    else await copyText(r.text, "Отчёт о переводе скопирован — вставьте его в чат");
   } else if (act === "live") {
     close();
     showPage("live");

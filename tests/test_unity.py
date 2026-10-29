@@ -271,7 +271,10 @@ def test_xunity_install_and_restore(tmp_path, monkeypatch):
 
 def test_tmp_font_bundle_by_version(tmp_path):
     game = detect.inspect(_fake_game(tmp_path))
+    game.version = "2019.4.40f1"
     assert xunity.tmp_font_bundle(game) == "arialuni_sdf_u2019"
+    game.version = "2020.3.25f1"          # бандл под 2019 роняет игру 2020.3 при запуске
+    assert xunity.tmp_font_bundle(game) is None
     game.version = "2018.4.1f1"
     assert xunity.tmp_font_bundle(game) == "arialuni_sdf_u2018"
     game.version = "2017.3.0f3"
@@ -467,6 +470,55 @@ def test_text_assets_ink_and_json():
     assert _asset_texts(ink) == ["Hello there, stranger."]
     data = '[{"id": "a1", "text": "The door is locked."}, {"id": "b2", "title": "Main Menu", "icon": "ico_main"}]'
     assert _asset_texts(data) == ["The door is locked.", "Main Menu"]
+
+
+def test_ink_lines_tags_templates_and_lowercase_speakers():
+    """Ink Date Everything: ник со строчной («tinfoilhat:: …»), описания предметов в тегах
+    («#null_hate_phrase Just a box.»), имя игрока внутри реплики (шаблон с вставкой «как есть»),
+    короткие реплики чата («sure», «dang») — всё это игра показывает, всё должно быть в словаре."""
+    import json
+    story = {"inkVersion": 21, "root": [[
+        "^tinfoilhat:: Okay. Here goes nothing...  ", "#", "^audio_name thiscord_phone_tinfoilhat_2", "/#", "\n",
+        "^tinfoilhat:: Hello, ", "ev", {"VAR?": "player_name"}, "out", "/ev", "^. ", "\n",
+        "#", "^null_hate_phrase Just a box.", "/#", "#", "^character penelope_stationery.sorter", "/#",
+        "#", "^Name: tinfoilhat", "/#",
+        "^Sam:: sure", "\n", "^dang", "\n", "^Player:: S.P.E.C.S.", "\n", "done"]]}
+    got = _asset_texts(json.dumps(story))
+    assert "Okay. Here goes nothing..." in got
+    assert "Hello, {0:v}." in got and "Just a box." in got
+    assert "sure" in got and "dang" in got and "Sam" in got
+    assert not any("audio_name" in s or "penelope" in s or "tinfoilhat::" in s for s in got)
+
+
+def test_xunity_case_variants_label_and_verbatim_rules():
+    from russificator.engines.unity import xunity
+    pairs = {"Tom": "Том", "abel face": "лицо Абеля", "<b>Hi</b>": "<b>Привет</b>", "TOM": "ТОМ!",
+             "Hello, {0:v}.": "Привет, {0:v}.", "You have {0} coins": "У вас {0} монет"}
+    var = xunity.case_variants(pairs)
+    assert var == {"ABEL FACE": "ЛИЦО АБЕЛЯ", "TOM": "ТОМ", "tom": "том"}   # разметка не трогается
+    # капс, переведённый сам по себе хуже, — по переводу той же строки обычным регистром
+    assert xunity.case_variants({"David Most": "Дэвид Мост", "DAVID MOST": "ДЭВИДА БОЛЬШИНСТВО"}) == \
+        {"DAVID MOST": "ДЭВИД МОСТ", "david most": "дэвид мост"}
+    assert xunity.case_variants({"Ok": "Ок", "OK": "ОК"}) == {"ok": "ок"}
+    rules = xunity.template_rules(pairs)
+    assert any(r.startswith("r:") and "Hello" in r and r.endswith("Привет, $1.") for r in rules)
+    assert any(r.startswith("sr:") and "coins" in r for r in rules)       # текстовая вставка — по словарю
+    assert len(xunity.label_rules()) == 4 and len(xunity.number_rules()) == 3
+    assert not xunity.template_rules({'Failed: "{0}" - Unknown': 'Ошибка: "{0}"'})   # кавычки ломают XUnity
+
+
+def test_utage_book_display_column_is_trusted():
+    """Таблица UTAGE: колонка English — текст для экрана, даже «female» (имя) и «Y-You…!» (заикание)."""
+    tree = {"importGridList": [
+        {"headerRow": 0, "rows": [{"strings": ["Key", "Korea", "English", "Turkish"]},
+                                  {"strings": ["女性", "여성", "female", "dişi"]}]},
+        {"headerRow": 0, "rows": [{"strings": ["Command", "Arg1", "Text", "Japanese", "English"]},
+                                  {"strings": ["", "girlB", "你…！", "あっ…", "Y-You…!"]},
+                                  {"strings": ["Wait", "0.5", "", "", ""]}]}]}
+    col = extract._Collector()
+    extract._from_monobehaviour(tree, col, "book")
+    assert {"female", "Y-You…!"} <= set(col.items)
+    assert not {"girlB", "dişi", "Key"} & set(col.items)
 
 
 def test_text_assets_csv_takes_english_column():
@@ -809,3 +861,248 @@ def test_format_strings_from_script_fields_are_collected():
     assert set(col.items) == {"{0} / {1} completed", "Level {0}"}
     assert _format_text("{0} / {1} completed") and _format_text("Level {0}")
     assert not _format_text("{0}_{1}.png") and not _format_text("x{0}")
+
+
+def _unity_string(s: str) -> bytes:
+    b = s.encode("utf-8")
+    pad = (-(4 + len(b))) % 4
+    return len(b).to_bytes(4, "little") + b + b"\0" * pad
+
+
+def test_direct_patch_raw_keeps_layout():
+    """Строка внутри объекта без типового дерева: длина + байты + выравнивание. После замены
+    всё, что дальше, читается так же; ключ рядом и фраза-дубль (может быть ключом) не трогаются."""
+    from russificator.engines.unity.direct import patch_raw
+    phrase = "We got lucky. Now we can find things here."
+    tr = "Нам повезло. Теперь мы найдём здесь вещи."
+    data = (_unity_string("E_story_131") + (7).to_bytes(4, "little") + _unity_string(phrase)
+            + (42).to_bytes(4, "little") + _unity_string("tail"))
+    new, n, amb = patch_raw(data, {phrase.encode(): tr.encode()})
+    assert (n, amb) == (1, 0)
+    assert new == (_unity_string("E_story_131") + (7).to_bytes(4, "little") + _unity_string(tr)
+                   + (42).to_bytes(4, "little") + _unity_string("tail"))
+    twice = _unity_string(phrase) + _unity_string(phrase)
+    same, n, amb = patch_raw(twice, {phrase.encode(): tr.encode()})
+    assert same == twice and (n, amb) == (0, 2)
+
+
+def test_direct_patch_csv_and_json():
+    import json
+    from russificator.engines.unity.direct import is_phrase, patch_document
+    m = {"Use the battery to turn on the flashlight.": "Включи фонарик батарейкой.",
+         "It's locked, try again.": "Заперто, попробуй ещё раз."}
+    csv_text = ("Key,English,Japanese\n"
+                "a_001,Use the battery to turn on the flashlight.,x\n"
+                "a_002,\"It's locked, try again.\",y\n")
+    new, n = patch_document(csv_text, m)
+    assert n == 2
+    assert "a_001,Включи фонарик батарейкой.,x" in new
+    assert 'a_002,"Заперто, попробуй ещё раз.",y' in new
+    unquoted = {"Use the battery to turn on the flashlight.": "Батарейка, фонарик, свет."}
+    same, n = patch_document(csv_text, unquoted)         # без кавычек запятая сломала бы колонки
+    assert n == 0 and same == csv_text
+    js, n = patch_document('{"hint": "Use the battery to turn on the flashlight.", "id": "a_001"}', m)
+    assert n == 1 and json.loads(js) == {"hint": "Включи фонарик батарейкой.", "id": "a_001"}
+    assert is_phrase("We got lucky. Now we can find things.") and not is_phrase("Yunxin")
+    assert not is_phrase("E_story_131") and not is_phrase("Main Menu")
+
+
+def test_direct_utage_book_writes_only_the_shown_column():
+    """Сценарий UTAGE: перевод — в колонку English (её игра показывает), любой длины и с повторами;
+    команды, аргументы-ключи персонажей, голос и японская колонка — как были."""
+    from russificator.engines.unity.direct import patch_tree
+    rows = [{"strings": ["Command", "Arg1", "Text", "Voice", "Japanese", "English"]},
+            {"strings": ["", "雲欣", "怎麼了？", "v_01", "どうした？", "What's wrong?"]},
+            {"strings": ["", "雲欣", "怎麼了？", "v_02", "どうした？", "What's wrong?"]},
+            {"strings": ["Jump", "*Patient", "", "", "", ""]}]
+    tree = {"importGridList": [{"rows": rows, "headerRow": 0, "name": "story"}]}
+    full = {"What's wrong?": "Что случилось?", "Patient": "Пациент"}
+    assert patch_tree(tree, full, {}) == 2
+    assert rows[1]["strings"] == ["", "雲欣", "怎麼了？", "v_01", "どうした？", "Что случилось?"]
+    assert rows[3]["strings"][1] == "*Patient"                # метка перехода — ключ
+
+
+def test_direct_i2_source_keeps_term_keys():
+    from russificator.engines.unity.direct import patch_tree
+    tree = {"mSource": {"mLanguages": [{"Name": "Chinese"}, {"Name": "English"}],
+                        "mTerms": [{"Term": "Use the battery", "Languages": ["用電池", "Use the battery"]}]}}
+    assert patch_tree(tree, {"Use the battery": "Включи батарейку"}, {}) == 1
+    term = tree["mSource"]["mTerms"][0]
+    assert term["Term"] == "Use the battery" and term["Languages"] == ["用電池", "Включи батарейку"]
+
+
+def test_direct_generic_fields_skip_keys():
+    from russificator.engines.unity.direct import patch_tree
+    phrase = "The door is locked from the inside."
+    tree = {"m_Name": phrase, "description": phrase, "questId": phrase, "lines": [phrase]}
+    assert patch_tree(tree, {}, {phrase: "Дверь заперта изнутри."}) == 2
+    assert tree["m_Name"] == phrase and tree["questId"] == phrase
+    assert tree["description"] == tree["lines"][0] == "Дверь заперта изнутри."
+
+
+def test_tmp_font_upgraded_asset_with_leftover_legacy_list_is_v2():
+    """Шрифт TMP, обновлённый со старой версии, хранит и остатки m_glyphInfoList, и новые таблицы:
+    TMP читает новые — русские буквы дописываются туда (Date Everything: дописывались в старый список,
+    и в игре вместо букв было «ↄↄↄ»)."""
+    both = {"m_glyphInfoList": [{"id": 65}], "m_GlyphTable": [{"m_Index": 1}],
+            "m_CharacterTable": [{"m_Unicode": 65, "m_GlyphIndex": 1}]}
+    assert not tmp_cyrillic.TmpFont(both).v1
+    assert tmp_cyrillic.TmpFont({"m_glyphInfoList": [{"id": 65}], "m_GlyphTable": [], "m_CharacterTable": []}).v1
+    assert tmp_cyrillic.TmpFont({"m_glyphInfoList": [{"id": 65}]}).v1
+
+
+def test_broken_synthesized_letters_are_redrawn():
+    """Буква, которую построенный шрифт нарисовал пустой («к» в Game of Life 2) или вдвое шире
+    соседних, рисуется запасным шрифтом — в слове нет дырки."""
+    import numpy as np
+    ok = [tmp_cyrillic.RenderedGlyph(c, 10, 10, 0, 10, 12.0, np.ones((14, 14), np.float32)) for c in "абвгде"]
+    empty = tmp_cyrillic.RenderedGlyph("к", 0, 0, 0, 0, 12.0, np.zeros((0, 0), np.float32))
+    wide = tmp_cyrillic.RenderedGlyph("т", 10, 10, 0, 10, 40.0, np.ones((14, 14), np.float32))
+    out = tmp_cyrillic._sane_glyphs(ok + [empty, wide], 40.0, 4, 5.0, True, "Font")
+    by = {g.char: g for g in out}
+    assert by["к"].bitmap.size and (by["к"].bitmap > 0.5).any() and by["т"].advance < 30
+    assert by["а"] is ok[0]
+
+
+def test_blank_letters_in_game_font_are_redrawn():
+    """Шрифт знает «к», но рисует её пустой (Dimbo, The Game of Life 2): буква считается отсутствующей."""
+    chars = [{"m_Unicode": 0x43A, "m_GlyphIndex": 5}, {"m_Unicode": 0x41A, "m_GlyphIndex": 6},
+             {"m_Unicode": 0x20, "m_GlyphIndex": 7}]
+    glyphs = [{"m_Index": 5, "m_GlyphRect": {"m_Width": 0, "m_Height": 0}},
+              {"m_Index": 6, "m_GlyphRect": {"m_Width": 20, "m_Height": 30}},
+              {"m_Index": 7, "m_GlyphRect": {"m_Width": 0, "m_Height": 0}}]
+    font = tmp_cyrillic.TmpFont({"m_CharacterTable": chars, "m_GlyphTable": glyphs})
+    assert font.drop_blank_letters("кК ") == 1
+    assert font.chars() == {0x41A, 0x20}                     # пробел пустой по праву — остаётся
+
+
+def test_display_only_text_goes_to_dictionary_not_into_game_data():
+    """Смелые источники текста (английский вариант среди переводов, подпись строчными в текстовом поле)
+    дают строки только для словаря XUnity: он меняет лишь показанный текст, в данные игры они не пишутся."""
+    col = extract._Collector()
+    tree = {"rows": [{"strings": ["女性", "여성", "หญิง", "female", "dişi", "女性"]}],
+            "opt": {"en": "Classic world", "ja": "クラシック"}, "text": "sure", "key": "ui_start",
+            "title": "Main Menu", "note": "The door is locked."}
+    extract._walk_strings(tree, col, "x", 0)
+    items = {e.source: e.notes.get("display_only", False) for e in col.entries()}
+    assert items["female"] and items["Classic world"] and items["sure"]
+    assert items["Main Menu"] is False and items["The door is locked."] is False
+    assert "dişi" not in items and "ui_start" not in items
+
+
+def test_full_height_atlas_grows_in_width(monkeypatch):
+    """Шрифт, сгенерированный огромным кеглем, занял атлас 1024×8192 целиком: русские буквы встают
+    справа, атлас растёт вширь, старые глифы остаются на своих координатах (Handshakes: 4 шрифта)."""
+    import numpy as np
+    from PIL import Image
+
+    class Tex:
+        def __init__(self, img):
+            self.image, self.m_TextureFormat = img, 1
+
+        def set_image(self, img, target_format=None):
+            self.image = img
+    W, H = 64, 8192
+    glyphs = [{"m_Index": i + 1, "m_GlyphRect": {"m_X": 0, "m_Y": i * 1024, "m_Width": 60, "m_Height": 1000},
+               "m_Metrics": {"m_Width": 60.0, "m_Height": 1000.0, "m_HorizontalBearingX": 0.0,
+                             "m_HorizontalBearingY": 900.0, "m_HorizontalAdvance": 64.0},
+               "m_Scale": 1.0, "m_AtlasIndex": 0} for i in range(8)]
+    chars = [{"m_ElementType": 1, "m_Unicode": ord(c), "m_GlyphIndex": i + 1, "m_Scale": 1.0}
+             for i, c in enumerate("HIEFTLNx")]
+    tree = {"m_Name": "Pixel", "m_GlyphTable": glyphs, "m_CharacterTable": chars, "m_AtlasWidth": W,
+            "m_AtlasHeight": H, "m_AtlasPadding": 2, "m_AtlasRenderMode": 4165, "m_AtlasPopulationMode": 0,
+            "m_FaceInfo": {"m_PointSize": 40.0, "m_CapLine": 30.0, "m_MeanLine": 20.0, "m_Scale": 1.0},
+            "m_UsedGlyphRects": [], "m_FreeGlyphRects": []}
+    alpha = np.zeros((H, W), np.uint8)
+    alpha[:, :60] = 255
+    tex = Tex(Image.merge("RGBA", [Image.fromarray(alpha, "L")] * 4))
+    from russificator.fonts import cyrillic
+    donor = tmp_cyrillic.GlyphRenderer(cyrillic.donor_bytes(False))
+    monkeypatch.setattr(tmp_cyrillic, "plan_atlas", lambda *a, **k: ({}, ["Ж"], donor, 40.0))
+    font = tmp_cyrillic.TmpFont(tree)
+    added = tmp_cyrillic.patch_font(font, tex, [], "Ж")
+    assert added == 1
+    assert tree["m_AtlasHeight"] == H and tree["m_AtlasWidth"] == 2 * W and tex.image.size == (2 * W, H)
+    new = [g for g in tree["m_GlyphTable"] if g["m_Index"] > 8][0]
+    assert new["m_GlyphRect"]["m_X"] >= W                       # справа от старых букв
+    assert tree["m_GlyphTable"][0]["m_GlyphRect"] == {"m_X": 0, "m_Y": 0, "m_Width": 60, "m_Height": 1000}
+
+
+def test_fullwidth_cyrillic_in_tmp_atlas_is_dropped_for_redraw():
+    """В атласе TMP китайского шрифта кириллица полноширинная — её буквы убираются из таблицы и потом
+    дорисовываются, как отсутствующие, по меркам латиницы атласа."""
+    chars, glyphs = [], []
+    for i, ch in enumerate("ABCDEFGHKLMNOPRSTUXYZabcdeghknopsuxyz" + tmp_cyrillic.RUSSIAN):
+        wide = ch in tmp_cyrillic.RUSSIAN
+        chars.append({"m_Unicode": ord(ch), "m_GlyphIndex": i})
+        glyphs.append({"m_Index": i, "m_GlyphRect": {"m_Width": 20, "m_Height": 30},
+                       "m_Metrics": {"m_HorizontalAdvance": 40.0 if wide else 18.0 + i % 7}})
+    font = tmp_cyrillic.TmpFont({"m_CharacterTable": chars, "m_GlyphTable": glyphs,
+                                 "m_FaceInfo": {"m_PointSize": 42}})
+    font.drop_blank_letters("Привет")
+    left = {chr(c) for c in font.chars()}
+    assert not set("Привет") & left and "ж" in left and "A" in left
+
+
+def test_xor_protected_bundles_are_read_and_written_back(tmp_path):
+    """Бандл, закрытый XOR коротким ключом (CardCultivation: StreamingAssets/*.dat), читается как обычный,
+    а изменённый пишется обратно тем же ключом; склейку бандлов и чужие файлы защищённым бандлом не считаем."""
+    from russificator.engines.unity import unitypy_io
+    body = (b"UnityFS\0" + struct.pack(">I", 8) + b"5.x.x\0" + b"2021.3.45f1\0")
+    plain = body + struct.pack(">Q", len(body) + 8 + 100) + bytes(100)
+    key = b"\x4d\x7e\xa2\xb2"
+    enc = bytes(c ^ key[i % 4] for i, c in enumerate(plain))
+    p = tmp_path / "English.dat"
+    p.write_bytes(enc)
+    lay = unitypy_io.layout(p)
+    assert lay is not None and lay.key == key and not lay.plain
+    assert unitypy_io.decode(enc, lay) == plain
+    assert unitypy_io.as_stored(p, plain + b"x") == bytes(c ^ key[i % 4] for i, c in enumerate(plain + b"x"))
+    # байты мусора впереди
+    q = tmp_path / "pad.bin"
+    q.write_bytes(b"JUNK" * 8 + plain)
+    assert unitypy_io.layout(q).offset == 32 and unitypy_io.as_stored(q, b"NEW")[:32] == b"JUNK" * 8
+    # два бандла в одном файле (размер в заголовке не сходится) — не трогаем; обычный бандл — как был
+    (tmp_path / "pack.bin").write_bytes(b"JUNK" + plain + plain)
+    assert unitypy_io.layout(tmp_path / "pack.bin") is None
+    (tmp_path / "plain.bundle").write_bytes(plain)
+    assert unitypy_io.layout(tmp_path / "plain.bundle").plain
+    (tmp_path / "video.dat").write_bytes(bytes(range(256)) * 4)
+    assert unitypy_io.layout(tmp_path / "video.dat") is None
+
+
+def _luban_str(s: str) -> bytes:
+    b = s.encode("utf-8")
+    n = len(b)
+    head = bytes([n]) if n < 0x80 else bytes([0x80 | (n >> 8), n & 0xFF])
+    return head + b
+
+
+def test_binary_table_strings_and_english_column():
+    """Двоичная таблица Luban «ключ, китайский, тайваньский, английский»: строки с длиной впереди читаются
+    все и точно (первая буква ключа «n» = 110 байт не захватывает соседние записи), английская колонка
+    берётся и одним словом, ключи и китайский — нет."""
+    from russificator.engines.unity import text_assets
+    rows = [("narration1_5", "当前工作台的动作是<color=#f3b123>修炼</color>", "當前工作臺的動作是",
+             "The current action of this workbench is <color=#f3b123>Cultivate</color>."),
+            ("tiaoguo_CNS", "跳过", "跳過", "Skip"),
+            ("xiuliangongzuotai_CNS", "修炼工作台：修炼", "修煉工作臺：修煉", "WorkBench：Cultivate"),
+            ("shouyuan_CNS", "寿元", "壽元", "Lifespan +20 years after cultivation;"),
+            ("Story_20221_6", "：王婶.....", "：王嬸.....", ": Aunt Wang..... (I also blacked out)")]
+    raw = bytes([len(rows)]) + b"".join(_luban_str(s) for r in rows for s in r) + b"\x05\x00"
+    assert text_assets.decode(raw) is None
+    found = text_assets.binary_strings(raw)
+    assert found == [s for r in rows for s in r]
+    col = extract._Collector()
+    extract._from_binary_table(raw, col, "LubanTables.dat:lang")
+    got = {e.source for e in col.entries()}
+    assert {"Skip", "WorkBench：Cultivate", "Lifespan +20 years after cultivation;", rows[0][3]} <= got
+    assert not got & {"narration1_5", "tiaoguo_CNS", "跳过"}
+
+
+def test_template_tail_goes_to_dictionary():
+    """«370 points!» общее правило «число + слово» делит на число и «points!» — хвост шаблона
+    «{0} points!» → «{0} очков!» лежит в словаре, слово не уходит в живой перевод («370 точки!»)."""
+    got = xunity.template_fragments({"{0} points!": "{0} очков!", "Added {0} points!": "Добавлено {0} баллов!",
+                                     "{0} coins left": "осталось {0} монет", "{0}/{1}": "{0}/{1}"})
+    assert got == {"points!": "очков!"}

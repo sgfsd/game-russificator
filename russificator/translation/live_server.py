@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from ..core.universal import Entry, TextKind
-from . import markup
+from . import edges, keys, markup
 from .base import Translator
 from .filters import is_brand, is_transliteration, looks_technical, looks_translatable
 from .memory import TranslationMemory
@@ -122,6 +122,11 @@ class LiveServer:
         # ники, коды, журналы и пути игра показывает как есть — возвращаем без перевода
         if not looks_translatable(text) or looks_technical(text) or is_brand(text):
             return text
+        hint = keys.plan(text)
+        if hint is not None:            # «SPACE» → «ПРОБЕЛ», подсказка управления — по колонкам
+            parts = keys.to_translate(hint)
+            done = {t: self.translate(t) for t in parts}
+            return keys.assemble(hint, {t: v for t, v in done.items() if v}) or text
         if not self.wait_ready(self.READY_TIMEOUT):   # cache_id уточняется при подготовке переводчика
             return None
         key = (text, None)
@@ -151,6 +156,12 @@ class LiveServer:
                                                                        kind=TextKind.OTHER), {})
             except Exception:  # noqa: BLE001
                 tr = None
+        if tr and tr.strip():
+            tr, why = edges.check(text, tr)
+            if why:
+                log.info("Живой перевод «%s» отброшен: %s", text[:60], why)
+                return text
+            tr = edges.fix(text, tr)
         if tr and is_transliteration(text, tr):
             return text                  # инициалы, буквы: перевода нет — как в игре
         if not tr or not markup.same_markup(text, tr):

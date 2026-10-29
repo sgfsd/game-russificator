@@ -37,12 +37,20 @@ def _setup_logging(name: str = "play.log") -> None:
     root.setLevel(logging.INFO)
 
 
-def _options(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Настройки переводчика для живого перевода (с запасным машинным переводом) или None."""
+def _options(cfg: Dict[str, Any], fast: bool = False) -> Optional[Dict[str, Any]]:
+    """Настройки переводчика для живого перевода (с запасным машинным переводом) или None.
+    ``fast`` — доводка словаря русифицированной игры: только быстрый переводчик."""
     from .translation import local_llm, machine
     from .translation.cloud import PROVIDERS
     opts = dict(cfg)
     mode = cfg.get("mode") or "machine"
+    if fast and mode != "machine" and machine.is_installed():
+        # на лету переводится только то, чего нет в словаре, и игрок ждёт этот перевод на экране:
+        # машинный отвечает за доли секунды, нейросеть — за секунды (на слабой видеокарте 3–5 с на
+        # строку, плюс загрузка модели). Найденные строки при следующей русификации переводятся
+        # выбранным способом и попадают в словарь
+        log.info("живой перевод — машинный (быстрый), а не «%s»", mode)
+        mode = "machine"
     if mode == "cloud":
         provider = PROVIDERS.get(cfg.get("cloud_provider", ""))
         key = settings.unprotect((cfg.get("cloud_keys") or {}).get(cfg.get("cloud_provider", ""), ""))
@@ -62,6 +70,7 @@ def _options(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if mode == "machine" and not machine.is_installed():
         return None
     opts["mode"] = mode
+    opts["local_fit_vram"] = True    # живой перевод: игра уже заняла видеопамять — модель по свободному месту
     return opts
 
 
@@ -113,7 +122,7 @@ def _factory(game_title: str):
         from .translation.memory import TranslationMemory
         cfg = settings.load()
         settings.apply_data_dir(cfg)
-        opts = _options(cfg)
+        opts = _options(cfg, fast=True)
         if opts is None:
             raise RuntimeError("ни один переводчик не установлен — живой перевод недоступен")
         translator = create_translator(opts["mode"], opts, game_title)

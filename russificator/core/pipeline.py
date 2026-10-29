@@ -304,18 +304,38 @@ class Pipeline:
             self.info("Способ перевода изменился — текст переводится заново")
             return
         n = project.merge_translations(old)
-        from ..translation.markup import normalize_layout
+        from ..translation.markup import normalize_layout, same_markup
         from .universal import EntryStatus
         from ..translation.filters import is_transliteration
+        from ..translation import edges, keys
+        from ..translation.length import over_limit, was_trimmed
         version = self.translator.rules_version()
         old_version = int(old.meta.get("rules", 0) or 0)
         for e in project.entries:        # переводы прошлых версий программы — к нынешним правилам
             if not e.translation:
                 continue
+            if keys.stale(e.source, e.translation):
+                e.translation, e.status = None, EntryStatus.NEW      # клавиши — по правилу, не из прошлого
+                n -= 1
+                continue
             if old_version < version and self.translator.redo(e.source, e.translation, old_version):
                 e.translation, e.status = None, EntryStatus.NEW      # правила изменились — переводится заново
                 n -= 1
                 continue
+            if was_trimmed(e.source, e.translation) or over_limit(e, e.translation):
+                # обрезан прошлым жёстким лимитом или длиннее места оригинала — переводится заново
+                # (из памяти, с сокращением под место)
+                e.translation, e.status = None, EntryStatus.NEW
+                n -= 1
+                continue
+            checked, why = edges.check(e.source, e.translation, e.speaker)
+            if not why and not same_markup(e.source, normalize_layout(e.source, e.translation)):
+                why = "разметка не совпадает"                         # правила разметки уточнились
+            if why:                                                   # мусор вместо перевода — заново
+                e.translation, e.status = None, EntryStatus.NEW
+                n -= 1
+                continue
+            e.translation = edges.fix(e.source, checked)              # кавычки и маркеры — как в оригинале
             if is_transliteration(e.source, e.translation):           # «DAP» → «ДАП»: остаётся как в игре
                 e.translation, e.status = None, EntryStatus.SKIPPED
                 n -= 1

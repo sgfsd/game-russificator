@@ -224,7 +224,7 @@ def _system(data: M.RubyObject, name: str, out: List[Entry]) -> None:
             out.append(Entry(id=_eid(key), source=str(val), kind=kind, target_key=key,
                              max_length=16 if kind == TextKind.UI else None))
 
-    add(f"{name}|game_title", data.get("game_title"), TextKind.SYSTEM)
+    # название игры — имя продукта (на логотипе оно латиницей): не переводится
     add(f"{name}|currency_unit", data.get("currency_unit"), TextKind.UI)
     for group in ("elements", "skill_types", "weapon_types", "armor_types"):
         for k, v in enumerate(data.get(group) or []):

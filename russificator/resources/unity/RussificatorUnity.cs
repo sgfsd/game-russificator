@@ -72,6 +72,9 @@ public class RussificatorUnity : BaseUnityPlugin
 {
     const BindingFlags Inst = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
     const float MinScale = 0.6f;
+    // Ради целого слова кегль уменьшается и сильнее MinScale, но не мельче этого: рамка, рассчитанная
+    // на два иероглифа («丹药»), вмещает «Эликсиры» только при ~45% кегля — лучше мелко, чем «Эли/сиры»
+    const float WordMinScale = 0.35f;
 
     static ManualLogSource _log;
     static bool _fitEnabled = true;
@@ -101,7 +104,7 @@ public class RussificatorUnity : BaseUnityPlugin
     static Type _tmp;
     static FieldInfo _tmpText;
     static PropertyInfo _tmpTextProp, _tmpRect, _tmpAuto, _tmpSize, _tmpSizeMin, _tmpSizeMax, _tmpWrap, _tmpWrapMode;
-    static PropertyInfo _tmpPrefW, _tmpPrefH, _tmpTextInfo;
+    static PropertyInfo _tmpPrefW, _tmpPrefH, _tmpTextInfo, _tmpSpacing;
     static MethodInfo _tmpForceUpdate;
     static object[] _tmpForceArgs;
     static FieldInfo _tiLineCount, _tiLineInfo, _tiCharInfo, _liFirst, _liLast, _ciChar;
@@ -401,6 +404,7 @@ public class RussificatorUnity : BaseUnityPlugin
             _tmpPrefW = _tmp.GetProperty("preferredWidth");
             _tmpPrefH = _tmp.GetProperty("preferredHeight");
             _tmpTextInfo = _tmp.GetProperty("textInfo");
+            _tmpSpacing = _tmp.GetProperty("characterSpacing");
             foreach (MethodInfo m in _tmp.GetMethods(BindingFlags.Instance | BindingFlags.Public))
             {
                 if (m.Name != "ForceMeshUpdate") continue;
@@ -1257,7 +1261,18 @@ public class RussificatorUnity : BaseUnityPlugin
             return;
         }
         st.CheckedLength = s.Length;
-        if (tmp ? (bool)_tmpAuto.GetValue(inst, null) : (bool)_uguiBestFit.GetValue(inst, null)) return;
+        if (tmp && (bool)_tmpAuto.GetValue(inst, null))
+        {
+            // автоподбор игры уже включён, но его нижний предел рассчитан на английский: русский текст
+            // упирается в него и обрезается («ВЫКЛЮЧИТЬ СИНХРОНИЗАЦИЮ V») — предел опускается
+            if (LowerTmpMin(inst, s, w, h))
+            {
+                st.Fitted = true;
+                if (_fitLogged++ < 100) _log.LogInfo("Autosize min: " + NameOf(inst) + " — " + Shorten(s));
+            }
+            return;
+        }
+        if (!tmp && (bool)_uguiBestFit.GetValue(inst, null)) return;
         if (KeepOneLine(inst, tmp, s, st.Original, w))
         {
             st.Fitted = true;
@@ -1269,15 +1284,20 @@ public class RussificatorUnity : BaseUnityPlugin
             // рамка уже одной буквы — текст нарочно выходит за неё (так задумано), не трогаем
             float size = (float)_tmpSize.GetValue(inst, null);
             if (w < size * 0.75f || h < size * 0.5f) return;
-            if (!TmpOverflows(inst, w, h)) return;
-            FitTmp(inst);
+            // слово, разрезанное по буквам («Эли/сиры»), исправляется всегда — даже если английский
+            // текст тоже не помещался: разрезанное слово не бывает задумкой
+            if (TmpWordScale(inst, s, w) >= 1f && !TmpOverflows(inst, w, h)) return;
+            FitTmp(inst, s, w);
         }
         else
         {
-            if (!UguiOverflows(inst, s, w, h)) return;
-            // английский текст тоже не помещался — так задумано, не трогаем
-            if (st.Original != null && UguiOverflows(inst, st.Original, w, h)) return;
-            FitUgui(inst);
+            if (UguiWordScale(inst, s, w) >= 1f)
+            {
+                if (!UguiOverflows(inst, s, w, h)) return;
+                // английский текст тоже не помещался по высоте — так задумано, не трогаем
+                if (st.Original != null && UguiOverflows(inst, st.Original, w, h)) return;
+            }
+            FitUgui(inst, s, w);
         }
         st.Fitted = true;
         if (_fitLogged++ < 100) _log.LogInfo("Autosize: " + NameOf(inst) + " — " + Shorten(s));
@@ -1297,7 +1317,7 @@ public class RussificatorUnity : BaseUnityPlugin
         {
             if (!TmpWraps(inst)) return false;
             trans = (float)_tmpPrefW.GetValue(inst, null);       // текущий (русский) текст в одну строку
-            int a = PlainLength(original), b = PlainLength(s);
+            float a = VisualLength(original), b = VisualLength(s);
             if (a <= 0 || b <= 0) return false;
             orig = trans * a / b;      // ширину оригинала мерить нельзя (портит буфер TMP) — по числу букв
         }
@@ -1342,6 +1362,83 @@ public class RussificatorUnity : BaseUnityPlugin
             else if (!tag && !char.IsWhiteSpace(c)) n++;
         }
         return n;
+    }
+
+    // Длина текста в «ширинах буквы»: иероглиф, кана, хангыль и полноширинные знаки — почти две буквы
+    static float VisualLength(string s)
+    {
+        float n = 0f;
+        bool tag = false;
+        foreach (char c in s)
+        {
+            if (c == '<') tag = true;
+            else if (c == '>' && tag) tag = false;
+            else if (!tag && !char.IsWhiteSpace(c)) n += IsWide(c) ? 1.8f : 1f;
+        }
+        return n;
+    }
+
+    static bool IsWide(char c)
+    {
+        return (c >= '\u1100' && c <= '\u11FF') || (c >= '\u2E80' && c <= '\uA4CF') || (c >= '\uAC00' && c <= '\uD7AF')
+            || (c >= '\uF900' && c <= '\uFAFF') || (c >= '\uFE30' && c <= '\uFE4F') || (c >= '\uFF00' && c <= '\uFF60')
+            || (c >= '\uFFE0' && c <= '\uFFE6');
+    }
+
+    // Во сколько раз уменьшить кегль, чтобы самое длинное слово встало в строку целиком (1 — встаёт).
+    // TextMeshPro: по ширине всего текста в одну строку и доле самого длинного слова в нём — так
+    // работает и в IL2CPP, где разбор строк textInfo недоступен.
+    static float TmpWordScale(object inst, string s, float w)
+    {
+        return TmpWordScale(inst, s, w, (float)_tmpSize.GetValue(inst, null));
+    }
+
+    // ``measured`` — кегль, которым TMP мерит preferredWidth (при автоподборе — верхний предел)
+    static float TmpWordScale(object inst, string s, float w, float measured)
+    {
+        if (!TmpWraps(inst)) return 1f;
+        List<string> words = LongestWords(s);
+        if (words.Count == 0) return 1f;
+        // preferredWidth — ширина самой длинной строки («ВЫБЕРИТЕ↵УРОВЕНЬ»: первой), а не всего текста
+        float total = 0f, word = VisualLength(words[0]);
+        foreach (string line in s.Split('\n')) total = Math.Max(total, VisualLength(line));
+        if (total <= 0f || word <= 0f) return 1f;
+        float one = (float)_tmpPrefW.GetValue(inst, null);
+        float spacing = _tmpSpacing != null ? (float)_tmpSpacing.GetValue(inst, null) : 0f;
+        if (spacing > 0f)
+        {
+            // разрядку подгонка убирает первой — слово меряется уже без неё
+            one -= spacing * 0.01f * measured * VisualLength(s);
+        }
+        float wordW = one * word / total;
+        return wordW > w - 1f && wordW > 0f ? (w - 1f) / wordW : 1f;
+    }
+
+    static float UguiWordScale(object inst, string s, float w)
+    {
+        if (Convert.ToInt32(_uguiHOverflow.GetValue(inst, null)) != 0) return 1f;   // однострочная: не переносит
+        object gen = _uguiGen.GetValue(inst, null);
+        float ppu = (float)_uguiPpu.GetValue(inst, null);
+        if (gen == null || ppu <= 0f) return 1f;
+        object extents = Activator.CreateInstance(_vector2, new object[] { w, 0f });
+        object settings = _uguiSettings.Invoke(inst, new object[] { extents });
+        float k = 1f;
+        foreach (string word in LongestWords(s))
+        {
+            float ww = (float)_genPrefW.Invoke(gen, new object[] { word, settings }) / ppu;
+            if (ww > w - 1f && ww > 0f) k = Math.Min(k, (w - 1f) / ww);
+        }
+        return k;
+    }
+
+    // Пределы автоподбора: самое крупное — при котором слова целые, самое мелкое — MinScale (или мельче,
+    // если иначе слово не встаёт, но не мельче WordMinScale)
+    static void FitRange(float kWord, out float hi, out float lo)
+    {
+        hi = Math.Min(1f, Math.Max(WordMinScale, kWord));
+        lo = Math.Min(MinScale, hi);
+        if (kWord < MinScale) lo = Math.Max(WordMinScale, kWord * 0.9f);
+        if (lo > hi) lo = hi;
     }
 
     static string NameOf(object inst)
@@ -1446,21 +1543,57 @@ public class RussificatorUnity : BaseUnityPlugin
         return pw > w + 1.5f;
     }
 
-    static void FitTmp(object inst)
+    // Автоподбор кегля TextMeshPro следит только за высотой: длинное русское слово («ВОСПРОИЗВЕСТИ» на
+    // кнопке «REPLAY») он режет по буквам, а кегль оставляет крупным, пока строки влезают по высоте. Здесь
+    // верхний предел опускается до кегля, при котором самое длинное слово встаёт в строку, а нижний — если
+    // текст упёрся в него и всё равно не влез (предел игры рассчитан на английский).
+    static bool LowerTmpMin(object inst, string s, float w, float h)
+    {
+        float size = (float)_tmpSize.GetValue(inst, null);
+        float min = (float)_tmpSizeMin.GetValue(inst, null);
+        float max = (float)_tmpSizeMax.GetValue(inst, null);
+        if (max <= 1f) return false;
+        // preferredWidth при автоподборе меряется верхним кеглем — доля слова от него же
+        float kWord = TmpWordScale(inst, s, w, max);
+        float wordFit = kWord < 1f ? max * kWord : max;          // кегль, при котором слово целое
+        bool broken = wordFit < size - 0.5f;
+        bool stuck = size <= min + 0.5f && TmpOverflows(inst, w, h);
+        if (!broken && !stuck) return false;
+        if (_tmpSpacing != null && (float)_tmpSpacing.GetValue(inst, null) > 0f)
+            _tmpSpacing.SetValue(inst, 0f, null);                // разрядка уходит первой (TmpWordScale без неё)
+        float newMax = (float)Math.Max(1.0, Math.Floor(Math.Max(wordFit, max * WordMinScale) * 10.0) / 10.0);
+        float newMin = Math.Min(min, newMax);
+        if (stuck) newMin = (float)Math.Max(1.0, Math.Min(newMin, Math.Floor(min * MinScale)));
+        bool changed = false;
+        if (newMax < max - 0.05f) { _tmpSizeMax.SetValue(inst, newMax, null); changed = true; }
+        if (newMin < min - 0.05f) { _tmpSizeMin.SetValue(inst, newMin, null); changed = true; }
+        return changed;
+    }
+
+    static void FitTmp(object inst, string s, float w)
     {
         float size = (float)_tmpSize.GetValue(inst, null);
         if (size <= 1f) return;
-        _tmpSizeMax.SetValue(inst, size, null);
-        _tmpSizeMin.SetValue(inst, (float)Math.Max(1.0, Math.Floor(size * MinScale)), null);
+        float kWord = TmpWordScale(inst, s, w);
+        // разрядка («К о л и ч е с т в о» — её ставят для иероглифов) убирается раньше, чем уменьшается шрифт
+        if (_tmpSpacing != null && (float)_tmpSpacing.GetValue(inst, null) > 0f)
+            _tmpSpacing.SetValue(inst, 0f, null);
+        float hi, lo;
+        FitRange(kWord, out hi, out lo);
+        _tmpSizeMax.SetValue(inst, (float)Math.Floor(size * hi * 10.0) / 10f, null);
+        _tmpSizeMin.SetValue(inst, (float)Math.Max(1.0, Math.Floor(size * lo)), null);
         _tmpAuto.SetValue(inst, true, null);
     }
 
-    static void FitUgui(object inst)
+    static void FitUgui(object inst, string s, float w)
     {
         int size = (int)_uguiSize.GetValue(inst, null);
         if (size <= 1) return;
-        _uguiMax.SetValue(inst, size, null);
-        _uguiMin.SetValue(inst, (int)Math.Max(1.0, Math.Floor(size * MinScale)), null);
+        float hi, lo;
+        FitRange(UguiWordScale(inst, s, w), out hi, out lo);
+        int max = (int)Math.Max(1.0, Math.Floor(size * hi));
+        _uguiMax.SetValue(inst, max, null);
+        _uguiMin.SetValue(inst, (int)Math.Min(max, Math.Max(1.0, Math.Floor(size * lo))), null);
         if (Convert.ToInt32(_uguiHOverflow.GetValue(inst, null)) != 0)   // однострочная подпись: перенос + подбор
             _uguiHOverflow.SetValue(inst, Enum.ToObject(_uguiHOverflow.PropertyType, 0), null);
         _uguiBestFit.SetValue(inst, true, null);

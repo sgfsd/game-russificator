@@ -61,11 +61,27 @@ class GlossaryBuilder:
 
 
 def apply_glossary(text: str, forced: Dict[str, str]) -> str:
-    """Принудительно заменить термины в готовом переводе (глоссарий пользователя)."""
-    for src, dst in forced.items():
-        if src and dst:
-            text = re.sub(rf"(?<!\w){re.escape(src)}(?!\w)", dst, text, flags=re.IGNORECASE)
-    return text
+    """Принудительно заменить термины в готовом переводе (глоссарий пользователя и термины игры, оставшиеся
+    в переводе по-английски). Только вне разметки — термин «Line» не трогает тег ``<line-indent>``; регистр —
+    как у заменяемого слова («Это workbench, который» → «Это верстак, который»)."""
+    from .markup import split_by_markup
+    pairs = [(src, dst) for src, dst in forced.items() if src and dst]
+    if not pairs:
+        return text
+
+    def fix(part: str) -> str:
+        for src, dst in pairs:
+            def sub(m: "re.Match", src=src, dst=dst) -> str:
+                # термин внутри оставшейся английской фразы («Proficiency in Poison Arts»): одно русское
+                # слово посреди английских дало бы мешанину «Proficiency in Яд Arts»
+                before = re.search(r"([A-Za-z]+)[^\w\n]{0,3}$", m.string[:m.start()])
+                after = re.match(r"[^\w\n]{0,3}([A-Za-z]+)", m.string[m.end():])
+                if before and after:
+                    return m.group(0)
+                return dst if m.group(0) == src else match_case(dst, m.group(0))
+            part = re.sub(rf"(?<!\w){re.escape(src)}(?!\w)", sub, part, flags=re.IGNORECASE)
+        return part
+    return "".join(c if is_tag else fix(c) for is_tag, c in split_by_markup(text))
 
 
 @lru_cache(maxsize=1)
@@ -101,11 +117,30 @@ def ui_phrase(text: str) -> Optional[str]:
     tr = ui_phrases().get(core.lower())
     lead = text[: len(text) - len(text.lstrip())]
     trail = text[len(text.rstrip()):]
+    if tr is None and "\n" in core:
+        return _stacked(core, lead, trail)
     if tr is None:
-        # слово в рамке из знаков: «-NEW-», «[ OK ]», «~Start~» — в словаре ищется само слово
-        m = re.fullmatch(r"([^\w\s]+\s*)(\w[\w' ]*\w|\w)(\s*[^\w\s]+)", core)
+        # слово в рамке из знаков: «-NEW-», «[ OK ]», «~Start~» — в словаре ищется само слово; без рамки
+        # слева — только с «!», «:» или многоточием справа («Done!», «Score:»): вопрос меняет смысл
+        # («Quit?» — это «Выйти?», а не «Выход?»)
+        m = (re.fullmatch(r"([^\w\s]+\s*)(\w[\w' ]*\w|\w)(\s*[^\w\s]+)", core)
+             or re.fullmatch(r"()(\w[\w' ]*\w|\w)(\s*(?:!+|:|\.\.\.|…))", core))
         tr = ui_phrases().get(m.group(2).lower()) if m else None
         if tr is None:
             return None
         return lead + m.group(1) + match_case(tr, m.group(2)) + m.group(3) + trail
     return lead + match_case(tr, core) + trail
+
+
+def _stacked(core: str, lead: str, trail: str) -> Optional[str]:
+    """Подпись кнопки, разложенная по строкам («LEVEL↵SELECT», «Main↵Menu»): строки по отдельности
+    переводятся бессмыслицей («УРОВЕНЬ↵ВЫБРАТЬ») — переводится вся подпись по словарю и раскладывается
+    на столько же строк."""
+    from .markup import rewrap
+    lines = [ln.strip() for ln in core.split("\n")]
+    if not 2 <= len(lines) <= 3 or any(not ln or len(ln.split()) > 3 for ln in lines):
+        return None
+    tr = ui_phrase(" ".join(lines))
+    if tr is None:
+        return None
+    return lead + rewrap(tr, [("\n", [len(ln) for ln in lines])]) + trail

@@ -94,6 +94,17 @@ def test_soft_mode_accepts_lowercase_words():
     assert not looks_translatable("run", strict=True)
 
 
+def test_soft_mode_judges_visible_text_not_tags():
+    """Теги Ren'Py и перевод строки не делают надпись идентификатором: «_» в {#quick_page}
+    и цифры в {size=32} — служебные, игрок видит «Quick» и «Flashing Images»."""
+    assert looks_translatable("{#quick_page}Quick")
+    assert looks_translatable("{size=32}Flashing\nImages")
+    assert looks_translatable("{b}Save{/b}")
+    for code in ("player_name", "{#x}item_name", "anim{0}_idle", "{size=32}Item01x", "{#file_time}%H:%M"):
+        assert not looks_translatable(code), code
+    assert not looks_translatable("{size=32}Flashing\nImages", strict=True)  # строгий режим — как был
+
+
 # ============================= глоссарий =============================
 
 def test_ui_phrases_keep_case():
@@ -192,9 +203,29 @@ def test_service_cancel(tmp_path):
 
 
 def test_service_length_control(tmp_path):
-    proj = _project(tmp_path, "Save the game", max_length=6, kind=TextKind.UI)
+    """Перевод сильно длиннее места обрезается, но лимит никогда не меньше места самого оригинала:
+    абсолютный лимит движка не режет перевод длинного оригинала («описание черты» → «Страстная…»)."""
+    proj = _project(tmp_path, "Save", max_length=6, kind=TextKind.UI)
     TranslationService(FakeTranslator(fn=lambda e: "Сохранить игру")).run(proj)
-    assert proj.entries[0].translation == "Сохран"
+    assert proj.entries[0].translation == "Сохран"                      # переводчик сократил
+    proj = _project(tmp_path / "b", "Save the game", max_length=6, kind=TextKind.UI)
+    TranslationService(FakeTranslator(fn=lambda e: "Сохранить игру")).run(proj)
+    assert proj.entries[0].translation == "Сохранить игру"
+    proj = _project(tmp_path / "c", "Save", max_length=6, kind=TextKind.UI)
+    proj.entries[0].notes["fits_at_runtime"] = True                 # движок сам ужмёт при показе
+    tr = FakeTranslator(fn=lambda e: "Сохранить игру")
+    tr.shorten = lambda *a: None                                     # сократить не смог — не режем
+    TranslationService(tr).run(proj)
+    assert proj.entries[0].translation == "Сохранить игру"
+
+
+def test_trimmed_translations_are_redone():
+    from russificator.translation.length import was_trimmed
+    assert was_trimmed("Hot. Extremely good looking. A natural flirt.", "Страстная. Очень красивая…")
+    assert not was_trimmed("Wait...", "Подожди…")
+    assert not was_trimmed("Save", "Сохранить")
+    assert was_trimmed("About", "О пр.") and was_trimmed("Save game", "Сохр. игру")   # обрубки
+    assert not was_trimmed("Something is wrong.", "Что-то не так.")
 
 
 # ============================= промпт и LLM-клиент =============================
@@ -529,7 +560,7 @@ def test_old_line_by_line_translations_are_redone(tmp_path):
     assert got["insert\r\ncoin"] == (EntryStatus.NEW, None)
     assert got["Options\nQuit"][1] == "Настройки\nВыход" and got["Hello"][1] == "Привет"
     assert got["-NEW-"] == (EntryStatus.NEW, None)                  # слово словаря в рамке — из словаря
-    assert new.meta["rules"] == 3
+    assert new.meta["rules"] == 5
 
 
 def test_letters_initials_and_alphabet_rows_stay_as_is():
@@ -575,3 +606,254 @@ def test_any_translator_keeps_lines_the_game_wrapped():
     assert got.count("\n") == src.count("\n")
     assert got.startswith("0 / 61 записей найдено\r\n0 испытаний пройдено\n\nОткрывайте")
     assert normalize_layout("Options\nQuit", "Настройки\nВыход") == "Настройки\nВыход"
+
+
+# ============================= края строки и мусор вместо перевода =============================
+
+@pytest.mark.parametrize("source,translation,expected", [
+    ("''Let's do it.''", "• Сделаем это", "''Сделаем это''"),                  # кавычки реплики, чужой маркер
+    ("''Damn, nearly had the thing...''", "''Черт, чуть не попал...", "''Черт, чуть не попал...''"),
+    ("{i}Sybil holds her silence.{/i}", "{i}• (Наблюдение) ''Сибиль хранит молчание.{/i}",
+     "{i}Сибиль хранит молчание.{/i}"),                                      # приписки соседней строки
+    ("{i}• (Keen Eye) ''Pepsi??? I'm a Coke guy.''{/i}", "{i}• (Зоркий глаз) Пепси??? Я за колу.{/i}",
+     "{i}• (Зоркий глаз) ''Пепси??? Я за колу.''{/i}"),
+    ("Hello there!", '"Привет!"', "Привет!"),                                 # модель обернула в кавычки
+    ('The "Deep" one', "«Глубокий» один", "«Глубокий» один"),                # кавычки внутри — не трогать
+    (" Save \n", "Сохранить", " Сохранить \n"),
+])
+def test_edges_follow_the_original(source, translation, expected):
+    from russificator.translation import edges
+    assert edges.fix(source, translation) == expected
+
+
+@pytest.mark.parametrize("source,translation,speaker", [
+    ("''Are you going to be okay after what happened with—''", "1", None),            # номер из пакета
+    ("''Those birds is like family to me. I raised them from eggs.''", "Duke", "Duke"),
+    ("''There's a time and a place, son, and this ain't either of them.''",
+     '{"9": "Есть время и место", "type": "dialogue", "speak', None),                   # кусок JSON
+    ("Some places have a pull on people, don't they? Sometimes you think you have a choice.",
+     "Места тянут.", None),                                                              # пересказ
+])
+def test_garbage_translations_are_rejected(source, translation, speaker):
+    from russificator.translation import edges
+    fixed, why = edges.check(source, translation, speaker)
+    assert fixed is None and why
+
+
+def test_json_reply_with_one_russian_string_is_salvaged():
+    from russificator.translation import edges
+    fixed, why = edges.check("Hello there, friend!", '{"1": "Привет, друг!"}')
+    assert fixed == "Привет, друг!" and why is None
+
+
+def test_identifiers_and_brands_are_markup():
+    """Код, плагины и бренды внутри текста («HIME_PreTitleEvents», «MikuMikuDance», «YouTube») —
+    неприкосновенная разметка: машинный перевод портил их («heme_PreTitleСобытия»). Крик капсом —
+    обычный текст, строка из одних идентификаторов — не текст."""
+    masked, found, _ = markup.mask("HimeWorks --- HIME_SyncSaveData, watch my YouTube! STOP!")
+    assert found == ["HimeWorks", "HIME_SyncSaveData", "YouTube"] and "STOP" in masked
+    assert not markup.has_words("SRD_GameUpgrade , SRD_HUDMaker")
+    assert markup.same_markup("Use $MUSH_Menu_p1 now", "Используй $MUSH_Menu_p1 сейчас")
+    assert not markup.same_markup("Use $MUSH_Menu_p1 now", "Используй $mush_Меню_p1 сейчас")
+
+
+def test_live_local_model_fits_free_vram(monkeypatch):
+    """llama.cpp кладёт на видеокарту столько слоёв, сколько влезает в СВОБОДНУЮ память: в живом
+    переводе игра её уже заняла, и «лучшая» модель почти вся считалась процессором. Живой перевод
+    берёт самую крупную установленную модель, которая помещается; обычная русификация — нет."""
+    from russificator.translation import local_llm
+    monkeypatch.setattr(local_llm, "gpu_devices",
+                        lambda: [{"id": "Vulkan0", "name": "RTX", "vram_gb": 16.0, "free_gb": 5.0}])
+    monkeypatch.setattr(local_llm, "model_installed", lambda p: True)
+    live = local_llm.LocalTranslator("gemma4-12b", fit_vram=True)
+    msgs = []
+    live._fit_to_vram(lambda m, f=None: msgs.append(m))
+    assert live.preset.id == "gemma4-e4b" and live.cache_id == "llm:gemma4-e4b" and msgs
+    files = local_llm.LocalTranslator("gemma4-12b")
+    files._fit_to_vram(lambda m, f=None: None)
+    assert files.preset.id == "gemma4-12b"                 # выбор пользователя, только предупреждение
+    monkeypatch.setattr(local_llm, "gpu_devices",
+                        lambda: [{"id": "Vulkan0", "name": "RTX", "vram_gb": 16.0, "free_gb": 12.0}])
+    roomy = local_llm.LocalTranslator("gemma4-12b", fit_vram=True)
+    roomy._fit_to_vram(lambda m, f=None: None)
+    assert roomy.preset.id == "gemma4-12b"
+
+
+# ---------- клавиши, имена, мусор живого перевода (отзыв 2026-10-27) ----------
+
+def test_key_names_and_control_hints():
+    """«SPACE» → «ПРОБЕЛ», а не «КОСМОС»; Esc/Shift/Ctrl — латиницей, как на клавиатуре; подсказка из
+    колонок переводится по колонкам, клавиша в колонке остаётся."""
+    from russificator.translation import keys
+    assert keys.plan("SPACE") == [(False, "ПРОБЕЛ")] and keys.plan("Space") == [(False, "Пробел")]
+    for k in ("ESC", "SHIFT", "LEFTCTRL", "Left Ctrl", "F5", "TAB", "ENTER"):
+        assert keys.plan(k) == [(False, k)], k
+    assert keys.plan("Enter") is None and keys.plan("Escape") is None      # с заглавной — может быть командой
+    hint = keys.plan("TAB Cancel    SPACE Confirm")
+    assert keys.to_translate(hint) == ["Cancel", "Confirm"]
+    assert keys.assemble(hint, {"Cancel": "Отмена", "Confirm": "Подтвердить"}) == "TAB Отмена    ПРОБЕЛ Подтвердить"
+    assert keys.plan("Press SPACE to jump") is None and keys.plan("Space Station Omega") is None
+    for text in ("END OF CHAPTER", "SPACE STATION", "DELETE SAVE?", "HOME SWEET HOME"):
+        assert keys.plan(text) is None, text
+    assert keys.to_translate(keys.plan("ESC to exit")) == ["to exit"]
+    for combo in ("Ctrl + G", "Alt+F4", "Ctrl +", "Ctrl + Left Alt", "Shift + Tab"):
+        assert keys.plan(combo) == [(False, combo)], combo
+    assert keys.plan("Rock + Roll") is None and keys.plan("A + B") is None
+
+
+def test_service_translates_keys_without_translator(tmp_path):
+    from russificator.core.universal import EntryStatus
+    tr = FakeTranslator(lambda e: {"Cancel": "Отмена", "Confirm": "Подтвердить"}.get(e.source, "Перевод"))
+    p = _project(tmp_path, "SPACE", "ESC", "TAB Cancel    SPACE Confirm")
+    TranslationService(tr).run(p)
+    got = {e.source: e.translation for e in p.entries}
+    assert got["SPACE"] == "ПРОБЕЛ" and got["ESC"] == "ESC"
+    assert got["TAB Cancel    SPACE Confirm"] == "TAB Отмена    ПРОБЕЛ Подтвердить"
+    sent = [s for call in tr.calls for s in call]
+    assert "SPACE" not in sent and "ESC" not in sent
+    assert all(e.status == EntryStatus.APPROVED for e in p.entries)
+
+
+def test_names_dialogue_words_and_slash_labels():
+    from russificator.translation import filters
+    assert not filters.is_transliteration("Tom", "Том") and not filters.is_transliteration("Sam", "Сэм")
+    assert filters.is_transliteration("DAP", "ДАП") and filters.is_transliteration("st", "ст")
+    assert filters.spelled_in_cyrillic("dang", "дэнг") and not filters.spelled_in_cyrillic("dang", "черт")
+    assert filters.looks_translatable("Y-You…!", strict=True) and filters.looks_translatable('"Wait…!"', strict=True)
+    assert filters.looks_translatable("Save/Load") and not filters.looks_translatable("Assets/Prefabs")
+    assert filters.looks_spoken("sure") and filters.looks_spoken("hey sam") and not filters.looks_spoken("ui_btn_ok")
+    for tech in ("1920 x 1080 @ 50Hz", "x 1080 @ 50Hz", "144Hz", "60 FPS", "4K"):
+        assert not filters.looks_translatable(tech), tech
+    assert filters.looks_translatable("Level 5") and filters.looks_translatable("60 seconds left")
+
+
+def test_edges_reject_mixed_script_and_fix_ukrainian_letters():
+    from russificator.translation import edges
+    assert edges.check("TINFOILHAT", "ТINFOILHAT")[0] is None
+    assert edges.check("WHAT? No way!", "ЧТO? Не может быть!") == ("ЧТО? Не может быть!", None)
+    assert edges.check("DAVID MOST", "ДЕЙВІД МОСТ") == ("ДЕЙВИД МОСТ", None)
+    assert edges.check("Use the iPhone app", "Используй приложение для iPhone") == ("Используй приложение для iPhone", None)
+
+
+def test_machine_retry_helpers():
+    from russificator.translation import machine
+    assert machine._repunct("Who cares lemme go") == "Who cares lemme go."
+    assert machine._repunct("Who cares?") == "Who cares"
+    assert machine._unrepunct("Who cares?", "Да какая разница.") == "Да какая разница?"
+    assert machine._unrepunct("Who cares lemme go", "Кому какое дело.") == "Кому какое дело"
+    assert machine._leftover_common("Who cares lemme go", "Кто cares, давай") == 1
+    assert machine._leftover_common("Ask Tom", "Спроси Tom") == 0
+
+
+def test_key_translations_from_old_versions_are_redone_only_when_wrong():
+    from russificator.translation import keys
+    assert keys.stale("SPACE", "КОСМОС") and not keys.stale("SPACE", "ПРОБЕЛ")
+    assert keys.stale("TAB Cancel    SPACE Confirm", "Подтвердить отмену вкладок")
+    assert not keys.stale("TAB Cancel    SPACE Confirm", "TAB Отмена    ПРОБЕЛ Подтвердить")
+    assert not keys.stale("Name     Price", "Название     Цена")       # колонки без клавиш — как были
+    assert not keys.stale("Hello there", "Привет")
+
+
+def test_fullwidth_punctuation_and_dictionary_compounds_are_text():
+    """«WorkBench：Cultivate» (китайская раскладка) — текст, а не идентификатор; обычное слово с заглавной
+    в середине («WorkBench», «FireBall») переводится, бренды и имена из кода («YouTube») остаются."""
+    assert looks_translatable("WorkBench：Cultivate", strict=True)
+    assert not looks_translatable("UnchartedRealm") and not looks_translatable("CardMC_Hero")
+    assert markup.tokens("Open the WorkBench on YouTube <b>now</b>") == ["YouTube", "<b>", "</b>"]
+    assert markup.same_markup("Recover WorkBench", "Восстановить верстак")
+    # теги TMP с «=» и «;» в конце пункта описания — не key=value и не код
+    assert looks_translatable("<line-indent=20%>The floor here... why does it look like a gameboard?", strict=True)
+    assert looks_translatable("Lifespan +20 years after cultivation;", strict=True)
+    assert not looks_translatable("return x;", strict=True) and not looks_translatable("speed=10", strict=True)
+
+
+def test_machine_input_normalized_and_title_labels():
+    from russificator.translation import machine
+    assert machine._for_model("WorkBench：Cultivate") == "Workbench: Cultivate"
+    assert machine._for_model("Watch YouTube") == "Watch YouTube"
+    assert machine._title_label("Main Dish") and machine._title_label("Auto Stack Radius")
+    assert not machine._title_label("Main dish") and not machine._title_label("Go home.")
+    assert machine._inner_capitals("Главная Блюда") == 1 and machine._inner_capitals("Главное блюдо") == 0
+
+
+def test_stacked_button_label_translated_whole():
+    """«LEVEL↵SELECT» по строкам — «УРОВЕНЬ↵ВЫБРАТЬ»; переводится вся подпись и раскладывается обратно."""
+    from russificator.translation.glossary import ui_phrase
+    assert ui_phrase("LEVEL\nSELECT") == "ВЫБОР\nУРОВНЯ"
+    assert ui_phrase("Done!") == "Готово!" and ui_phrase("Quit?") is None
+    assert ui_phrase("Attack\nDefend") is None
+
+
+def test_machine_rules_v5_redo_old_translations():
+    """Переводы прошлых версий, которые нынешние правила сделали бы иначе, переводятся заново."""
+    from russificator.translation import machine
+    assert machine._redo_v5("REPLAY", "ВОСПРОИЗВЕСТИ") and not machine._redo_v5("REPLAY", "ЗАНОВО")
+    assert machine._redo_v5("Main Dish", "Главная Блюда") and not machine._redo_v5("Main Dish", "Основное блюдо")
+    assert machine._redo_v5("WorkBench：Cultivate", "WorkBench:Культивировать")
+    assert not machine._redo_v5("Hello there", "Привет")
+
+
+def test_game_terms_genre_and_leftovers(tmp_path):
+    """Словарь терминов игры: карточная игра — deck это колода (падеж сохраняется), термин, оставшийся в
+    переводе по-английски, заменяется переводом термина, но не посреди английской фразы и не в разметке."""
+    from russificator.translation import terms
+    from russificator.translation.glossary import apply_glossary
+    src = [f"Draw a card number {i}." for i in range(20)]
+    assert terms.genres(src) == ["cards"] and terms.genres(["Hello"] * 50) == []
+    rules = terms.genre_rules()["cards"]["stems"]
+    assert terms.stem_fix("Battle Deck", "Боевая палуба", rules) == "Боевая колода"
+    assert terms.stem_fix("Disable battle deck sorting", "Отключить сортировку боевой палубы", rules) \
+        == "Отключить сортировку боевой колоды"
+    assert terms.stem_fix("The ship deck is wet", "Палуба корабля мокрая", rules) == "Палуба корабля мокрая"
+    found = terms.collect(["This is a <color=#f3b123>Workbench</color>, which represents <b>30%</b>.",
+                           "Open the WorkBench.", "{color=#fff}Mana Potion{/color} restores mana"])
+    assert set(found) == {"Workbench", "WorkBench", "Mana Potion"}
+    tr = "Это <color=#f3b123>workbench</color>, который представляет"
+    assert apply_glossary(tr, {"Workbench": "Верстак"}) == "Это <color=#f3b123>верстак</color>, который представляет"
+    assert apply_glossary("Но бонус от Proficiency in Poison Arts", {"Poison": "Яд"}) == \
+        "Но бонус от Proficiency in Poison Arts"
+    assert apply_glossary("<line-indent=8%>Line", {"Line": "Строка"}) == "<line-indent=8%>Строка"
+    p = TranslationProject(tmp_path / "game", "unity", tmp_path / "work")
+    p.entries = [Entry(id=str(i), source=s, target_key=str(i)) for i, s in
+                 enumerate(src + ["This is a <color=#f3b123>Workbench</color>.", "Skill Deck"])]
+    for e, t in zip(p.entries[-2:], ["Это <color=#f3b123>workbench</color>.", "Навык палубы"]):
+        e.translation, e.status = t, EntryStatus.APPROVED
+    assert terms.polish(p, {"Workbench": "Верстак"}) == 2
+    assert [e.translation for e in p.entries[-2:]] == ["Это <color=#f3b123>верстак</color>.", "Навык колоды"]
+
+
+def test_game_terms_translated_once_with_translator():
+    from russificator.translation import terms
+
+    class Fake:
+        def translate(self, entries, glossary):
+            return {e.id: {"Workbench": "Верстак", "Mana Potion": "Mana зелье"}.get(e.source, "") for e in entries}
+    entries = [Entry(id=str(i), source=s, target_key=str(i)) for i, s in
+               enumerate(["Use the <b>Workbench</b>.", "A <b>Mana Potion</b>.", "Go <b>Home</b>."])]
+    got = terms.build(entries, Fake(), {"Home": "Дом"})
+    assert got == {"Workbench": "Верстак"}            # «Mana зелье» — с английским словом, «Home» уже в глоссарии
+
+
+def test_translation_report_counts_and_suspicious(tmp_path, monkeypatch):
+    """Отчёт о переводе: строки по источникам, не переведённое, подозрительные переводы (английские слова,
+    пословный Заглавный Регистр — но не имена), без личных путей."""
+    from russificator import stand
+    from russificator.core import pipeline
+    game = tmp_path / "Game"
+    game.mkdir()
+    work = tmp_path / "work"
+    monkeypatch.setattr(pipeline, "project_dir", lambda g: work if g == game else tmp_path / "none")
+    p = TranslationProject(game, "renpy", work)
+    rows = [("Main Dish", "Главная Блюда", "script.rpy"), ("Su Lianyan", "Су Лянян", "script.rpy"),
+            ("Open the gate", "Открой gate", "options.rpy"), ("Hello", None, "script.rpy")]
+    for i, (s, t, sc) in enumerate(rows):
+        e = Entry(id=str(i), source=s, target_key=str(i), scene=sc)
+        e.translation, e.status = (t, EntryStatus.APPROVED) if t else (None, EntryStatus.FAILED)
+        p.entries.append(e)
+    p.meta["game_title"] = "Game"
+    p.save()
+    text = stand.build(game)
+    assert "всего 4, переведено 3, не переведено 1" in text and "script.rpy: 3" in text
+    assert "`Main Dish` → `Главная Блюда`" in text and "`Su Lianyan`" not in text
+    assert "`Open the gate` → `Открой gate`" in text and "`Hello`" in text
+    assert stand.build(tmp_path / "nothing") is None

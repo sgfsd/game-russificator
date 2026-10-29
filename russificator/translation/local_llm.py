@@ -124,6 +124,26 @@ def gpu_devices() -> List[dict]:
     return devs
 
 
+#: видеопамять, нужная модели целиком (веса на видеокарте + контекст и буферы, замер llama.cpp).
+#: У E-моделей Gemma таблицы эмбеддингов остаются в ОЗУ — им нужно меньше размера файла.
+VRAM_NEED_GB = {"gemma4-e2b": 1.6, "gemma4-e4b": 3.0, "gemma4-12b": 8.0}
+
+
+def vram_need_gb(preset: Optional[ModelPreset], custom: Optional[Path] = None) -> float:
+    if custom is not None:
+        try:
+            return custom.stat().st_size / 1e9 + 0.8
+        except OSError:
+            return 0.0
+    return VRAM_NEED_GB.get(preset.id, preset.size_gb + 0.8) if preset else 0.0
+
+
+def best_gpu() -> Optional[dict]:
+    """Видеокарта с наибольшей свободной памятью (как её видит llama.cpp прямо сейчас)."""
+    devs = gpu_devices()
+    return max(devs, key=lambda d: d["free_gb"]) if devs else None
+
+
 def recommend_preset(ram_gb: Optional[float] = None, vram_gb: Optional[float] = None) -> str:
     ram = total_ram_gb() if ram_gb is None else ram_gb
     vram = vram_gb if vram_gb is not None else max((d["vram_gb"] for d in gpu_devices()), default=0)
@@ -448,8 +468,10 @@ class LocalTranslator(LLMTranslator):
     """Способ 2: Gemma 4 на llama.cpp у пользователя на компьютере."""
 
     def __init__(self, preset_id: str = "", use_gpu: bool = True, threads: int = 0,
-                 custom_model: str = "", game_title: str = ""):
+                 custom_model: str = "", game_title: str = "", fit_vram: bool = False):
         self.preset = PRESET_BY_ID.get(preset_id) or PRESET_BY_ID[recommend_preset()]
+        #: живой перевод: игра уже заняла видеопамять — взять модель, которая поместится рядом с ней
+        self.fit_vram = fit_vram
         self.custom_model = Path(custom_model) if custom_model else None
         self.use_gpu = use_gpu
         self.threads = threads
@@ -467,12 +489,43 @@ class LocalTranslator(LLMTranslator):
                 raise TranslatorError(f"Файл модели не найден: {self.custom_model}")
             model = self.custom_model
         else:
+            if self.use_gpu:
+                self._fit_to_vram(status)
             model = install_model(self.preset, status, cancel)
         if self.server is None or self.server.proc is None:
             self.server = LlamaServer(exe, model, use_gpu=self.use_gpu, threads=self.threads)
             self.server.start(status, cancel)
         self.client.base_url = self.server.base_url
         super().prepare(status, cancel)
+
+    def _fit_to_vram(self, status: StatusFn) -> None:
+        """llama.cpp раскладывает модель по свободной видеопамяти на момент запуска: что не влезло,
+        считает процессор — медленно и с полной загрузкой ЦП. В живом переводе игра уже заняла
+        видеопамять, поэтому модель «лучшая» рядом с ней почти вся уходит на процессор."""
+        dev = best_gpu()
+        if dev is None:
+            log.info("Видеокарта для нейросети не найдена — модель %s на процессоре", self.preset.id)
+            return
+        need = vram_need_gb(self.preset)
+        log.info("Видеокарта %s: свободно %.1f из %.1f ГБ, модели %s нужно ~%.1f ГБ",
+                 dev["name"], dev["free_gb"], dev["vram_gb"], self.preset.id, need)
+        if need <= dev["free_gb"]:
+            return
+        if self.fit_vram:
+            fits = [p for p in PRESETS if model_installed(p) and vram_need_gb(p) <= dev["free_gb"]]
+            if fits:
+                best = max(fits, key=vram_need_gb)
+                log.warning("Видеопамять занята игрой (свободно %.1f ГБ): для живого перевода взята модель %s "
+                            "вместо %s", dev["free_gb"], best.id, self.preset.id)
+                status(f"Игра заняла видеопамять — для живого перевода взята модель «{best.title}»", None)
+                self.preset = best
+                self.cache_id = f"llm:{best.id}"
+                return
+        log.warning("Модель %s не помещается в свободную видеопамять (%.1f из %.1f ГБ): часть слоёв будет "
+                    "считать процессор — перевод медленнее, процессор загружен", self.preset.id,
+                    dev["free_gb"], dev["vram_gb"])
+        status("Модель не помещается в свободную видеопамять — часть работы на процессоре, перевод медленнее"
+               + (". Поможет модель полегче" if self.fit_vram else ""), None)
 
     def close(self) -> None:
         if self.server is not None:

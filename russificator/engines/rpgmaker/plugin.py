@@ -70,6 +70,11 @@ class RPGMakerPlugin(EnginePlugin):
         else:
             return ExtractionResult([], warnings=["Версия RPG Maker не определена."])
         for e in entries:
+            if e.max_length:
+                # имя, предмет, вариант выбора, термин: движок сам сжимает надпись по ширине места
+                # (drawText с maxWidth, draw_text в RGSS), окно выбора расширяется под текст —
+                # перевод сокращается переводчиком, но не обрезается «…»
+                e.notes = dict(e.notes or {}, fits_at_runtime=True)
             project.add_entry(e)
         project.meta["rpgmaker_version"] = self.version
         return ExtractionResult(entries, meta={"version": self.version}, warnings=warnings)
