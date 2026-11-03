@@ -18,6 +18,24 @@ from typing import Optional
 _override: Optional[Path] = None
 
 
+def inside(root: Path, rel: str) -> Optional[Path]:
+    """``root / rel``, только если путь остаётся внутри ``root``; иначе None.
+
+    Имена из чужих данных (файлы внутри zip, список отката) не должны выводить запись или удаление
+    за пределы папки: абсолютный путь, диск Windows, «..», ссылка-перенаправление наружу."""
+    if not isinstance(rel, str) or not rel or "\x00" in rel:
+        return None
+    norm = rel.replace("\\", "/")
+    if norm.startswith("/") or ":" in norm or ".." in norm.split("/"):
+        return None
+    try:
+        base = Path(root).resolve()
+        target = (base / norm).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return target if base in target.parents else None
+
+
 def is_frozen() -> bool:
     """Запущены из собранного exe (PyInstaller)."""
     return bool(getattr(sys, "frozen", False))

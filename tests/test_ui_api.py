@@ -200,3 +200,57 @@ def test_library_custom_cover(api, tmp_path, monkeypatch):
     api._window = types.SimpleNamespace(create_file_dialog=lambda *a, **k: [str(tmp_path / "bad.png")])
     r = api.library_cover(str(game))
     assert not r["ok"] and "картинку" in r["error"]
+
+
+def test_switching_model_asks_before_dropping_progress(api, tmp_path):
+    """Сменил модель — программа молча переводила всё заново, прогресс «крутой» модели пропадал.
+    Теперь окно спрашивает: продолжить с переведённым или заново. Тот же способ — без вопроса."""
+    from russificator.core.pipeline import project_dir
+    from russificator.core.universal import Entry, EntryStatus, TranslationProject
+    vn = _renpy(tmp_path / "Library" / "VN")
+    proj = TranslationProject(vn, "renpy", project_dir(vn))
+    proj.entries = [Entry(id="a", source="Hello there.", translation="Привет.", status=EntryStatus.TRANSLATED),
+                    Entry(id="b", source="Bye.")]
+    proj.meta["translator"] = "LocalTranslator:llm:gemma4-12b"
+    proj.save()
+    r = api.progress_check({"game_dir": str(vn), "mode": "local", "local_model": "gemma4-e2b"})
+    assert r["ask"] and r["done"] == 1 and r["total"] == 2
+    assert r["old"] == "нейросеть на ПК (gemma4-12b)" and r["new"] == "нейросеть на ПК (gemma4-e2b)"
+    assert not api.progress_check({"game_dir": str(vn), "mode": "local", "local_model": "gemma4-12b"})["ask"]
+    assert not api.progress_check({"game_dir": str(tmp_path / "nope")})["ask"]
+
+
+def test_friend_archive_numbers_reach_the_window_as_numbers(api, tmp_path, monkeypatch):
+    """package.json чужого архива: «stats.total» с разметкой окно получало как есть (HTML-инъекция в
+    окно программы). Теперь — только числа и строки, а окно ещё и экранирует их."""
+    from russificator.core import package
+    from types import SimpleNamespace
+    info = {"stats": {"total": "<img src=x onerror=alert(1)>", "translated": "5"},
+            "translator": "<b>x</b>", "created": 7, "game": {"engine_title": "Unity"}}
+    fake = SimpleNamespace(info=info, title="<i>T</i>", game=info["game"], engine="unity", close=lambda: None)
+    monkeypatch.setattr(package, "open_package", lambda p: fake)
+    monkeypatch.setattr(package, "find_game", lambda p: [])
+    r = api.import_open(str(tmp_path / "a.zip"))
+    assert r["total"] == 0 and r["translated"] == 5 and isinstance(r["created"], str)
+
+
+def test_without_webview2_program_explains_instead_of_dead_window(tmp_path, monkeypatch):
+    """Без WebView2 Runtime pywebview молча открывал окно в Internet Explorer: без оформления, кнопки
+    мёртвые (Windows 7 из комментариев: «запускается и всё, дальше ничего не работает»). Теперь
+    окно не открывается — вместо него понятное сообщение, что поставить."""
+    import sys
+    if sys.platform != "win32":
+        pytest.skip("окно программы — только Windows")
+    from russificator import unblock
+    from russificator.overlay import win32
+    from russificator.ui import app as ui
+    monkeypatch.setenv("RUSSIFICATOR_HOME", str(tmp_path / "home"))
+    paths.set_home(None)
+    shown = []
+    monkeypatch.setattr(unblock, "ensure_unblocked", lambda: None)
+    monkeypatch.setattr(win32, "single_instance", lambda name: True)
+    monkeypatch.setattr(ui, "_setup_logging", lambda: None)
+    monkeypatch.setattr(ui, "_message", lambda title, text: shown.append((title, text)))
+    monkeypatch.setattr(ui, "_web_engine", lambda: "mshtml")
+    assert ui.run([]) == 1
+    assert shown and "WebView2" in shown[0][1] and "Internet Explorer" in shown[0][1]

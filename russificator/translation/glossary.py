@@ -52,7 +52,10 @@ class GlossaryBuilder:
 
     @staticmethod
     def _looks_like_name(text: str) -> bool:
+        from .lang import cjk_letters, cjk_text
         t = text.strip()
+        if cjk_text(t):                     # имя иероглифами или каной: заглавных букв там нет
+            return cjk_letters(t) <= 12 and not re.search(r"[。、，！？!?.,:;「」『』{}<>\\\[\]]", t)
         if not t or len(t) > 30 or len(t.split()) > 3:
             return False
         if re.search(r"[.!?…,:;\"{}\[\]<>\\]", t) or not t[:1].isupper():

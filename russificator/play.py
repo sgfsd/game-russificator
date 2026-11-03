@@ -37,14 +37,15 @@ def _setup_logging(name: str = "play.log") -> None:
     root.setLevel(logging.INFO)
 
 
-def _options(cfg: Dict[str, Any], fast: bool = False) -> Optional[Dict[str, Any]]:
+def _options(cfg: Dict[str, Any], fast: bool = False, lang: str = "en") -> Optional[Dict[str, Any]]:
     """Настройки переводчика для живого перевода (с запасным машинным переводом) или None.
-    ``fast`` — доводка словаря русифицированной игры: только быстрый переводчик."""
+    ``fast`` — доводка словаря русифицированной игры: только быстрый переводчик. ``lang`` — язык
+    оригинала игры: машинный переводит только с английского, японскую игру переводит только нейросеть."""
     from .translation import local_llm, machine
     from .translation.cloud import PROVIDERS
     opts = dict(cfg)
     mode = cfg.get("mode") or "machine"
-    if fast and mode != "machine" and machine.is_installed():
+    if fast and mode != "machine" and machine.is_installed() and lang == "en":
         # на лету переводится только то, чего нет в словаре, и игрок ждёт этот перевод на экране:
         # машинный отвечает за доли секунды, нейросеть — за секунды (на слабой видеокарте 3–5 с на
         # строку, плюс загрузка модели). Найденные строки при следующей русификации переводятся
@@ -67,7 +68,7 @@ def _options(cfg: Dict[str, Any], fast: bool = False) -> Optional[Dict[str, Any]
                                                   or (preset and local_llm.model_installed(preset))):
             log.info("локальная нейросеть не установлена — живой перевод машинный")
             mode = "machine"
-    if mode == "machine" and not machine.is_installed():
+    if mode == "machine" and (not machine.is_installed() or lang != "en"):
         return None
     opts["mode"] = mode
     opts["local_fit_vram"] = True    # живой перевод: игра уже заняла видеопамять — модель по свободному месту
@@ -114,7 +115,18 @@ def _running(exe: Path) -> bool:
 LIVE_PORT = 47631   # = engines.unity.xunity.LIVE_PORT (здесь без импорта движка — быстрее старт)
 
 
-def _factory(game_title: str):
+def _source_lang(game_dir: Path) -> str:
+    """Язык оригинала игры из её проекта перевода (en, если проекта нет)."""
+    import json
+    from .core.pipeline import project_dir
+    try:
+        meta = json.loads((project_dir(game_dir) / "project.json").read_text(encoding="utf-8")).get("meta") or {}
+        return str(meta.get("source_lang") or "en")
+    except (OSError, ValueError, AttributeError):
+        return "en"
+
+
+def _factory(game_title: str, lang: str = "en"):
     """Создать переводчик и память (в фоне, уже после открытия порта)."""
     def make():
         import threading
@@ -122,10 +134,13 @@ def _factory(game_title: str):
         from .translation.memory import TranslationMemory
         cfg = settings.load()
         settings.apply_data_dir(cfg)
-        opts = _options(cfg, fast=True)
+        opts = _options(cfg, fast=True, lang=lang)
         if opts is None:
-            raise RuntimeError("ни один переводчик не установлен — живой перевод недоступен")
+            raise RuntimeError("ни один переводчик не установлен — живой перевод недоступен"
+                               if lang == "en" else "игра не на английском, а нейросеть не выбрана — "
+                               "живой перевод недоступен")
         translator = create_translator(opts["mode"], opts, game_title)
+        translator.source_lang = lang
         translator.prepare(lambda m, f=None: None, threading.Event())
         log.info("живой перевод: %s", opts["mode"])
         try:
@@ -142,7 +157,7 @@ def start_server(game_dir: Path):
     from .translation.live_server import LiveServer
     server = LiveServer(None, None)
     try:
-        server.start(LIVE_PORT, factory=_factory(Path(game_dir).name))
+        server.start(LIVE_PORT, factory=_factory(Path(game_dir).name, _source_lang(Path(game_dir))))
     except OSError:
         log.info("порт %d занят — живой перевод уже запущен", LIVE_PORT)
         return None

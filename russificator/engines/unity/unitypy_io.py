@@ -14,9 +14,10 @@ import contextlib
 import gc
 import os
 import struct
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 #: версия Unity игры (из :func:`use_game_version`): по ней находятся и длинные ключи защиты бандлов
 _GAME_VERSION = ""
@@ -117,29 +118,56 @@ def fix_script_type_index() -> None:
     _patched = True
 
 
-def object_table(env) -> dict:
-    """Таблица объектов сохраняемого файла: (номер файла в бандле, path_id) -> (class_id, type_id,
-    номер скрипта) — для сверки после сохранения.
+def own_files(env) -> list:
+    """Файлы ассетов, которые сохранит ``env.file.save()``: сам файл и файлы внутри него, если это
+    бандл (``data.unity3d`` — все сцены игры сразу), в постоянном порядке.
 
-    Только сам файл (``env.file`` и файлы внутри него, если это бандл): пока читаются скрипты
-    объектов, UnityPy подгружает в окружение соседние файлы игры, а их path_id пересекаются с path_id
-    этого файла."""
-    out = {}
+    Номера объектов (path_id) уникальны только внутри одного такого файла: у разных сцен бандла они
+    совпадают. Соседние файлы игры, которые UnityPy подгружает, пока читает скрипты объектов, сюда
+    не входят — их path_id тоже пересекаются с path_id этого файла."""
+    out = []
     stack = [getattr(env, "file", None)]
-    n = 0
     while stack:
         f = stack.pop(0)
-        objects = getattr(f, "objects", None)
-        if isinstance(objects, dict):
-            own = getattr(f, "_russificator_script_index", None) or {}
-            for pid, obj in objects.items():
-                st = obj.serialized_type
-                out[(n, pid)] = (obj.class_id, obj.type_id,
-                                 own.get(pid, st.script_type_index if st is not None else None))
-            n += 1
+        if isinstance(getattr(f, "objects", None), dict):
+            out.append(f)
         files = getattr(f, "files", None)
         if isinstance(files, dict):
             stack.extend(files.values())
+    return out
+
+
+def file_numbers(env) -> Dict[int, int]:
+    """id(файл ассетов) -> его номер в :func:`own_files` — ключ объекта ``(номер, path_id)`` один и тот
+    же до сохранения и после перечитывания сохранённого."""
+    return {id(f): n for n, f in enumerate(own_files(env))}
+
+
+def own_objects(env) -> Dict[Tuple[int, int], object]:
+    """(номер файла в бандле, path_id) -> объект, только для объектов сохраняемого файла."""
+    return {(n, pid): obj for n, f in enumerate(own_files(env)) for pid, obj in f.objects.items()}
+
+
+def local_object(obj, pptr: Optional[dict]):
+    """Объект по ссылке PPtr из ``obj``: только ссылка внутри того же файла ассетов (m_FileID 0),
+    иначе None. Искать по одному path_id во всём окружении нельзя — в бандле со многими сценами
+    найдётся чужой объект с тем же номером (текстовый ассет вместо атласа шрифта)."""
+    if not isinstance(pptr, dict) or int(pptr.get("m_FileID", 0)) != 0:
+        return None
+    objects = getattr(getattr(obj, "assets_file", None), "objects", None)
+    return objects.get(int(pptr.get("m_PathID", 0))) if isinstance(objects, dict) else None
+
+
+def object_table(env) -> dict:
+    """Таблица объектов сохраняемого файла (:func:`own_files`): (номер файла в бандле, path_id) ->
+    (class_id, type_id, номер скрипта) — для сверки после сохранения."""
+    out = {}
+    for n, f in enumerate(own_files(env)):
+        own = getattr(f, "_russificator_script_index", None) or {}
+        for pid, obj in f.objects.items():
+            st = obj.serialized_type
+            out[(n, pid)] = (obj.class_id, obj.type_id,
+                             own.get(pid, st.script_type_index if st is not None else None))
     return out
 
 
@@ -173,6 +201,10 @@ def open_env(src):
         lay = layout(Path(src))
         if lay is not None and not lay.plain:
             src = decode(Path(src).read_bytes(), lay)
+        elif Path(src).suffix.lower() in (".zip", ".apk") and not zipfile.is_zipfile(src):
+            # UnityPy открывает путь «*.zip» как zip-архив, а это бандл с таким именем (Mad Island:
+            # StreamingAssets/dlc_00.zip — «File is not a zip file», текст в нём не переводился)
+            src = Path(src).read_bytes()
     return UnityPy.load(str(src) if isinstance(src, Path) else src)
 
 
@@ -284,6 +316,20 @@ def decode(data: bytes, lay: Layout) -> bytes:
         _xor(buf, lay.key)
         return bytes(buf)
     return data[lay.offset:]
+
+
+def save_env(env) -> bytes:
+    """``env.file.save()``. Несжатый бандл UnityPy пишет одним блоком, а размер блока в заголовке —
+    32 бита: бандл больше 4 ГБ не сохранялся («'I' format requires 0 <= number <= 4294967295» —
+    defaultlocalgroup_assets_all в Demonic Mahjong, шрифты остались без кириллицы). Такой бандл
+    сохраняется сжатым LZ4 блоками по 128 КБ — как его пишет сама Unity."""
+    f = env.file
+    try:
+        return f.save()
+    except struct.error:
+        if getattr(f, "signature", "") != "UnityFS":
+            raise
+        return f.save(packer="lz4")
 
 
 def as_stored(path: Path, data: bytes) -> bytes:

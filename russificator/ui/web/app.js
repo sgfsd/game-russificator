@@ -121,7 +121,16 @@ async function checkUpdate(force) {
 /* ---------------- навигация ---------------- */
 
 function showPage(name) {
-  if (S.running && name !== "run") name = name === "main" ? "run" : name;
+  // идёт русификация — «Русификация» показывает её ход; закончилась или остановлена — снова выбор
+  // игры и способа перевода (раньше страница результата не отпускала, пока не нажмёшь «Готово»:
+  // окно выбора подключения и модели было не найти до перезапуска программы)
+  if (S.running && name === "main") {
+    if (S.inRun) name = "run";
+    else {
+      S.running = false;
+      if (S.game) detectGame(S.game.path, true);
+    }
+  }
   $$(".page").forEach((p) => p.classList.toggle("active", p.id === "page-" + name));
   $$(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.page === name || (name === "run" && b.dataset.page === "main")));
   if (name === "models") renderModels();
@@ -158,6 +167,15 @@ function bindUi() {
   // облако
   $("#cloudUrl").addEventListener("change", () => saveCloud());
   $("#cloudModel").addEventListener("change", () => saveCloud());
+  $("#cloudModel").addEventListener("input", markModelPick);
+  $("#modelPick").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-model]");
+    if (!b) return;
+    e.preventDefault();
+    $("#cloudModel").value = b.dataset.model;
+    markModelPick();
+    saveCloud();
+  });
   $("#cloudKey").addEventListener("change", storeKey);
   $("#rememberKey").addEventListener("change", storeKey);
   $("#toggleKey").addEventListener("click", () => {
@@ -174,6 +192,9 @@ function bindUi() {
 
   // запуск
   $("#startBtn").addEventListener("click", start);
+  $("#previewBtn").addEventListener("click", () => openPreview(0));
+  $("#pvAgain").addEventListener("click", () => openPreview((S.pvRound || 0) + 1));
+  $("#pvGo").addEventListener("click", () => { $("#previewModal").classList.add("hidden"); start(); });
   $("#restoreBtn").addEventListener("click", () => restoreGame(S.game && S.game.path));
   $("#stopBtn").addEventListener("click", () => {
     api().cancel_task();
@@ -371,6 +392,7 @@ async function loadHardware() {
   let text = `ОЗУ ${Math.round(S.hw.ram_gb)} ГБ`;
   if (g.length) text += " · " + g.map((x) => `${x.name} (${Math.round(x.vram_gb)} ГБ)`).join(", ");
   else if (!S.hw.gpu_known) text += " · видеокарта определится после установки движка нейросети";
+  else if (S.hw.gpu_error) text += " · видеокарту не удалось опросить (" + S.hw.gpu_error + ") — нейросеть будет работать на процессоре";
   else text += " · видеокарта не найдена — нейросеть будет работать на процессоре";
   $("#hwText").textContent = "Ваш ПК: " + text;
   if (!S.preset) S.preset = S.hw.recommended;
@@ -441,6 +463,7 @@ function applyProvider(id, fromSettings = false) {
   $("#keyLink").textContent = p.needs_key ? "где взять ключ" : "сайт";
   $("#providerNote").textContent = p.note || "";
   $("#modelList").innerHTML = "";
+  renderModelPick([]);
   $("#modelHint").textContent = "Нажмите ⟳, чтобы загрузить актуальный список моделей провайдера.";
   $("#testResult").textContent = "";
   $$(".prov").forEach((b) => b.classList.toggle("active", b.dataset.prov === id));
@@ -478,9 +501,28 @@ async function refreshModels() {
     $("#cloudModel").value = r.models[0];
     saveCloud();
   }
-  $("#modelHint").textContent = r.models.length
-    ? `Доступно моделей: ${r.models.length}. Рекомендуем: ${r.models.slice(0, 3).join(", ")}`
-    : "Провайдер не вернул список моделей — впишите имя вручную.";
+  renderModelPick(r.models);
+  const n = r.models.length;
+  $("#modelHint").textContent = !n ? "Провайдер не вернул список моделей — впишите имя вручную."
+    : n <= MODEL_PICKS ? `Доступно моделей: ${n}, подходящие для перевода — первыми.`
+      : `Доступно моделей: ${n}. Здесь ${MODEL_PICKS} подходящих для перевода, остальные — начните вводить имя в поле.`;
+}
+
+// Модели провайдера кнопками: подсказки поля фильтруются по уже вписанному имени, и выбрав одну
+// модель, остальные было не увидеть (LM Studio: «из четырёх моделей выбрать дало только две»)
+const MODEL_PICKS = 12;
+
+function renderModelPick(models) {
+  const box = $("#modelPick");
+  box.innerHTML = models.slice(0, MODEL_PICKS).map((m) =>
+    `<button type="button" class="mpick" data-model="${esc(m)}">${esc(m)}</button>`).join("");
+  box.classList.toggle("hidden", !models.length);
+  markModelPick();
+}
+
+function markModelPick() {
+  const cur = $("#cloudModel").value.trim();
+  $$("#modelPick [data-model]").forEach((b) => b.classList.toggle("active", b.dataset.model === cur));
 }
 
 async function testCloud() {
@@ -519,11 +561,58 @@ function updateRunState() {
   }
   $("#runHint").textContent = hint;
   $("#startBtn").disabled = !can;
+  $("#previewBtn").disabled = !can || S.busy;
   $("#restoreBtn").disabled = !(S.game && S.game.russified) || S.busy;
   const exp = $("#exportBtn");
   exp.disabled = !(S.game && S.game.can_export) || S.busy;
   exp.title = S.game && !S.game.can_export && S.game.export_reason ? S.game.export_reason
     : "Архив с установщиком — отправьте другу";
+}
+
+/* Пробный перевод: 20 строк из разных мест игры выбранным способом — до полного перевода. */
+async function openPreview(round) {
+  if (!S.game) return;
+  await storeKey();
+  S.pvRound = round;
+  $("#pvGame").textContent = "«" + S.game.name + "»";
+  $("#pvBody").innerHTML = "";
+  const box = $("#pvProgress");
+  box.classList.remove("hidden");
+  box.querySelector(".dl-text").textContent = "Ищу текст игры…";
+  $("#pvAgain").disabled = $("#pvGo").disabled = true;
+  $("#previewModal").classList.remove("hidden");
+  const opts = {
+    game_dir: S.game.path, mode: S.mode, local_model: S.preset || "", local_gpu: $("#useGpu").checked,
+    cloud_provider: S.provider, cloud_base_url: $("#cloudUrl").value.trim(), cloud_model: $("#cloudModel").value.trim(),
+    api_key: $("#cloudKey").value.trim(), round,
+  };
+  const r = await api().preview(opts);
+  if (!r.ok) {
+    box.classList.add("hidden");
+    $("#pvAgain").disabled = $("#pvGo").disabled = false;
+    $("#pvBody").innerHTML = `<div class="msg e">${icon("x-circle")}<span>${esc(r.error)}</span></div>`;
+    return;
+  }
+  S.busy = true;
+  updateRunState();
+}
+
+const lowerFirst = (s) => (s || "").replace(/^./, (c) => c.toLowerCase());
+
+function onPreviewDone(ev) {
+  S.busy = false;
+  updateRunState();
+  $("#pvProgress").classList.add("hidden");
+  $("#pvAgain").disabled = $("#pvGo").disabled = false;
+  if (!ev.ok) {
+    $("#pvBody").innerHTML = `<div class="msg e">${icon("x-circle")}<span>${esc(ev.error)}</span></div>`;
+    return;
+  }
+  const lang = ev.lang && ev.lang !== "en" ? " · язык игры: " + esc(ev.lang_name) : "";
+  const head = `<div class="msg n">${icon("search")}<span>${esc(ev.translator)}${lang}. Найдено: ${esc(lowerFirst(ev.found))}</span></div>`;
+  const rows = (ev.pairs || []).map((p) => `<tr><td>${esc(p.source)}</td><td>${p.translation ? esc(p.translation)
+    : `<span class="muted">не перевелось: ${esc(p.problem)}</span>`}</td></tr>`).join("");
+  $("#pvBody").innerHTML = head + `<table class="pv-table"><thead><tr><th>Оригинал</th><th>Перевод</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 async function start() {
@@ -535,9 +624,23 @@ async function start() {
     api_key: $("#cloudKey").value.trim(), reuse: !!(S.game.russified && S.game.intact === false) || !!S.reuseNext,
   };
   S.reuseNext = false;
+  if (!opts.reuse) {
+    // игра уже переводилась другим способом или моделью — не стирать переведённое молча
+    const pc = await api().progress_check(opts);
+    if (pc && pc.ask) {
+      const pick = await choiceBox("У этой игры уже есть перевод",
+        `Переведено ${pc.done} из ${pc.total} строк, способ — ${pc.old}. Сейчас выбран другой: ${pc.new}. ` +
+        "«Продолжить» — готовые строки останутся, новым способом переведутся только оставшиеся. " +
+        "«Перевести всё заново» — весь текст переведётся новым способом.",
+        "Перевести всё заново", "Продолжить");
+      if (!pick) return;
+      opts.reuse = pick === "main";
+    }
+  }
   const r = await api().start(opts);
   if (!r.ok) return toast(r.error, true);
   S.running = true;
+  S.inRun = true;
   S.busy = true;
   S.stage = null;
   $("#runGame").textContent = S.game.name;
@@ -623,8 +726,11 @@ window.onBackendEvent = (ev) => {
     case "export_done": onExportDone(ev); break;
     case "coverage": onCoverageProgress(ev); break;
     case "coverage_done": onCoverageDone(ev); break;
+    case "preview_status": $("#pvProgress .dl-text").textContent = ev.message; break;
+    case "preview_done": onPreviewDone(ev); break;
     case "task_error": {
       S.busy = false;
+      S.inRun = false;
       toast(ev.message, true);
       updateRunState();
       break;
@@ -634,6 +740,7 @@ window.onBackendEvent = (ev) => {
 
 function finishRun(ev) {
   S.busy = false;
+  S.inRun = false;
   const ok = ev.success;
   const errs = ev.errors || [];
   if (S.game && ev.injected) {
@@ -657,10 +764,13 @@ function finishRun(ev) {
     ? "Запускайте игру. Если что-то не так — откат вернёт всё как было."
     : ev.cancelled ? "Прогресс перевода сохранён — при следующем запуске продолжим с того же места."
       : "Игра не изменена. Подробности ниже и в журнале.";
+  const num = (v) => (v ?? 0).toLocaleString("ru-RU");
   $("#resultStats").innerHTML = st.total ? [
-    ["Строк найдено", st.total], ["Переведено", st.translated], ["Из памяти", st.memory || 0], ["Не переведено", st.failed],
-  ].map(([t, v]) => `<div class="stat"><b>${v ?? 0}</b><span>${t}</span></div>`).join("") : "";
+    ["Строк найдено", st.total], ["Слов", st.words], ["Переведено", st.translated], ["Из памяти", st.memory || 0],
+    ["Не переведено", st.failed],
+  ].filter(([t, v]) => t !== "Слов" || v).map(([t, v]) => `<div class="stat"><b>${esc(num(v))}</b><span>${t}</span></div>`).join("") : "";
   const msgs = [
+    ...(ev.found ? [["n", "search", "Найдено: " + lowerFirst(ev.found)]] : []),
     ...errs.map((m) => ["e", "x-circle", m]),
     ...(ev.instructions || []).map((m) => ["n", "info", m]),
     ...(ev.warnings || []).slice(0, 12).map((m) => ["w", "alert", m]),
@@ -1035,6 +1145,10 @@ function openGame(g, fresh = false) {
   if (g.russified && g.engine === "unity") links.push(["link", "Ярлык на рабочий стол", "shortcut"]);
   if (g.engine === "unity" && (g.russified || g.live)) links.push(["search", "Полнота перевода", "coverage"]);
   if (g.russified) links.push(["copy", "Скопировать отчёт о переводе", "trreport"]);
+  if (g.russified || g.total) {
+    links.push(["database", "Таблица перевода", "table"]);
+    links.push(["pen", "Загрузить исправления", "tableimport"]);
+  }
   links.push(["image", "Сменить обложку", "cover"]);
   if (g.cover_custom) links.push(["undo", "Обычная обложка", "cover_reset"]);
   if (g.hidden) {
@@ -1074,6 +1188,17 @@ async function gameAction(act, g) {
     const r = await api().translation_report(g.path);
     if (!r || !r.ok) toast((r && r.error) || "Не получилось собрать отчёт", true);
     else await copyText(r.text, "Отчёт о переводе скопирован — вставьте его в чат");
+  } else if (act === "table") {
+    const r = await api().table_export(g.path);
+    if (!r || !r.ok) toast((r && r.error) || "Таблица не выгружена", true);
+    else toast(`Таблица перевода (${r.rows} строк) и словарь терминов (${r.terms}) — в папке ${r.table.replace(/[\\/][^\\/]*$/, "")}. Открываются в Excel`);
+  } else if (act === "tableimport") {
+    const r = await api().table_import(g.path);
+    if (!r || r.cancelled) return;
+    if (!r.ok) toast(r.error || "Таблица не загружена", true);
+    else toast(r.terms ? `Термины загружены: ${r.terms}. Нажмите «Русифицировать» — они заменятся во всём переводе`
+                       : `Исправлено строк: ${r.translations}` + (r.broken ? ` (пропущено с потерянной разметкой: ${r.broken})` : "")
+                         + ". Нажмите «Русифицировать» — исправления лягут в игру");
   } else if (act === "live") {
     close();
     showPage("live");
@@ -1248,7 +1373,7 @@ async function openImport(path) {
   const r = await api().import_open(path || "");
   if (!r.ok) { if (r.error) toast(r.error, true); return; }
   S.imp = { path: r.path, game: r.game };
-  $("#imInfo").innerHTML = `<b>${esc(r.title)}</b> · ${esc(r.engine)}` + (r.total ? ` · переведено ${r.translated} из ${r.total} строк` : "") +
+  $("#imInfo").innerHTML = `<b>${esc(r.title)}</b> · ${esc(r.engine)}` + (r.total ? ` · переведено ${esc(r.translated)} из ${esc(r.total)} строк` : "") +
     (r.translator ? ` · ${esc(r.translator)}` : "") + (r.created ? `<br><span class="small">создан ${esc(r.created)}</span>` : "");
   $("#imGame").textContent = r.game || "Игра не найдена — укажите папку";
   setImportCheck(!!r.game, r.exact, r.game ? r.check : "Нажмите «Изменить…» и выберите папку игры (где её .exe).");
@@ -1389,6 +1514,27 @@ async function copyReport(e) {
 
 /* ---------------- мелочи ---------------- */
 
+// Выбор из двух действий: "main" | "alt"; закрыли окно — null
+function choiceBox(title, text, altLabel, mainLabel) {
+  return new Promise((resolve) => {
+    const m = $("#choiceModal");
+    $("#choiceTitle").textContent = title;
+    $("#choiceText").textContent = text;
+    for (const [id, label, value] of [["#choiceAlt", altLabel, "alt"], ["#choiceMain", mainLabel, "main"]]) {
+      const old = $(id);
+      const b = old.cloneNode(false);
+      b.textContent = label;
+      old.replaceWith(b);
+      b.addEventListener("click", () => { m.classList.add("hidden"); done(value); });
+    }
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    const watch = new MutationObserver(() => { if (m.classList.contains("hidden")) { watch.disconnect(); done(null); } });
+    watch.observe(m, { attributes: true, attributeFilter: ["class"] });
+    m.classList.remove("hidden");
+  });
+}
+
 function confirmBox(title, text, onOk) {
   $("#confirmTitle").textContent = title;
   $("#confirmText").textContent = text;
@@ -1438,7 +1584,7 @@ function renderCoverage(rep, missed) {
   if (rep && rep.file) S.cov.file = rep.file;
   if (!rep) {
     box.innerHTML = missed
-      ? `<div class="msg n">${icon("info")}<span>Во время игры найдено строк, которых не было в словаре: <b>${missed}</b>. Нажмите «Проверить» — программа найдёт, где каждая лежит в файлах игры (займёт столько же, сколько русификация).</span></div>`
+      ? `<div class="msg n">${icon("info")}<span>Во время игры найдено строк, которых не было в словаре: <b>${esc(missed)}</b>. Нажмите «Проверить» — программа найдёт, где каждая лежит в файлах игры (займёт столько же, сколько русификация).</span></div>`
       : `<div class="msg n">${icon("info")}<span>Пока пусто: во время игры живому переводу ещё ничего не досталось. Поиграйте с русификацией (живой перевод включается сам) и зайдите сюда снова — здесь появится всё, что игра показала, а заранее найдено не было.</span></div>`;
     return;
   }
@@ -1449,8 +1595,8 @@ function renderCoverage(rep, missed) {
   const items = rep.items || [];
   const kinds = rep.kinds || {};
   const sum = Object.keys(kinds).filter((k) => rep.counts[k])
-    .map((k) => `<span class="chip">${esc(kinds[k].title)}: ${rep.counts[k]}</span>`).join("");
-  let html = `<div class="muted small">Проверено ${esc(rep.date)}. Строк, которых не было в словаре: <b>${rep.total}</b>.</div><div class="cov-sum">${sum}</div>`;
+    .map((k) => `<span class="chip">${esc(kinds[k].title)}: ${esc(rep.counts[k])}</span>`).join("");
+  let html = `<div class="muted small">Проверено ${esc(rep.date)}. Строк, которых не было в словаре: <b>${esc(rep.total)}</b>.</div><div class="cov-sum">${sum}</div>`;
   for (const k of Object.keys(kinds)) {
     const group = items.filter((m) => m.kind === k);
     if (!group.length) continue;

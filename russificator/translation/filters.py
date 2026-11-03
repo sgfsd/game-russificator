@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 
+from .lang import cjk_letters, cjk_text
 from .markup import has_words, is_cyrillic, plain_compound, plain_text
 
 #: полноширинные знаки (U+FF01–FF5E) и пробел/запятая/точка CJK -> обычные
@@ -88,6 +89,8 @@ def looks_translatable(text: str, strict: bool = False) -> bool:
         return False
     if _measurement(s):
         return False  # «1920 x 1080 @ 50Hz», «60 FPS», «x 1080» — числа и единицы, переводить нечего
+    if cjk_text(plain_text(s)):
+        return _cjk_translatable(s, strict)
     # полноширинные знаки китайской раскладки («WorkBench：Cultivate») — как знак и пробел: в коде их не
     # пишут, это текст, и строка из них — не один «идентификатор»
     spaced = _FULLWIDTH_PUNCT_RE.sub(lambda m: halfwidth(m.group(0)) + " ", s).strip()
@@ -129,15 +132,43 @@ def looks_translatable(text: str, strict: bool = False) -> bool:
     return True
 
 
+#: путь с латинской папкой или расширением («img/pictures/立ち絵», «背景01.png», «Sound\効果音»)
+_CJK_PATH_RE = re.compile(r"(?:^|[\\/])[A-Za-z0-9_\-.]+[\\/]|\.[A-Za-z0-9]{1,5}$")
+_CJK_CODE_RE = re.compile(r"[;{}]\s*$|==|!=|&&|\|\||=>|::")
+
+
+def _cjk_translatable(s: str, strict: bool) -> bool:
+    """Строка иероглифами, каной или хангылем. Слова в них пишутся без пробелов, так что «одно слово»
+    латиницы тут не мерило: не текст — только путь или файл, идентификатор с «_» и код. «はい/いいえ»
+    и «ポーション(小)» — надписи."""
+    tok = s.strip()
+    if not re.search(r"\s", tok) and ("_" in tok or ("/" in tok or "\\" in tok) and _CJK_PATH_RE.search(tok)
+                                      or _FILE_RE.match(tok)):
+        return False
+    return not (strict and _CJK_CODE_RE.search(s))
+
+
 _SYSLOG_RE = re.compile(r"^[\w\-./]+\[\d+\]:")                      # systemd[1]: …, CRON[6043]: …
 _UNIX_PATH_RE = re.compile(r"(?:^|[\s(\"'=])/(?:[\w.\-]+/)+[\w.\-]*")  # /opt/psa/admin/…
+#: путь Windows или объекта редактора с пробелами в папках: «\SoundBanks\Default Work Unit\UISFX\Bank»,
+#: «E:\Project\.cache\14\{148EB…}.wem» (описания банков звука Wwise) — одним словом их не поймать.
+#: Путь — вся строка или целое поле таблицы (после табуляции), папки — без скобок, «*», «|» и знаков
+#: препинания: иначе за путь сойдёт реплика с кодами RPG Maker («do I look \c[23]red\c[0] or \c[23]human»,
+#: «\fbspace bar\fb or the \fbmouse\fb!», «\{\{\{the attic», паузы «\.S\.o\.m\.e») или со строками через «\n»
+#: («\nSie wird…\n Dieses»). Папка с точки — только «.cache»-подобная, от трёх букв
+_WIN_PATH_RE = re.compile(r"(?:^|\t)(?:[A-Za-z]:)?\\(?:(?![nrt][A-Z])(?:\w|\.\w{3})[\w .()\-]*\\){2,}"
+                          r"[^\\\t\n!?,;\"<>|*\[\]]*(?=\t|$)")
 _SHELL_RE = re.compile(r"&&|>\s*/dev/null|2>&1|\$\(")
+#: код символа: справочник Unicode в ресурсах игры («⊒  U+2292 (alt-08850)  SQUARE ORIGINAL OF…»)
+_CODEPOINT_RE = re.compile(r"\bU\+[0-9A-Fa-f]{4,6}\b")
 
 
 def looks_technical(text: str) -> bool:
-    """Журналы, пути и команды, которые игра показывает «как есть» (терминал хакера и т.п.)."""
+    """Журналы, пути, команды и коды символов, которые игра показывает «как есть» (терминал хакера и т.п.)
+    или не показывает вовсе (справочник Unicode разработчиков)."""
     s = (text or "").strip()
-    return bool(_SYSLOG_RE.match(s) or _UNIX_PATH_RE.search(s) or _SHELL_RE.search(s))
+    return bool(_SYSLOG_RE.match(s) or _UNIX_PATH_RE.search(s) or _SHELL_RE.search(s) or _CODEPOINT_RE.search(s)
+                or _WIN_PATH_RE.search(s))
 
 
 def looks_spoken(text: str) -> bool:
@@ -155,9 +186,17 @@ def is_name_word(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Z][a-z]{2,}", s)) and bool(re.search(r"[aeiouy]", s[1:]))
 
 
+#: конец фразы китайского и японского письма
+_CJK_SENTENCE_END = re.compile(r"[。！？…」』!?.]$")
+
+
 def looks_like_sentence(text: str) -> bool:
-    """Фраза из нескольких слов — точно текст, даже в strict-режиме."""
+    """Фраза из нескольких слов — точно текст, даже в strict-режиме. Иероглифами и каной слова пишутся
+    без пробелов: там фраза — от четырёх знаков или от двух с концом фразы («はい。»)."""
     s = plain_text(text).strip()
+    if cjk_text(s):
+        n = cjk_letters(s)
+        return n >= 4 or (n >= 2 and bool(_CJK_SENTENCE_END.search(s)))
     words = re.findall(r"[A-Za-z']+", s)
     return len(words) >= 3 or (len(words) >= 2 and bool(_SENTENCE_END.search(s)))
 
@@ -173,9 +212,28 @@ _BRANDS = re.compile(r"(?i)^(?:made with|powered by|created with|built with|a ga
                      r"facebook|bluesky|ko-?fi|tumblr|github|gog(?:\.com)?|boosty|telegram|vk|x\.com)?\s*[™®©]?$")
 
 
+#: названия языков на них самих — пункты выбора языка. Их не переводят и сами игры, а код игры бывает узнаёт
+#: язык по надписи: в Demonic Mahjong после «English» → «Английский» выбор языка при первом запуске не
+#: срабатывал, и игра не начиналась
+_LANGUAGE_NAMES = {s.casefold() for s in (
+    "English", "English (US)", "English (UK)", "Español", "Español (España)", "Español (Latinoamérica)",
+    "Español latinoamericano", "Deutsch", "Français", "Italiano", "Português", "Português (Brasil)",
+    "Português do Brasil", "Polski", "Türkçe", "Nederlands", "Svenska", "Norsk", "Dansk", "Suomi", "Čeština",
+    "Magyar", "Română", "Ελληνικά", "Bahasa Indonesia", "Tiếng Việt", "ไทย", "日本語", "한국어", "简体中文",
+    "繁體中文", "繁体中文", "簡体中文", "中文", "Русский", "Українська", "العربية", "עברית")}
+
+
+def is_language_name(text: str) -> bool:
+    """Строка — название языка на нём самом («English», «Deutsch», «日本語»): пункт выбора языка."""
+    return re.sub(r"\s+", " ", (text or "").strip()).casefold() in _LANGUAGE_NAMES
+
+
 def is_brand(text: str) -> bool:
-    """Строка — название движка, площадки или соцсети («Made with Unity», «Discord», «Patreon»)."""
+    """Строка — название движка, площадки или соцсети («Made with Unity», «Discord», «Patreon») или языка
+    в выборе языка («English», «日本語»)."""
     t = re.sub(r"\s+", " ", (text or "").strip())
+    if is_language_name(t):
+        return True
     return bool(t) and bool(_BRANDS.match(t)) and bool(re.search(r"[A-Za-z]{3,}", t))
 
 

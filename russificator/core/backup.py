@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .. import paths
+
 BACKUP_DIR = "russificator_backup"
 MANIFEST = "manifest.json"
 
@@ -53,12 +55,23 @@ class GameBackup:
     def _load(self) -> None:
         try:
             data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-            self.modified = dict(data.get("modified", {}))
-            self.created = list(data.get("created", []))
-            self.snapshot_state = dict(data.get("snapshot", {}))
+            modified = data.get("modified", {})
+            created = data.get("created", [])
+            self.modified = {rel: str(sha) for rel, sha in dict(modified).items() if self._safe(rel)}
+            self.created = [rel for rel in list(created) if self._safe(rel)]
+            self.snapshot_state = {rel: v for rel, v in dict(data.get("snapshot", {})).items() if self._safe(rel)}
             self.info = dict(data.get("info", {}))
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError, AttributeError):
             pass
+
+    def _safe(self, rel) -> bool:
+        """Путь из списка отката — файл внутри папки игры, но не в самой папке бэкапа. Список лежит в
+        папке игры, его можно подделать: путь с «..» или абсолютный при откате удалил бы или
+        перезаписал чужой файл — такие записи отбрасываются."""
+        if paths.inside(self.game_dir, rel) is None:
+            return False
+        first = rel.replace("\\", "/").split("/", 1)[0]
+        return first.lower() != BACKUP_DIR
 
     def _save(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -82,6 +95,13 @@ class GameBackup:
         """Файл сам или одна из его папок создан русификатором."""
         parts = rel.split("/")
         return any("/".join(parts[:i]) in self.created for i in range(1, len(parts) + 1))
+
+    def is_ours(self, path: Path) -> bool:
+        """Файл или папка создан русификатором, а не был в игре до него."""
+        try:
+            return self._created_by_us(self._rel(Path(path)))
+        except ValueError:                       # не в папке игры
+            return False
 
     def save_original(self, path: Path) -> None:
         """Сохранить оригинал файла перед первой правкой (повторные вызовы — no-op)."""

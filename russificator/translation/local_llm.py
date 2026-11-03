@@ -30,7 +30,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .. import net, paths
 from .base import StatusFn, TranslatorError, _noop
@@ -41,6 +41,13 @@ log = logging.getLogger("russificator.local_llm")
 #: проверенная сборка llama.cpp; если её когда-нибудь удалят — берём свежую из релизов
 LLAMA_BUILD = "b11147"
 LLAMA_REPO = "ggml-org/llama.cpp"
+#: SHA-256 и размер архивов проверенной сборки (digest релиза на GitHub): llama.cpp — исполняемый код,
+#: архив принимается только целым и неподменённым, в том числе с зеркал GitHub
+LLAMA_PINS = {
+    "bin-win-vulkan-x64.zip": ("55058706491ecc2a33c0bb3d24400ebda341965d89bfa4b975dc9c68e7f37d35", 32126894),
+    "bin-win-cpu-x64.zip": ("b6776a3bfd46ac027d177782e80260c196ed069698e9a80c5d2c4bf62eb7a219", 18560059),
+    "bin-win-cpu-arm64.zip": ("b4d004f40bb56ef1318409c08cbaea4b64658efc43b77de50d5da2f26ecb5599", 12034418),
+}
 
 
 @dataclass(frozen=True)
@@ -108,20 +115,103 @@ def total_ram_gb() -> float:
 
 
 def gpu_devices() -> List[dict]:
-    """Видеокарты, которые видит llama.cpp (нужен установленный рантайм)."""
+    """Видеокарты, которые видит llama.cpp (нужен установленный рантайм). Если сам опрос падает
+    (драйвер, оверлей) — пустой список, а причина — в :func:`gpu_probe_error`."""
+    global _GPU_PROBE_ERROR
     exe = server_exe()
     if exe is None:
         return []
-    try:
-        out = subprocess.run([str(exe), "--list-devices"], capture_output=True, text=True, timeout=30,
-                             creationflags=_NO_WINDOW, cwd=str(exe.parent)).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    devs = []
-    for m in re.finditer(r"^\s*(\w+\d+):\s*(.+?)\s*\((\d+) MiB,\s*(\d+) MiB free\)", out, re.M):
-        devs.append({"id": m.group(1), "name": m.group(2), "vram_gb": int(m.group(3)) / 1024,
-                     "free_gb": int(m.group(4)) / 1024})
-    return devs
+    _GPU_PROBE_ERROR = ""
+    for no_layers in (False, True):
+        try:
+            res = subprocess.run([str(exe), "--list-devices"], capture_output=True, text=True, timeout=30,
+                                 creationflags=_NO_WINDOW, cwd=str(exe.parent), env=runtime_env(no_layers),
+                                 encoding="utf-8", errors="replace")
+        except (OSError, subprocess.SubprocessError) as exc:
+            _GPU_PROBE_ERROR = f"опрос видеокарты не запустился: {exc}"
+            return []
+        if res.returncode == 0:
+            _GPU_PROBE_ERROR = ""
+            devs = []
+            for m in re.finditer(r"^\s*(\w+\d+):\s*(.+?)\s*\((\d+) MiB,\s*(\d+) MiB free\)", res.stdout or "", re.M):
+                devs.append({"id": m.group(1), "name": m.group(2), "vram_gb": int(m.group(3)) / 1024,
+                             "free_gb": int(m.group(4)) / 1024})
+            return devs
+        _GPU_PROBE_ERROR = exit_reason(res.returncode)
+        log.warning("опрос видеокарт llama.cpp%s: код %s (%s)", " без слоёв Vulkan" if no_layers else "",
+                    res.returncode, _GPU_PROBE_ERROR)
+    return []
+
+
+_GPU_PROBE_ERROR = ""
+
+
+def gpu_probe_error() -> str:
+    """Почему последний опрос видеокарт не удался ("" — опрос прошёл, видеокарт может и не быть)."""
+    return _GPU_PROBE_ERROR
+
+
+#: Встраиваемые слои Vulkan (оверлеи Steam, RivaTuner, OBS, Discord…) подгружаются в любой процесс,
+#: который открывает видеокарту, и llama.cpp с ними может упасть на старте, не написав ни строчки
+#: (RTX 5070: «Нейросеть не запустилась: … srv llama_server: initializing»). Особенно в живом переводе:
+#: программу запускает игра, игру — Steam, и движку достаются переменные, включающие оверлей Steam.
+_LAYERS_OFF = {"DISABLE_VK_LAYER_VALVE_steam_overlay_1": "1", "DISABLE_VK_LAYER_VALVE_steam_fossilize_1": "1",
+               "DISABLE_RTSS_LAYER": "1", "DISABLE_VULKAN_OBS_CAPTURE": "1"}
+
+
+def runtime_env(no_layers: bool = False) -> Dict[str, str]:
+    """Окружение для llama.cpp: без включённых снаружи слоёв Vulkan; ``no_layers`` — и без всех
+    встраиваемых (загрузчик Vulkan 1.3.234+: ``VK_LOADER_LAYERS_DISABLE``)."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.upper().startswith(("ENABLE_VK_LAYER", "VK_INSTANCE_LAYERS", "VK_LOADER_LAYERS_ENABLE"))}
+    env.update(_LAYERS_OFF)
+    if no_layers:
+        env["VK_LOADER_LAYERS_DISABLE"] = "~implicit~"
+    return env
+
+
+#: коды аварийного завершения Windows (NTSTATUS) — что сказать человеку
+_CRASH_CODES = {
+    0xC0000005: "сбой при обращении к памяти — обычно драйвер видеокарты или оверлей (MSI Afterburner, "
+                "RivaTuner, OBS, Discord)",
+    0xC000001D: "процессор не поддерживает нужные инструкции",
+    0xC0000135: "не найдена системная библиотека — установите Microsoft Visual C++ Redistributable (x64)",
+    0xC0000142: "не удалось загрузить системную библиотеку",
+    0xC0000409: "аварийное завершение (сбой драйвера видеокарты или нехватка памяти)",
+    0xC0000017: "не хватает памяти",
+}
+
+
+def exit_reason(code: Optional[int]) -> str:
+    if code is None:
+        return "процесс не завершился"
+    known = _CRASH_CODES.get(code & 0xFFFFFFFF)
+    return f"{known} (код 0x{code & 0xFFFFFFFF:08X})" if known else f"код выхода {code}"
+
+
+def cpu_runtime_exe() -> Optional[Path]:
+    """Копия llama.cpp без модулей видеокарты (ggml-vulkan.dll): если движок падает уже при подключении
+    к видеокарте, «--device none» не спасает — модуль загружается и опрашивает её всё равно."""
+    exe = server_exe()
+    if exe is None:
+        return None
+    dst = runtime_dir().with_name("llama.cpp-cpu")
+    if (dst / exe.name).is_file():
+        return dst / exe.name
+    tmp = dst.with_name(dst.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    for f in exe.parent.iterdir():
+        name = f.name.lower()
+        if not f.is_file() or name.startswith(("ggml-vulkan", "ggml-cuda", "ggml-hip", "ggml-sycl", "ggml-opencl")):
+            continue
+        try:
+            os.link(f, tmp / f.name)
+        except OSError:
+            shutil.copy2(f, tmp / f.name)
+    shutil.rmtree(dst, ignore_errors=True)
+    tmp.rename(dst)
+    return dst / exe.name
 
 
 #: видеопамять, нужная модели целиком (веса на видеокарте + контекст и буферы, замер llama.cpp).
@@ -185,21 +275,34 @@ def server_exe() -> Optional[Path]:
     return None
 
 
-def _release_urls() -> List[str]:
-    """Ссылки на архив llama.cpp: сначала проверенная сборка, затем свежие релизы."""
-    urls = [f"https://github.com/{LLAMA_REPO}/releases/download/{LLAMA_BUILD}/llama-{LLAMA_BUILD}-{s}"
-            for s in _asset_suffixes()]
+def _release_urls() -> List[Tuple[str, str, int]]:
+    """Архивы llama.cpp: (ссылка, SHA-256, размер) — сначала проверенная сборка (хеш записан в
+    программе), затем свежие релизы с хешем, который публикует GitHub (без хеша архив не берётся)."""
+    out = [(f"https://github.com/{LLAMA_REPO}/releases/download/{LLAMA_BUILD}/llama-{LLAMA_BUILD}-{s}",
+            *LLAMA_PINS.get(s, ("", 0))) for s in _asset_suffixes()]
     try:
         releases = net.get_json(f"https://api.github.com/repos/{LLAMA_REPO}/releases?per_page=10", timeout=15)
         for rel in releases:
-            names = {a["name"]: a["browser_download_url"] for a in rel.get("assets", [])}
             for s in _asset_suffixes():
-                for name, url in names.items():
-                    if name.endswith(s) and not name.startswith("cudart"):
-                        urls.append(url)
+                for a in rel.get("assets", []):
+                    name, digest = str(a.get("name", "")), str(a.get("digest") or "")
+                    if name.endswith(s) and not name.startswith("cudart") and digest.startswith("sha256:"):
+                        out.append((a["browser_download_url"], digest.split(":", 1)[1], int(a.get("size") or 0)))
     except Exception as exc:  # noqa: BLE001
         log.info("Список релизов llama.cpp недоступен: %s", exc)
-    return list(dict.fromkeys(urls))
+    seen, uniq = set(), []
+    for url, sha, size in out:
+        if sha and url not in seen:
+            seen.add(url)
+            uniq.append((url, sha, size))
+    return uniq
+
+
+#: что делать, если llama.cpp не скачивается (GitHub не открывается) — в тексте ошибки
+MANUAL_RUNTIME = ("Можно поставить вручную: скачайте с github.com/{repo}/releases/tag/{build} файл "
+                  "llama-{build}-bin-win-vulkan-x64.zip (без видеокарты или если с ним вылетает — "
+                  "llama-{build}-bin-win-cpu-x64.zip) и распакуйте в папку «{dir}» так, чтобы в ней "
+                  "лежал llama-server.exe. Потом нажмите «Скачать» ещё раз — программа найдёт его сама.")
 
 
 def install_runtime(status: StatusFn = _noop, cancel: Optional[threading.Event] = None, notes=None) -> Path:
@@ -207,7 +310,7 @@ def install_runtime(status: StatusFn = _noop, cancel: Optional[threading.Event] 
         return server_exe()
     target = runtime_dir()
     last_error: Optional[Exception] = None
-    for url in _release_urls():
+    for url, sha, size in _release_urls():
         archive = paths.tools_dir() / url.rsplit("/", 1)[-1]
 
         def progress(done: int, total: int) -> None:
@@ -215,7 +318,8 @@ def install_runtime(status: StatusFn = _noop, cancel: Optional[threading.Event] 
                    done / total if total else None)
 
         try:
-            net.download(url, archive, progress=progress, cancel=cancel, notes=notes)
+            net.download(net.with_github_mirrors([url]), archive, progress=progress, cancel=cancel, notes=notes,
+                         sha256=sha, expected_size=size, strict=True)
         except net.Cancelled:
             raise
         except net.NetError as exc:
@@ -243,7 +347,8 @@ def install_runtime(status: StatusFn = _noop, cancel: Optional[threading.Event] 
                 if f.is_file() and not f.suffix:
                     f.chmod(0o755)
         return exe
-    raise TranslatorError(f"Не удалось скачать llama.cpp: {last_error}")
+    raise TranslatorError(f"Не удалось скачать llama.cpp: {last_error}. "
+                          + MANUAL_RUNTIME.format(repo=LLAMA_REPO, build=LLAMA_BUILD, dir=runtime_dir()))
 
 
 # ---------- модели ----------
@@ -351,11 +456,25 @@ def _fmt_eta(seconds: float) -> str:
 
 # ---------- сервер ----------
 
+#: удачный способ запуска llama-server ("gpu", "gpu-no-layers", "cpu") — до конца работы программы
+_START_MODE = ""
+
+
+class ServerCrashed(TranslatorError):
+    """llama-server завершился, не успев загрузиться (падение, а не долгая загрузка)."""
+
+    def __init__(self, message: str, code: Optional[int]):
+        super().__init__(message)
+        self.code = code
+
+
 class LlamaServer:
     """Процесс llama-server на свободном локальном порту."""
 
-    def __init__(self, exe: Path, model: Path, use_gpu: bool = True, ctx: int = 8192, threads: int = 0):
+    def __init__(self, exe: Path, model: Path, use_gpu: bool = True, ctx: int = 8192, threads: int = 0,
+                 env: Optional[Dict[str, str]] = None):
         self.exe, self.model, self.use_gpu, self.ctx, self.threads = exe, model, use_gpu, ctx, threads
+        self.env = env if env is not None else runtime_env()
         self.proc: Optional[subprocess.Popen] = None
         self.port = 0
         self._job = None
@@ -378,7 +497,7 @@ class LlamaServer:
         status("Запуск нейросети…", None)
         logf = self.log_path.open("w", encoding="utf-8", errors="replace")
         self.proc = subprocess.Popen(args, stdout=logf, stderr=subprocess.STDOUT, cwd=str(self.exe.parent),
-                                     creationflags=_NO_WINDOW)
+                                     creationflags=_NO_WINDOW, env=self.env)
         self._job = _kill_with_parent(self.proc)
         atexit.register(self.stop)
         deadline = time.monotonic() + timeout
@@ -386,8 +505,10 @@ class LlamaServer:
             if cancel is not None and cancel.is_set():
                 self.stop()
                 raise net.Cancelled()
-            if self.proc.poll() is not None:
-                raise TranslatorError("Нейросеть не запустилась: " + self._log_tail())
+            code = self.proc.poll()
+            if code is not None:
+                self.proc = None
+                raise ServerCrashed(f"Нейросеть не запустилась ({exit_reason(code)}): " + self._log_tail(), code)
             try:
                 data = net.get_json(f"http://127.0.0.1:{self.port}/health", timeout=5)
                 if isinstance(data, dict) and data.get("status") == "ok":
@@ -493,10 +614,48 @@ class LocalTranslator(LLMTranslator):
                 self._fit_to_vram(status)
             model = install_model(self.preset, status, cancel)
         if self.server is None or self.server.proc is None:
-            self.server = LlamaServer(exe, model, use_gpu=self.use_gpu, threads=self.threads)
-            self.server.start(status, cancel)
+            self.server = self._start_server(exe, model, status, cancel)
         self.client.base_url = self.server.base_url
         super().prepare(status, cancel)
+
+    def _start_server(self, exe: Path, model: Path, status: StatusFn,
+                      cancel: Optional[threading.Event]) -> "LlamaServer":
+        """Запуск с запасными вариантами: движок, упавший на старте, — ещё раз без встраиваемых слоёв
+        Vulkan (оверлеи), а затем на процессоре, копией без модуля видеокарты. Удачный вариант
+        запоминается до конца работы программы."""
+        global _START_MODE
+        attempts = [("gpu", exe, self.use_gpu, runtime_env())]
+        if self.use_gpu:
+            attempts.append(("gpu-no-layers", exe, True, runtime_env(no_layers=True)))
+        attempts.append(("cpu", None, False, runtime_env(no_layers=True)))
+        if _START_MODE:
+            attempts = [a for a in attempts if a[0] == _START_MODE] or attempts
+        last: Optional[ServerCrashed] = None
+        for mode, path, gpu, env in attempts:
+            if mode == "cpu":
+                path = cpu_runtime_exe()
+                if path is None:
+                    break
+                if self.use_gpu:
+                    status("Нейросеть падает при работе с видеокартой — запускаю её на процессоре "
+                           "(медленнее, но работает)", None)
+            elif mode == "gpu-no-layers":
+                status("Нейросеть упала при запуске — пробую ещё раз без оверлеев видеокарты", None)
+            server = LlamaServer(path or exe, model, use_gpu=gpu, threads=self.threads, env=env)
+            try:
+                server.start(status, cancel)
+            except ServerCrashed as exc:
+                log.warning("llama-server (%s) упал при запуске: %s", mode, exc)
+                last = exc
+                continue
+            if mode != "gpu":
+                log.warning("llama-server работает в режиме «%s»", mode)
+            _START_MODE = mode
+            return server
+        raise TranslatorError(
+            f"{last}. Нейросеть не запускается на этом ПК ни с видеокартой, ни на процессоре. Обновите драйвер "
+            "видеокарты и закройте программы с оверлеем (MSI Afterburner/RivaTuner, OBS, Discord), либо выберите "
+            f"машинный перевод или облачную нейросеть. Подробности: {paths.logs_dir() / 'llama-server.log'}")
 
     def _fit_to_vram(self, status: StatusFn) -> None:
         """llama.cpp раскладывает модель по свободной видеопамяти на момент запуска: что не влезло,

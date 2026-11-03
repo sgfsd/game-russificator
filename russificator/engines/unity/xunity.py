@@ -67,14 +67,42 @@ def xua_url(game: UnityGame) -> str:
             f"XUnity.AutoTranslator-{kind}-{XUA}.zip")
 
 
+#: SHA-256 и размер архивов, которые ставятся в игру: BepInEx и XUnity — исполняемый код, их подмена по дороге
+#: (или на зеркале) не должна дойти до игры. Хеши сверены с опубликованными на GitHub (digest
+#: релиза); у сборок BepInEx 6 с builds.bepinex.dev и у архива шрифтов XUnity 5.4.4 опубликованных
+#: хешей нет — записаны хеши официальных файлов, скачанных дважды в разное время.
+PINNED = {
+    "BepInEx_win_x64_5.4.23.5.zip":
+        ("82f9878551030f54657792c0740d9d51a09500eeae1fba21106b0c441e6732c4", 639118),
+    "BepInEx_win_x86_5.4.23.5.zip":
+        ("37651c79e40d6f909572a4f461ac25350bb3ef8fe7fbd29f1aa8791a33b84c82", 638544),
+    "BepInEx-Unity.IL2CPP-win-x64-6.0.0-be.788+5b766a3.zip":
+        ("f4cc496bd098a0df4164b81e3737297707f13a47c2478dba2f60eefab784817a", 34336405),
+    "BepInEx-Unity.IL2CPP-win-x86-6.0.0-be.788+5b766a3.zip":
+        ("d5954a5993ec39cd1133603d85bff93875d30b6411b712cc13dcf03c8e08a4d3", 31440336),
+    "XUnity.AutoTranslator-BepInEx-5.6.2.zip":
+        ("836a4066b9369b0d23dc1b0ef6336ad7fe7ae16880931259ec4d157aff7a81c0", 758678),
+    "XUnity.AutoTranslator-BepInEx-IL2CPP-5.6.2.zip":
+        ("639392d3ee3c7542cca98c6c04b384deee4961fe965f3d80a4d9c8413884a0f3", 761721),
+    "TMP_Font_AssetBundles.zip":
+        ("cd18628ea3bd1128fa172b910ae15685f89ff689b20c4836d42d42491c26dd39", 60160941),
+}
+
+
 def _cached(url: str, status: StatusFn, cancel) -> Path:
-    """Архив из кэша программы (скачивается один раз на все игры)."""
+    """Архив из кэша программы (скачивается один раз на все игры, хеш и размер — строго по :data:`PINNED`;
+    архив в кэше, который хешу не соответствует, скачивается заново)."""
     name = url.rsplit("/", 1)[-1].replace("%2B", "+")
+    sha, size = PINNED[name]
     dest = paths.tools_dir() / "unity" / name
+    if dest.is_file() and net.file_sha256(dest) != sha:
+        log.warning("архив %s в кэше не совпал с известным хешем — скачивается заново", name)
+        dest.unlink()
     if not dest.is_file():
         def progress(done: int, total: int) -> None:
             status(f"Скачивание {name}: {done >> 20} из {(total >> 20) or '?'} МБ", done / total if total else None)
-        net.download(url, dest, progress=progress, cancel=cancel)
+        net.download(net.with_github_mirrors([url]), dest, progress=progress, cancel=cancel, sha256=sha,
+                     expected_size=size, strict=True)
     return dest
 
 
@@ -142,12 +170,15 @@ def plugin_installed(game: UnityGame) -> bool:
     return (plugins / PLUGIN).is_file() or (plugins / PLUGIN_IL2CPP).is_file()
 
 
-def plugin_config_text(server: Optional[tuple], fit: bool = True, credit: str = "") -> str:
-    """Настройки плагина: как запустить сервер живого перевода и надпись о программе."""
+def plugin_config_text(server: Optional[tuple], fit: bool = True, credit: str = "", source: str = "en") -> str:
+    """Настройки плагина: как запустить сервер живого перевода, надпись о программе, язык оригинала."""
     lines = ["# Русификатор игр: настройки плагина Russificator.Unity (пишет программа при русификации).",
              "# server/args — чем запустить живой перевод, когда игра стартует без программы;",
-             "# credit — надпись о программе при запуске игры (только в русификаторах «для друзей»).",
+             "# credit — надпись о программе при запуске игры (только в русификаторах «для друзей»);",
+             "# source — язык оригинала (ja, zh, ko: иероглифы и кана — тоже текст).",
              f"port={LIVE_PORT}", f"fit={'true' if fit else 'false'}"]
+    if source != "en":
+        lines.append(f"source={source}")
     if server:
         exe, args, workdir = server
         lines += [f"server={exe}", f"args={args}", f"workdir={workdir}"]
@@ -156,8 +187,9 @@ def plugin_config_text(server: Optional[tuple], fit: bool = True, credit: str = 
     return "\n".join(lines) + "\n"
 
 
-def write_plugin_config(game: UnityGame, backup, server: Optional[tuple], fit: bool = True) -> None:
-    backup.write_text(game.root / PLUGIN_CONFIG, plugin_config_text(server, fit))
+def write_plugin_config(game: UnityGame, backup, server: Optional[tuple], fit: bool = True,
+                        source: str = "en") -> None:
+    backup.write_text(game.root / PLUGIN_CONFIG, plugin_config_text(server, fit, source=source))
 
 
 def config_for_friends(ini: str, tmp_font: Optional[str]) -> str:
@@ -191,17 +223,25 @@ def tmp_font_file(game: UnityGame, status: StatusFn = _noop, cancel=None) -> Opt
 
 
 def _unzip(archive: Path, root: Path, backup, track_top_level: bool) -> None:
-    """Распаковать архив в корень игры, запоминая всё созданное для отката."""
+    """Распаковать архив в корень игры, запоминая всё созданное для отката.
+
+    Имя внутри архива, которое ведёт за пределы папки игры («..», абсолютный путь, диск), — отказ
+    до записи первого файла: такой архив не ставится вовсе (откат не узнал бы о записанном снаружи)."""
     with zipfile.ZipFile(archive) as z:
-        tops = {Path(n).parts[0] for n in z.namelist() if n.strip("/")}
+        members = []
+        for info in z.infolist():
+            dest = paths.inside(root, info.filename)
+            if dest is None:
+                raise RuntimeError(f"В архиве {archive.name} недопустимый путь: {info.filename!r}")
+            members.append((info, dest))
+        tops = {Path(info.filename.replace("\\", "/")).parts[0] for info, _ in members if info.filename.strip("/")}
         if track_top_level:
             for top in sorted(tops):
                 if not (root / top).exists():
                     backup.track_new(root / top)
-        for info in z.infolist():
+        for info, dest in members:
             if info.is_dir():
                 continue
-            dest = root / info.filename
             if dest.exists():
                 backup.save_original(dest)
             elif not track_top_level:
@@ -250,8 +290,13 @@ def partial_translations_fit(sources) -> bool:
     return sum(len(s) ** 2 for s in sources) <= PARTIAL_BUDGET
 
 
+#: язык оригинала (``translation.lang``) → код XUnity: по нему XUnity решает, какой текст переводить
+#: (с «en» японская строка для него — не текст, и словарь к ней не применяется)
+XUNITY_LANGS = {"zh": "zh-CN"}
+
+
 def write_config(game: UnityGame, backup, live: bool, tmp_font: Optional[str], partial: bool = False,
-                 getter_compat: bool = False, imgui: bool = False) -> None:
+                 getter_compat: bool = False, imgui: bool = False, source: str = "en") -> None:
     """Настройки XUnity.AutoTranslator под русский язык и наш сервер перевода.
 
     ``partial`` — текст, который игра выводит по букве (монологи, «печатная
@@ -264,6 +309,10 @@ def write_config(game: UnityGame, backup, live: bool, tmp_font: Optional[str], p
     английское продолжение к уже переведённому началу.
 
     ``imgui`` — игра рисует интерфейс через IMGUI (``GUI.Label`` и т.п.).
+
+    ``IgnoreWhitespace…`` — переносы строк, которые игра вставляет сама (NGUI, длинные реплики:
+    «The Sacred↵Sword» у Celestian Tales), не мешают найти фразу в словаре: для английского XUnity
+    заменяет перенос пробелом (слова не склеиваются), а ключи словаря хранит и в таком виде.
     """
     endpoint = "CustomTranslate" if live else ""
     ini = f"""[Service]
@@ -272,7 +321,7 @@ FallbackEndpoint=
 
 [General]
 Language=ru
-FromLanguage=en
+FromLanguage={XUNITY_LANGS.get(source, source)}
 
 [Files]
 Directory=Translation\\{{Lang}}\\Text
@@ -289,8 +338,8 @@ EnableIMGUI={imgui}
 MaxCharactersPerTranslation={MAX_CHARS}
 GeneratePartialTranslations={partial}
 TextGetterCompatibilityMode={getter_compat}
-IgnoreWhitespaceInDialogue=False
-IgnoreWhitespaceInNGUI=False
+IgnoreWhitespaceInDialogue=True
+IgnoreWhitespaceInNGUI=True
 MinDialogueChars=20
 EnableUIResizing=True
 ForceUIResizing=False
@@ -328,6 +377,63 @@ def entrypoint_assembly(game: UnityGame) -> str:
         else "UnityEngine.dll"
 
 
+#: последняя версия метаданных IL2CPP, с которой работает BepInEx 6 (Il2CppInterop 1.5.3). Unity 6000.3
+#: (метаданные v38/v39) поменял устройство классов в памяти: перехват Class::Init промахивается, и игра
+#: падает при запуске (Il2CppInterop #283; Demonic Mahjong, Unity 6000.3.21f1: «при первом запуске
+#: качает что должен и закрывается»). Новый BepInEx, который это чинит, — поднять вместе с ним
+IL2CPP_BEPINEX_MAX_METADATA = 31
+
+_FILES_AND_LIVE = (" Перевод вписан прямо в файлы игры, а текст, который собирает код игры, переводит "
+                   "«Живой перевод» поверх экрана.")
+
+
+def bepinex_blocker(game: UnityGame) -> str:
+    """Почему BepInEx не может работать в этой игре; "" — может. Такие игры переводятся только
+    правкой их файлов и живым переводом поверх экрана.
+
+    IL2CPP: BepInEx 6 читает global-metadata.dat (Cpp2IL) и перехватывает функции движка
+    (Il2CppInterop). Зашифрованные метаданные он не прочтёт, а на Unity 6000.3+ роняет игру
+    (см. :data:`IL2CPP_BEPINEX_MAX_METADATA`).
+
+    Mono: Unity при сборке с высоким уровнем «урезания» кода (Managed Stripping Level) выбрасывает из
+    библиотек всё, чем не пользуется сама игра. Загрузчику BepInEx нужно событие
+    ``AppDomain.AssemblyResolve`` (без него Doorstop молча падает на старте — missed messages., Unity
+    2019.1), а его журналу — событие логов Unity (без него падает статический конструктор
+    MonoBehaviour, и с ним вся игра). Подложить полные библиотеки (dll_search_path_override) нельзя:
+    код самой игры урезан под урезанные библиотеки, и с полными у его корутин не собираются таблицы
+    методов (TypeLoadException: VTable setup failed) — игра зависает."""
+    if game.backend == "il2cpp":
+        from .extract import metadata_version
+        meta = game.data / "il2cpp_data" / "Metadata" / "global-metadata.dat"
+        if not meta.is_file():
+            return ""
+        version = metadata_version(meta)
+        if version is None:
+            return ("Код игры зашифрован (global-metadata.dat): модуль перевода (BepInEx) в ней не работает "
+                    "и не ставится." + _FILES_AND_LIVE)
+        if version > IL2CPP_BEPINEX_MAX_METADATA:
+            return (f"Игра на новой Unity ({game.version or f'метаданные v{version}'}): модуль перевода "
+                    "(BepInEx) пока роняет такие игры при запуске, поэтому не ставится." + _FILES_AND_LIVE)
+        return ""
+    if game.backend != "mono":
+        return ""
+    managed = game.data / "Managed"
+
+    def has(name: str, *needles: bytes) -> Optional[bool]:
+        try:
+            data = (managed / name).read_bytes()      # библиотеки — единицы МБ: целиком, без стыков блоков
+        except OSError:
+            return None                               # файла нет — судить не по чему
+        return any(n in data for n in needles)
+
+    corlib = has("mscorlib.dll", b"add_AssemblyResolve")
+    engine = has(entrypoint_assembly(game), b"logMessageReceived", b"RegisterLogCallback")
+    if corlib is False or engine is False:
+        return ("Игра собрана с урезанными библиотеками .NET: модуль перевода (BepInEx) в ней не "
+                "запускается." + _FILES_AND_LIVE)
+    return ""
+
+
 def write_bepinex_config(game: UnityGame, backup) -> None:
     """BepInEx.cfg: консоль выключена, загрузчик плагинов стартует из ``MonoBehaviour..cctor``.
 
@@ -337,9 +443,17 @@ def write_bepinex_config(game: UnityGame, backup) -> None:
     Auto Translator]»), а в других играх у компонентов не вызывается Update. MonoBehaviour..cctor
     срабатывает позже, когда движок уже готов, — так советует документация BepInEx для таких
     случаев, и это точка по умолчанию в BepInEx 6. Другую точку входа, выбранную владельцем
-    (для модов), не трогаем — меняется только умолчание."""
+    (для модов), не трогаем — меняется только умолчание.
+
+    BepInEx, который стоял в игре до русификатора (моды игрока), не трогаем совсем: его моды
+    работают с его настройкой, а с другой точкой входа стартуют в другой момент — Mad Island:
+    «Mad Island Uncensor Tool» после переноса на MonoBehaviour..cctor ронял игру («Graphics device is
+    null», «Crash!!!»)."""
     if game.backend != "mono":
         return                                     # BepInEx 6 (IL2CPP): своя настройка, и так поздняя
+    core = game.root / "BepInEx" / "core"
+    if core.is_dir() and not backup.is_ours(core / "BepInEx.dll"):
+        return
     path = game.root / "BepInEx" / "config" / "BepInEx.cfg"
     try:
         text = path.read_text(encoding="utf-8-sig") if path.is_file() else ""

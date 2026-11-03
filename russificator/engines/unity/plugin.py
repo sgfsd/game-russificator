@@ -32,6 +32,12 @@ PAGE_PREFIX = "zfb:"
 log = logging.getLogger("russificator.unity")
 
 
+#: игра на нескольких языках (таблицы Unity Localization): меню русское на любом из них, а реплики и прочий
+#: текст переведены с английского — Mad Island на русской Windows стартует по-японски
+LANGUAGE_TIP = ("Игра знает несколько языков. Если она запустилась не на английском — выберите English в её "
+                "настройках: перевод сделан с английского текста.")
+
+
 class UnityPlugin(EnginePlugin):
     engine_id = "unity"
     title = "Unity"
@@ -53,6 +59,7 @@ class UnityPlugin(EnginePlugin):
         entries, warnings, col = _extract.extract_all(game, self.status)
         entries += self._live_entries(project, {e.source for e in entries})
         project.meta["unity_font_files"] = [str(p) for p in col.font_files]
+        project.meta["unity_text_files"] = sorted(col.text_files)
         project.meta["unity_ui"] = col.ui
         project.meta["unity_prefixes"] = col.prefixes
         for e in entries:
@@ -89,8 +96,16 @@ class UnityPlugin(EnginePlugin):
         self._il2cpp = game.backend == "il2cpp"
         from . import unitypy_io
         unitypy_io.use_game_version(game.version)
-        for note in xunity.install(game, backup, self.status, self.cancel):
-            project.warnings.append(note)
+        # BepInEx в игре не работает (урезанные библиотеки, Unity 6.3+, зашифрованный код) — только правка
+        # файлов и живой перевод поверх экрана
+        blocker = xunity.bepinex_blocker(game)
+        self._bepinex = not blocker
+        project.meta["unity_bepinex_blocked"] = bool(blocker)
+        if blocker:
+            project.warnings.append(blocker)
+        else:
+            for note in xunity.install(game, backup, self.status, self.cancel):
+                project.warnings.append(note)
         done = [e for e in project.entries
                 if e.translation and e.status in (EntryStatus.TRANSLATED, EntryStatus.APPROVED)]
         pairs = {e.source: e.translation for e in done if not e.target_key.startswith(PAGE_PREFIX)}
@@ -112,53 +127,67 @@ class UnityPlugin(EnginePlugin):
         if fixed:
             names = ", ".join(sorted({r.name for r in reports if r.added})[:8])
             project.warnings.append(f"Шрифтам игры без кириллицы дорисованы русские буквы ({fixed}): {names}.")
-        fallback = None
-        if any(r.error for r in reports) or any("шрифты не исправлены" in p for p in problems):
-            try:  # запасной вариант — готовый шрифт XUnity (есть для Unity 2018+)
-                fallback = xunity.install_tmp_font(game, backup, self.status, self.cancel)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("TMP-шрифт XUnity: %s", exc)
         project.warnings.extend(problems)
-        partial = xunity.partial_translations_fit(pairs)
-        usage = self._code_usage(game)
-        compat = usage.appends > 0 and usage.length_reveals == 0
-        imgui = usage.imgui_calls >= 3
-        project.meta["unity_getter_compat"] = compat
-        project.meta["unity_imgui"] = imgui
-        xunity.write_config(game, backup, live=True, tmp_font=fallback, partial=partial, getter_compat=compat,
-                            imgui=imgui)
-        if xunity.plugin_installed(game):
-            from ...core import launcher
-            xunity.write_plugin_config(game, backup, launcher.serve_command(game.root))
-        rules = (xunity.prefix_rules(project.meta.get("unity_prefixes") or [], pairs) + xunity.template_rules(pairs)
-                 + xunity.number_rules() + xunity.label_rules() + xunity.paragraph_rules())
-        project.meta["unity_template_rules"] = len(rules)
-        n = xunity.write_translations(game, backup, {**pairs, **variants, **xunity.template_fragments(pairs)}, rules)
-        project.meta["unity_static_translations"] = n
+        if not blocker:
+            self._write_xunity(game, project, pairs, variants, reports, problems)
         # фразы — прямо в данные игры: их увидят и компоненты, которых XUnity не знает (UTAGE и пр.)
         self.status("Перевод в данных игры…", None)
         try:
             from . import direct
             # строки «только для словаря» (найдены по смелым признакам) в данные игры не вписываются
             display_only = {e.source for e in project.entries if (e.notes or {}).get("display_only")}
+            text_files = project.meta.get("unity_text_files")
             drep = direct.apply(game, {s: t for s, t in pairs.items() if s not in display_only}, backup,
-                                self.status)
+                                self.status, bundles_with_text=set(text_files) if text_files is not None else None,
+                                runtime=not blocker)
             project.meta["unity_direct"] = {"files": drep.files, "strings": drep.strings,
-                                            "ambiguous": drep.skipped_ambiguous}
+                                            "ambiguous": drep.skipped_ambiguous, "other_locales": drep.other_locales}
+            self._other_locales = drep.other_locales > 0
             if drep.errors:
                 project.warnings.append("Часть файлов игры не изменена (перевод в них — на лету): "
                                         + "; ".join(drep.errors[:5]))
         except Exception as exc:  # noqa: BLE001
             log.warning("Прямой перевод в данных игры не выполнен: %s", exc)
         project.meta["unity_backend"] = game.backend
-        resized = xunity.write_resizer(game, backup, xunity.resize_rules(project.meta.get("unity_ui") or [], pairs))
-        project.meta["unity_resized"] = resized
+        if not blocker:
+            resized = xunity.write_resizer(game, backup,
+                                           xunity.resize_rules(project.meta.get("unity_ui") or [], pairs))
+            project.meta["unity_resized"] = resized
         if pages:
             self.status("Перевод страниц встроенного браузера…", None)
             project.meta["unity_pages"] = inject_pages(game, backup, pages)
         # плагин сам запускает доводку при любом запуске игры; без плагина — ярлык «Играть на русском»
+        # (без BepInEx ярлыку нечего запускать: доводка идёт через XUnity)
         self._plugin = xunity.plugin_installed(game)
-        self._shortcut = None if self._plugin else self._make_shortcut(game, backup)
+        self._shortcut = None if self._plugin or blocker else self._make_shortcut(game, backup)
+
+    def _write_xunity(self, game, project: TranslationProject, pairs: Dict[str, str], variants: Dict[str, str],
+                      reports, problems: List[str]) -> None:
+        """Настройки и словари XUnity.AutoTranslator и плагина русификатора."""
+        backup = project.backup
+        fallback = None
+        if any(r.error for r in reports) or any("шрифты не исправлены" in p for p in problems):
+            try:  # запасной вариант — готовый шрифт XUnity (есть для Unity 2018+)
+                fallback = xunity.install_tmp_font(game, backup, self.status, self.cancel)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("TMP-шрифт XUnity: %s", exc)
+        partial = xunity.partial_translations_fit(pairs)
+        usage = self._code_usage(game)
+        compat = usage.appends > 0 and usage.length_reveals == 0
+        imgui = usage.imgui_calls >= 3
+        project.meta["unity_getter_compat"] = compat
+        project.meta["unity_imgui"] = imgui
+        source = project.meta.get("source_lang") or "en"
+        xunity.write_config(game, backup, live=True, tmp_font=fallback, partial=partial, getter_compat=compat,
+                            imgui=imgui, source=source)
+        if xunity.plugin_installed(game):
+            from ...core import launcher
+            xunity.write_plugin_config(game, backup, launcher.serve_command(game.root), source=source)
+        rules = (xunity.prefix_rules(project.meta.get("unity_prefixes") or [], pairs) + xunity.template_rules(pairs)
+                 + xunity.number_rules() + xunity.label_rules() + xunity.paragraph_rules())
+        project.meta["unity_template_rules"] = len(rules)
+        n = xunity.write_translations(game, backup, {**pairs, **variants, **xunity.template_fragments(pairs)}, rules)
+        project.meta["unity_static_translations"] = n
 
     @staticmethod
     def _code_usage(game):
@@ -191,6 +220,11 @@ class UnityPlugin(EnginePlugin):
         return _export_plan(self, game_dir, project, credit)
 
     def post_inject_instructions(self) -> List[str]:
+        if getattr(self, "_bepinex", True) is False:
+            return ["Перевод вписан прямо в файлы игры — запускайте её как обычно (Steam, ярлык, exe).",
+                    "Текст, которого нет в файлах (его собирает код игры), переводит «Живой перевод» поверх "
+                    "экрана — включите его на вкладке «Живой перевод». Alt+T показывает и прячет его."] + (
+                [LANGUAGE_TIP] if getattr(self, "_other_locales", False) else [])
         if getattr(self, "_plugin", False) or not getattr(self, "_il2cpp", False):
             first = ("Запускайте игру как обычно (Steam, ярлык, exe): живой перевод текста, который игра "
                      "собирает на лету, включится сам. Не перемещайте и не удаляйте папку русификатора — "
@@ -208,6 +242,8 @@ class UnityPlugin(EnginePlugin):
         ]
         if getattr(self, "_il2cpp", False):
             tips.insert(1, "IL2CPP-игра: первый запуск с BepInEx занимает 1–5 минут и требует интернет — это один раз.")
+        if getattr(self, "_other_locales", False):
+            tips.append(LANGUAGE_TIP)
         return tips
 
 
@@ -223,6 +259,11 @@ def _export_plan(plugin: "UnityPlugin", game_dir: Path, project: TranslationProj
     plan.exclude = [launcher.SHORTCUT_NAME, "BepInEx/cache/*", "BepInEx/interop/*", "BepInEx/unity-libs/*",
                     "BepInEx/LogOutput.log*", "BepInEx/ErrorLog*", "BepInEx/DumpedAssemblies/*",
                     "BepInEx/Translation/*/Text/_Preprocessors*.log", "*.tmp", "*.rutmp"]
+    if not (root / "BepInEx" / "core").is_dir():
+        # BepInEx в игре не работает (xunity.bepinex_blocker): перевод только в файлах игры
+        plan.notes.append("Перевод вписан прямо в файлы игры. Что в них не попало, можно перевести "
+                          "«Живым переводом» программы «Русификатор игр» поверх экрана.")
+        return plan
     fonts_patched = any(f.get("added") for f in project.meta.get("unity_fonts") or [])
     fallback = None
     if game is not None and fonts_patched:
@@ -244,7 +285,8 @@ def _export_plan(plugin: "UnityPlugin", game_dir: Path, project: TranslationProj
         plan.replace["BepInEx/config/AutoTranslatorConfig.ini"] = \
             xunity.config_for_friends(text, fallback).encode("utf-8")
     if (root / xunity.PLUGIN_CONFIG).is_file() or (game is not None and xunity.plugin_installed(game)):
-        plan.replace[xunity.PLUGIN_CONFIG] = xunity.plugin_config_text(None, True, credit or "").encode("utf-8")
+        plan.replace[xunity.PLUGIN_CONFIG] = xunity.plugin_config_text(
+            None, True, credit or "", source=project.meta.get("source_lang") or "en").encode("utf-8")
     plan.notes.append("Первый запуск игры после установки может быть на 10–30 секунд дольше — "
                       "загружается модуль перевода (BepInEx). Alt+T в игре переключает перевод и оригинал.")
     if game is not None and game.backend == "il2cpp":

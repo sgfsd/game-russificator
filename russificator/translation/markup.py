@@ -26,9 +26,16 @@ _PARTS = [
     r"\\[A-Za-z]{1,4}<[^>\n]{0,40}>",                 # \n<Имя> (плагины RPG Maker)
     r"\\[{}$.|!><^\\]",                               # \{ \. \| \! (RPG Maker)
     r"\\[nrt]",                                       # литеральные \n \t внутри строки
+    # «/n» — перенос строки у части игр (Mad Island: «My bad.../nI'm ready now...»). Без этого «nI'm»
+    # считался названием из кода, а «/nЕсли» в переводе — словом из двух алфавитов: реплики уходили на
+    # повтор и пропадали. Не перенос — «/n» перед строчной буквой после буквы или пробела: «com/news»,
+    # «and/nor», команда «/name»
+    r"(?<=[^\w\s])/n|/n(?![^\W\d_])|/n(?=[A-ZА-ЯЁ])",
     r"\\[A-Za-z](?![A-Za-z])",                        # \G и прочие однобуквенные коды
     r"\{[^{}\n]{0,80}\}",                             # {w} {0} {color=#fff} {/b} {player}
     r"\[[A-Za-z_][\w.!:]*(?:\[[\w\"']*\])?\]",        # [player] [p.name!c] [items[0]]
+    # BBCode NGUI: цвет [1b130a] [ff000080] и его конец [-], [b] [/i] [u] [s] [c] [sub] [sup] [url=…]
+    r"\[(?:[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?|-|/?[biusc]|/?su[bp]|/?url(?:=[^\]\n]{0,200})?)\]",
     r"</?[A-Za-z][\w\-]*(?:[= ][^<>\n]{0,300})?/?>",  # <b> </color> <size=20> <a class="x" href="…">
     r"<<[^<>\n]{0,80}>>",                             # <<макросы>>
     r"%\([A-Za-z_]\w*\)[-+0#]*\d*(?:\.\d+)?[sdifr]",  # %(name)s
@@ -104,7 +111,16 @@ def plain_text(text: str) -> str:
 
 
 def has_words(text: str) -> bool:
-    """Есть ли что переводить помимо разметки (хотя бы две буквы подряд)."""
+    """Есть ли что переводить помимо разметки: две латинские буквы подряд или буква китайского,
+    японского, корейского письма (переводить ли её в этой игре — решает язык оригинала, см. ``lang``)."""
+    from .lang import has_cjk
+    p = plain_text(text)
+    return bool(re.search(r"[A-Za-z]{2}", p)) or has_cjk(p)
+
+
+def has_latin(text: str) -> bool:
+    """Есть ли помимо разметки английские слова (две латинские буквы подряд) — для машинного переводчика
+    с английского."""
     return bool(re.search(r"[A-Za-z]{2}", plain_text(text)))
 
 
@@ -283,7 +299,7 @@ def normalize_layout(source: str, translation: str) -> str:
         translation = re.sub(r"[ \t]*\\n[ \t]*", " ", translation).strip()
     # «Go to the forest» -> «Иди в лес.»: лишняя точка в конце кнопки/пункта меню
     src_end = source.rstrip()[-1:] if source.strip() else ""
-    if src_end and src_end not in ".!?…:;" and re.search(r"(?<!\.)\.\s*$", translation):
+    if src_end and src_end not in ".!?…:;。！？：；．" and re.search(r"(?<!\.)\.\s*$", translation):
         translation = re.sub(r"\.(\s*)$", r"\1", translation)
     found = list(markup_matches(source))
     for a, b in zip(found, found[1:]):

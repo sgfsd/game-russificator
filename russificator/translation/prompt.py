@@ -27,6 +27,22 @@ Rules:
 
 Reply with ONLY a JSON object that maps every "id" to its Russian translation, e.g. {"1": "...", "2": "..."}."""
 
+#: правило для игр на китайском, японском, корейском: модель любит оставлять имена и кавычки как в оригинале
+_CJK_RULE = ("8. Never leave {lang} characters in the translation: write names in Cyrillic (the usual Russian "
+             "spelling of the name), and use Russian punctuation and quotes «» instead of 「」『』。、.")
+
+
+def system_prompt(lang: str = "en") -> str:
+    """Системная подсказка для игры на языке ``lang`` (см. ``lang.detect``)."""
+    from .lang import is_cjk, name
+    if lang == "en":
+        return SYSTEM_PROMPT
+    prompt = SYSTEM_PROMPT.replace("Translate English game text into Russian.",
+                                   f"Translate {name(lang)} game text into Russian.")
+    if is_cjk(lang):
+        prompt = prompt.replace("\n\nReply with ONLY", "\n" + _CJK_RULE.format(lang=name(lang)) + "\n\nReply with ONLY")
+    return prompt
+
 KIND_NAMES = {
     TextKind.DIALOGUE: "dialogue",
     TextKind.NARRATION: "narration",
@@ -119,3 +135,9 @@ def _normalize(data) -> Dict[str, str]:
 SHORTEN_PROMPT = ("Shorten this Russian game UI translation to at most {limit} characters, keeping the meaning "
                   "and all markup tokens exactly. English original: {source}\nRussian: {text}\n"
                   "Reply with only the shortened Russian text.")
+
+
+def shorten_prompt(limit: int, source: str, text: str, lang: str = "en") -> str:
+    from .lang import name
+    template = SHORTEN_PROMPT if lang == "en" else SHORTEN_PROMPT.replace("English", name(lang))
+    return template.format(limit=limit, source=source, text=text)

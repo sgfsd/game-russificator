@@ -38,6 +38,27 @@ def _open_path(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
+def _translator_title(translator_id: str) -> str:
+    """«LocalTranslator:llm:gemma4-e2b» → «нейросеть на ПК (gemma4-e2b)» — для вопроса о прогрессе."""
+    kind, _, cache = translator_id.partition(":")
+    name = cache.split(":", 1)[-1] if ":" in cache else cache
+    if kind == "MachineTranslator":
+        return "машинный перевод"
+    if kind == "LocalTranslator":
+        return f"нейросеть на ПК ({name})"
+    if kind == "CloudTranslator":
+        return f"облачная нейросеть ({name})"
+    return name or translator_id
+
+
+def _count(value) -> int:
+    """Неотрицательное целое из чужих данных (package.json архива) или 0."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _dir_size(p: Path) -> int:
     if p.is_file():
         return p.stat().st_size
@@ -177,7 +198,7 @@ class Api:
         gpus = local_llm.gpu_devices()
         vram = max((g["vram_gb"] for g in gpus), default=None)
         return {"ram_gb": round(local_llm.total_ram_gb(), 1), "gpus": gpus,
-                "gpu_known": local_llm.server_exe() is not None,
+                "gpu_known": local_llm.server_exe() is not None, "gpu_error": local_llm.gpu_probe_error(),
                 "recommended": local_llm.recommend_preset(vram_gb=vram if vram is not None else 0)}
 
     def bug_report(self) -> Dict[str, Any]:
@@ -488,6 +509,7 @@ class Api:
             local_llm.remove_model(local_llm.PRESET_BY_ID[model_id])
         elif kind == "runtime":
             shutil.rmtree(local_llm.runtime_dir(), ignore_errors=True)
+            shutil.rmtree(local_llm.runtime_dir().with_name("llama.cpp-cpu"), ignore_errors=True)
         return {"ok": True}
 
     def clear_memory(self) -> Dict[str, Any]:
@@ -497,6 +519,40 @@ class Api:
         return {"ok": True}
 
     # ---------- русификация ----------
+
+    def progress_check(self, options: Dict[str, Any]) -> Dict[str, Any]:
+        """Спросить ли перед запуском, что делать с уже переведённым: игра переводилась другим
+        способом или моделью. Без вопроса программа переводила всё заново, молча — прогресс,
+        сделанный «крутой» моделью, пропадал при переходе на модель полегче."""
+        from ..core.pipeline import project_dir
+        from ..core.universal import TranslationProject
+        from ..translation import create_translator
+        game = (options or {}).get("game_dir") or ""
+        if not game or not Path(game).is_dir():
+            return {"ask": False}
+        try:
+            proj = TranslationProject.load(project_dir(Path(game)))
+            st = proj.stats()
+        except Exception:  # noqa: BLE001 — игра ещё не переводилась
+            return {"ask": False}
+        old = str(proj.meta.get("translator") or "")
+        done = int(st.get("translated", 0)) + int(st.get("approved", 0))
+        if not old or not done:
+            return {"ask": False}
+        opts = dict(self._cfg)
+        opts.update(options or {})
+        mode = opts.get("mode") or "machine"
+        if mode == "cloud":
+            opts["api_key"] = self._key(opts.get("cloud_provider", ""), (options or {}).get("api_key", ""))
+        try:
+            translator = create_translator(mode, opts, Path(game).name)
+        except Exception:  # noqa: BLE001 — не настроен (нет ключа, модели): ошибку покажет сам запуск
+            return {"ask": False}
+        new = f"{type(translator).__name__}:{translator.cache_id}"
+        if new == old:
+            return {"ask": False}
+        return {"ask": True, "done": done, "total": int(st.get("total", 0)), "old": _translator_title(old),
+                "new": _translator_title(new)}
 
     def start(self, options: Dict[str, Any]) -> Dict[str, Any]:
         from ..core.pipeline import Pipeline, PipelineOptions
@@ -516,6 +572,7 @@ class Api:
             self._emit({"type": "run_started", "game": game, "mode": mode})
             try:
                 translator = create_translator(mode, opts, Path(game).name)
+                from ..core.pipeline import describe_found
                 pipeline = Pipeline(translator, PipelineOptions(font_path=Path(font) if font else None,
                                                                 reuse_translations=bool(options.get("reuse"))),
                                     on_event=self._emit, cancel=self._cancel)
@@ -533,9 +590,45 @@ class Api:
                 "live": result.live,
                 "stats": {"total": result.total_lines, "translated": result.translated_lines,
                           "failed": result.failed_lines, "skipped": result.skipped_lines,
-                          "memory": result.from_memory},
+                          "memory": result.from_memory, "unique": result.found.get("unique", 0),
+                          "words": result.found.get("words", 0), "files": result.found.get("files", 0)},
+                "found": describe_found(result.found) if result.found else "",
             })
         return self._run_task("run", work)
+
+    def preview(self, options: Dict[str, Any]) -> Dict[str, Any]:
+        """Пробный перевод 20 строк игры выбранным способом — до русификации, игра не меняется (итог — событием
+        ``preview_done``). ``round`` — другая выборка строк («Другие строки»)."""
+        from ..core.pipeline import Pipeline, PipelineOptions
+        from ..translation import create_translator
+        from ..translation.base import TranslatorError
+        game = (options or {}).get("game_dir") or self._cfg.get("game_dir", "")
+        if not game or not Path(game).is_dir():
+            return {"ok": False, "error": "Выберите папку с игрой."}
+        mode = options.get("mode") or self._cfg.get("mode", "machine")
+        opts = dict(self._cfg)
+        opts.update(options or {})
+        if mode == "cloud":
+            opts["api_key"] = self._key(opts.get("cloud_provider", ""), options.get("api_key", ""))
+        round_ = int(options.get("round") or 0)
+
+        def relay(ev: Dict[str, Any]) -> None:
+            msg = ev.get("title") if ev.get("type") == "stage" else ev.get("message")
+            if msg and ev.get("type") in ("stage", "status", "progress"):
+                self._emit({"type": "preview_status", "message": msg})
+
+        def work():
+            try:
+                translator = create_translator(mode, opts, Path(game).name)
+                res = Pipeline(translator, PipelineOptions(), on_event=relay, cancel=self._cancel).preview(
+                    Path(game), count=20, offset=round_)
+                self._emit(dict(res, type="preview_done", ok=True, final=True))
+            except TranslatorError as exc:
+                self._emit({"type": "preview_done", "ok": False, "error": str(exc), "final": True})
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Пробный перевод не удался")
+                self._emit({"type": "preview_done", "ok": False, "error": _err(exc), "final": True})
+        return self._run_task("preview", work)
 
     # ---------- обновления ----------
 
@@ -809,10 +902,12 @@ class Api:
             cands = find_game(pkg)
             game = next((c for c in cands if check_game(pkg, c).ok), None)
             chk = check_game(pkg, game) if game else None
-            st = pkg.info.get("stats") or {}
-            return {"ok": True, "path": path, "title": pkg.title, "engine": pkg.game.get("engine_title") or pkg.engine,
-                    "translator": pkg.info.get("translator", ""), "translated": st.get("translated", 0),
-                    "total": st.get("total", 0), "created": pkg.info.get("created", ""),
+            st = pkg.info.get("stats") if isinstance(pkg.info.get("stats"), dict) else {}
+            # архив чужой: в окно — только строки и числа (разметку из них окно экранирует само)
+            return {"ok": True, "path": path, "title": str(pkg.title),
+                    "engine": str(pkg.game.get("engine_title") or pkg.engine),
+                    "translator": str(pkg.info.get("translator", "")), "translated": _count(st.get("translated")),
+                    "total": _count(st.get("total")), "created": str(pkg.info.get("created", "")),
                     "game": str(game) if game else "", "check": chk.message if chk else "",
                     "exact": bool(chk and chk.exact)}
         finally:
@@ -993,6 +1088,41 @@ class Api:
             return {"ok": False, "error": "Игра ещё не русифицирована — отчёта нет."}
         return {"ok": True, "text": text}
 
+    # ---------- таблица перевода ----------
+
+    def table_export(self, path: str) -> Dict[str, Any]:
+        """Таблица «оригинал — перевод» и словарь терминов (CSV для Excel) — в папку для архивов (рабочий стол)."""
+        from ..core import table
+        from ..core.pipeline import project_dir
+        game = Path(path)
+        try:
+            res = table.export_table(project_dir(game), Path(self.export_defaults()["dir"]), game.name)
+        except table.TableError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Таблица перевода не выгружена")
+            return {"ok": False, "error": _err(exc)}
+        self.reveal(res["table"])
+        return dict(res, ok=True)
+
+    def table_import(self, path: str) -> Dict[str, Any]:
+        """Загрузить исправленную таблицу перевода (или словарь терминов) в проект игры."""
+        import webview
+        from ..core import table
+        from ..core.pipeline import project_dir
+        picked = self._window.create_file_dialog(webview.FileDialog.OPEN,
+                                                 file_types=("Таблица CSV (*.csv;*.tsv;*.txt)",))
+        if not picked:
+            return {"ok": False, "cancelled": True}
+        try:
+            res = table.import_table(project_dir(Path(path)), Path(picked[0]))
+        except table.TableError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Таблица перевода не загружена")
+            return {"ok": False, "error": _err(exc)}
+        return dict(res, ok=True)
+
     # ---------- полнота перевода (Unity) ----------
 
     def coverage_last(self, path: str) -> Dict[str, Any]:
@@ -1092,6 +1222,28 @@ def _message(title: str, text: str) -> None:
         print(f"{title}: {text}", file=sys.stderr)
 
 
+NO_WEBVIEW2 = (
+    "Окну программы нужен бесплатный компонент Microsoft — «Edge WebView2 Runtime». Без него окно "
+    "открывается в старом Internet Explorer и не работает: без оформления, кнопки не нажимаются.\n\n"
+    "Установите WebView2 Runtime с сайта Microsoft (developer.microsoft.com/microsoft-edge/webview2) и "
+    ".NET Framework 4.8, затем запустите программу снова.\n\n"
+    "Программа рассчитана на Windows 10/11. На Windows 7 и 8.1 WebView2 есть только до версии 109, "
+    "а живой перевод поверх игры там не работает.")
+
+
+def _web_engine() -> str:
+    """Чем pywebview нарисует окно: "edgechromium", "mshtml"…; "" — не узнать (тогда решит сам start).
+
+    Без WebView2 Runtime (или .NET 4.6.2+) pywebview молча берёт Internet Explorer, где интерфейс
+    программы не работает (Windows 7 из комментариев: «запускается и всё, дальше ничего не работает»).
+    Модуль окна pywebview выбирает движок при импорте — тот же выбор потом сделает и ``webview.start``."""
+    try:
+        from webview.platforms import winforms
+        return str(getattr(winforms, "renderer", ""))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _selftest(blocked: Optional[str] = None) -> int:
     """Проверка сборки без окна: все компоненты импортируются, ресурсы на месте.
 
@@ -1185,6 +1337,11 @@ def run(argv=None) -> int:
         _message("Русификатор игр", blocked)
         return 1
     import webview
+    if sys.platform == "win32" and _web_engine() == "mshtml":
+        logging.getLogger("russificator").error("нет Microsoft Edge WebView2 Runtime — окно было бы "
+                                                "в Internet Explorer")
+        _message("Русификатор игр — нужен компонент WebView2", NO_WEBVIEW2)
+        return 1
     api = Api()
     window = webview.create_window(
         f"Русификатор игр {russificator.__version__}", url=str(WEB / "index.html"), js_api=api,

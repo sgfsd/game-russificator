@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from ..core.universal import Entry, TextKind
-from . import edges, keys, markup
+from . import edges, keys, lang, markup
 from .base import Translator
 from .filters import is_brand, is_transliteration, looks_technical, looks_translatable
 from .memory import TranslationMemory
@@ -129,6 +129,11 @@ class LiveServer:
             return keys.assemble(hint, {t: v for t, v in done.items() if v}) or text
         if not self.wait_ready(self.READY_TIMEOUT):   # cache_id уточняется при подготовке переводчика
             return None
+        # строка чужой локализации игры (китайская, японская, корейская рядом с английской: «攻撃», «UI尺寸»)
+        # — не текст игры: английская модель выдала бы кашу «ПОЛЬЗОВАТЕЛЬСКИЙ ИНТЕРФЕЙС尺寸». Как и при
+        # русификации (translation.lang), язык оригинала берётся из проекта игры
+        if not lang.translatable(text, getattr(self.translator, "source_lang", "en")):
+            return text
         key = (text, None)
         if self.memory is not None:
             try:
@@ -157,7 +162,7 @@ class LiveServer:
             except Exception:  # noqa: BLE001
                 tr = None
         if tr and tr.strip():
-            tr, why = edges.check(text, tr)
+            tr, why = edges.check(text, tr, None, getattr(self.translator, "source_lang", "en"))
             if why:
                 log.info("Живой перевод «%s» отброшен: %s", text[:60], why)
                 return text

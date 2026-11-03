@@ -15,14 +15,15 @@ import json
 import re
 from typing import Optional, Tuple
 
+from .lang import CJK_RE, cjk_letters, cjk_text, has_cjk, russian_punctuation, with_inserts
 from .markup import markup_matches, plain_text
 
-_LETTER_RE = re.compile(r"[A-Za-zА-Яа-яЁё]")
+_LETTER_RE = re.compile(r"[A-Za-zА-Яа-яЁё]|" + CJK_RE.pattern)
 _CYR_RE = re.compile(r"[А-Яа-яЁё]")
 _JSON_RE = re.compile(r'^\s*[\[{]\s*"|"(?:id|type|speaker|text|context|translation|max_chars)"\s*:')
 #: открывающая кавычка -> закрывающая
-_QUOTES = (("''", "''"), ('"', '"'), ("“", "”"), ("«", "»"), ("„", "“"))
-_QUOTE_CHARS = "\"'“”«»„"
+_QUOTES = (("''", "''"), ('"', '"'), ("“", "”"), ("«", "»"), ("„", "“"), ("「", "」"), ("『", "』"))
+_QUOTE_CHARS = "\"'“”«»„「」『』"
 _BULLETS = ("•", "·", "*", "-", "–", "—")
 _PAREN_RE = re.compile(r"^\(([^()]{1,25})\)\s+")
 #: буквы украинского и белорусского алфавитов: в русском переводе это ошибка модели («ДЕЙВІД»)
@@ -36,6 +37,17 @@ _MIXED_WORD_RE = re.compile(r"(?<![\w])(?=[\w]*[А-Яа-яЁё])(?=[\w]*[A-Za-z]
 
 def _letters(text: str) -> int:
     return len(_LETTER_RE.findall(plain_text(text)))
+
+
+def _longest_run(text: str) -> int:
+    """Самая длинная серия одной и той же буквы подряд (без учёта регистра)."""
+    best = cur = 0
+    prev = None
+    for ch in text.lower():
+        cur = cur + 1 if ch == prev and ch.isalpha() else (1 if ch.isalpha() else 0)
+        prev = ch
+        best = max(best, cur)
+    return best
 
 
 def _salvage_json(translation: str) -> Optional[str]:
@@ -61,8 +73,11 @@ def _salvage_json(translation: str) -> Optional[str]:
     return None
 
 
-def check(source: str, translation: str, speaker: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
-    """(годный перевод или None, причина отказа). Перевод-JSON с одной русской строкой — исправляется."""
+def check(source: str, translation: str, speaker: Optional[str] = None,
+          src_lang: str = "en") -> Tuple[Optional[str], Optional[str]]:
+    """(годный перевод или None, причина отказа). Перевод-JSON с одной русской строкой — исправляется.
+    ``src_lang`` — язык оригинала игры (``lang.detect``): английская реплика со вставками иероглифов
+    («Put it down and 捨てぷ 番号») остаётся с ними, а не отбрасывается как «остались иероглифы»."""
     tr = translation
     if _JSON_RE.search(tr) and not _JSON_RE.search(source):
         fixed = _salvage_json(tr)
@@ -76,12 +91,22 @@ def check(source: str, translation: str, speaker: Optional[str] = None) -> Tuple
         return None, "перевод втрое короче оригинала (пересказ или чужая строка)"
     if speaker and tr.strip() == speaker.strip() and source.strip() != speaker.strip():
         return None, "вместо перевода — имя говорящего"
+    # модель зациклилась: «Aaand now they're bursting in.» → «Ааааааааааааааа…» (машинный перевод)
+    if _longest_run(tr) >= 8 and _longest_run(tr) > 2 * _longest_run(source) + 2:
+        return None, "перевод зациклился (одна буква много раз подряд)"
+    # японская (китайская) строка вернулась как есть или наполовину; иероглифы в переводе английской
+    # строки — мусор модели
+    src_cjk, left = cjk_letters(plain_text(source)), cjk_letters(plain_text(tr))
+    if left and (left >= 0.3 * src_cjk if cjk_text(plain_text(source)) and not with_inserts(source, src_lang)
+                 else left > src_cjk):
+        return None, "в переводе остались иероглифы или кана"
     if not _CYR_RE.search(source):
         tr = tr.translate(_FOREIGN_CYR)
         # «ЧТO», «пpивет» — латинская буква-двойник в русском слове: исправляется на русскую
         tr = _MIXED_WORD_RE.sub(lambda m: m.group(0) if m.group(0) in source or re.search(
             r"[^AaBCcEeHKMOoPpTXxyА-Яа-яЁё]", m.group(0)) else m.group(0).translate(_LOOKALIKE), tr)
-        mixed = [w for w in _MIXED_WORD_RE.findall(plain_text(tr)) if w not in source]
+        # «пусто/nэто» — перенос строки «/n» вплотную к слову, а не слово из двух алфавитов
+        mixed = [w for w in _MIXED_WORD_RE.findall(plain_text(tr).replace("/n", " ")) if w not in source]
         if mixed:
             return None, f"слово из латиницы и кириллицы вперемешку: {mixed[0]}"
     return tr, None
@@ -156,4 +181,7 @@ def fix(source: str, translation: str) -> str:
             if t_open and unpaired:                 # непарная кавычка из соседней реплики
                 t_q = t_q[len(t_open):].lstrip()
     inner = s_bul + head + t_q
-    return s_lead_ws + t_lead.lstrip() + inner + t_tail.rstrip() + s_trail_ws
+    out = s_lead_ws + t_lead.lstrip() + inner + t_tail.rstrip() + s_trail_ws
+    # строка на китайском или японском: их пунктуация в переводе — русской; каомодзи английской реплики
+    # («Ｙ⌒Ｙ⌒ ヾ(oﾟДﾟ)ﾉ», Date Everything) не трогаются
+    return russian_punctuation(out) if has_cjk(source) and cjk_text(plain_text(source)) else out

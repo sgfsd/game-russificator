@@ -24,7 +24,8 @@ from typing import Any, Dict, List, Optional
 from .. import net
 from ..core.universal import Entry
 from .base import StatusFn, Translator, TranslatorError, _noop
-from .prompt import SHORTEN_PROMPT, SYSTEM_PROMPT, build_user_message, parse_reply
+from .lang import display_width
+from .prompt import build_user_message, parse_reply, shorten_prompt, system_prompt
 
 log = logging.getLogger("russificator.llm")
 
@@ -100,6 +101,8 @@ class ChatClient:
 
     def _classify(self, exc: net.NetError, attempt: int) -> None:
         s, body = exc.status, (exc.body or str(exc)).lower()
+        if region_blocked(exc):
+            raise TranslatorError(region_message(exc)) from None
         if s in (401, 403):
             raise TranslatorError("Ключ API не подходит или у него нет доступа к модели "
                                   f"({exc}). Проверьте ключ и адрес API.") from None
@@ -113,6 +116,25 @@ class ChatClient:
                                   f"({exc}). Нажмите «Обновить список моделей».") from None
         if s == 400 and not _mentions_json(exc):
             raise TranslatorError(f"Провайдер отклонил запрос: {exc}", fatal=False) from None
+
+
+#: провайдер не работает в стране пользователя (Gemini, OpenAI, Claude из России). Раньше это
+#: выглядело как «ключ не подходит» (403) или как отказ в одном запросе (400) — перевод шёл дальше,
+#: проваливая строку за строкой
+_REGION = ("location is not supported", "unsupported_country", "country, region, or territory",
+           "not available in your country", "not available in your region", "unsupported region")
+
+
+def region_blocked(exc: net.NetError) -> bool:
+    body = (exc.body or str(exc)).lower()
+    if exc.status == 403 and "request not allowed" in body:     # так отвечает Anthropic
+        return True
+    return exc.status in (400, 403, 451) and any(m in body for m in _REGION)
+
+
+def region_message(exc: net.NetError) -> str:
+    return (f"Провайдер не работает из вашей страны ({exc}). Включите VPN или выберите DeepSeek "
+            "либо нейросеть на своём ПК.")
 
 
 def _mentions_json(exc: net.NetError) -> bool:
@@ -170,7 +192,7 @@ class LLMTranslator(Translator):
     def _max_tokens(self, entries: List[Entry]) -> Optional[int]:
         if not self.client.local:
             return None
-        chars = sum(len(e.source) for e in entries)
+        chars = sum(display_width(e.source) for e in entries)     # иероглиф по-русски — два-три знака
         return min(8192, int(chars * 1.2) + 40 * len(entries) + 200)
 
     def translate(self, entries: List[Entry], glossary: Dict[str, str]) -> Dict[str, str]:
@@ -178,7 +200,7 @@ class LLMTranslator(Translator):
             return {}
         user, ids = build_user_message(entries, glossary, self.game_title)
         try:
-            raw = self.client.chat(SYSTEM_PROMPT, user, max_tokens=self._max_tokens(entries))
+            raw = self.client.chat(system_prompt(self.source_lang), user, max_tokens=self._max_tokens(entries))
             parsed = parse_reply(raw)
         except (_BadReply, ValueError) as exc:
             if len(entries) == 1:
@@ -208,8 +230,9 @@ class LLMTranslator(Translator):
         masked, originals, sign = markup.mask(entry.source)
         probe = replace(entry, source=masked, neighbors=[])
         user, _ = build_user_message([probe], glossary, self.game_title)
-        system = SYSTEM_PROMPT + (f"\n\nIMPORTANT: tokens like {sign}0, {sign}1 are placeholders for markup. "
-                                  "Keep every one of them exactly once, where it belongs in the sentence.")
+        system = system_prompt(self.source_lang) + (
+            f"\n\nIMPORTANT: tokens like {sign}0, {sign}1 are placeholders for markup. "
+            "Keep every one of them exactly once, where it belongs in the sentence.")
         try:
             parsed = parse_reply(self.client.chat(system, user, max_tokens=self._max_tokens([entry])))
         except (_BadReply, ValueError, TranslatorError):
@@ -223,7 +246,7 @@ class LLMTranslator(Translator):
     def shorten(self, text: str, limit: int, source: str) -> Optional[str]:
         try:
             reply = self.client.chat("You are an editor of Russian game localization.",
-                                     SHORTEN_PROMPT.format(limit=limit, source=source, text=text),
+                                     shorten_prompt(limit, source, text, self.source_lang),
                                      want_json=False, max_tokens=200 if self.client.local else None)
         except (TranslatorError, _BadReply):
             return None

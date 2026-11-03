@@ -321,11 +321,19 @@ def _gb(n: float) -> str:
 def download(url, dest: Path, progress: Optional[ProgressFn] = None,
              cancel: Optional[threading.Event] = None, sha256: Optional[str] = None,
              expected_size: int = 0, retries: int = 5, notes: Optional[Callable[[str], None]] = None,
-             connections: int = CONNECTIONS) -> Path:
+             connections: int = CONNECTIONS, strict: bool = False) -> Path:
     """Скачать файл с докачкой. ``url`` — ссылка или список ссылок на один и тот же файл (зеркала,
     в порядке предпочтения). ``notes`` получает короткие сообщения для окна (обрыв, смена сервера).
-    Прерванная загрузка продолжается с того же места при следующем вызове."""
+    Прерванная загрузка продолжается с того же места при следующем вызове.
+
+    ``strict`` — файл принимается, только если его SHA-256 равна ``sha256``, что бы ни сообщал сервер:
+    для программ и библиотек (BepInEx, XUnity, llama.cpp), которые потом исполняются, и для
+    сторонних зеркал GitHub. Без ``strict`` хеш, который сообщает сам сервер (Hugging Face — у
+    обновлённой модели), важнее записанного в программе."""
     _ensure_log()
+    pinned = _sha(sha256 or "")
+    if strict and not pinned:
+        raise ValueError("strict: нужна sha256 файла")
     urls = [url] if isinstance(url, str) else [u for u in url if u]
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -359,6 +367,11 @@ def download(url, dest: Path, progress: Optional[ProgressFn] = None,
         rf = probes.get(s.url)
         if rf is None:
             continue
+        if strict and ((rf.sha256 and rf.sha256 != pinned) or (expected_size and rf.size
+                                                                and rf.size != expected_size)):
+            s.dead = "на этом сервере другой файл"
+            log.warning("%s: %s (sha256 %s, размер %s)", s.host, s.dead, rf.sha256 or "?", rf.size)
+            continue
         if info is None and rf.size:
             info = rf
         elif info is not None and (rf.size != info.size or (rf.sha256 and info.sha256 and rf.sha256 != info.sha256)):
@@ -369,14 +382,30 @@ def download(url, dest: Path, progress: Optional[ProgressFn] = None,
                        status=404 if all("HTTP" in s.dead for s in srcs) else 0)
     if info is None or not info.ranges or info.size < MULTI_MIN:
         alive = [s.url for s in srcs if not s.dead]
-        return _stream(alive, dest, progress, cancel, sha256 or (info.sha256 if info else ""), expected_size, retries)
+        return _stream(alive, dest, progress, cancel, sha256 or (info.sha256 if info else ""), expected_size, retries,
+                       strict)
     want_sha = info.sha256
-    pinned = _sha(sha256 or "")
-    if not want_sha and pinned and (not expected_size or info.size == expected_size):
+    if strict:
+        want_sha = pinned
+    elif not want_sha and pinned and (not expected_size or info.size == expected_size):
         want_sha = pinned
     elif want_sha and pinned and want_sha != pinned:
         log.info("на сервере новая версия файла (sha256 %s, программа знала %s)", want_sha, pinned)
     return _segmented(srcs, info.size, want_sha, dest, progress, cancel, note, connections)
+
+
+#: открытые прокси для файлов с GitHub — для тех, у кого github.com не открывается или режется.
+#: Чужой сервер может отдать что угодно, поэтому через них качается только файл с известной SHA-256
+#: (``download(..., strict=True)``): подменённый файл не совпадёт и будет удалён.
+GITHUB_PROXIES = ("https://gh-proxy.com/", "https://ghproxy.net/")
+
+
+def with_github_mirrors(urls: List[str]) -> List[str]:
+    """Ссылки на GitHub и вслед за ними — те же файлы через прокси :data:`GITHUB_PROXIES`."""
+    out = list(urls)
+    for proxy in GITHUB_PROXIES:
+        out += [proxy + u for u in urls if u.startswith("https://github.com/")]
+    return list(dict.fromkeys(out))
 
 
 def _segmented(srcs: List[_Src], size: int, sha: str, dest: Path, progress: Optional[ProgressFn],
@@ -683,6 +712,11 @@ def _load_state(state_file: Path, part: Path, size: int, sha: str) -> Optional[L
         return None
 
 
+def file_sha256(path: Path) -> str:
+    """SHA-256 файла (hex) — сверить архив в кэше с известным хешем."""
+    return _file_sha256(Path(path))
+
+
 def _file_sha256(path: Path, cancel: Optional[threading.Event] = None) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -708,9 +742,10 @@ def _finish(part: Path, dest: Path) -> None:
 
 
 def _stream(urls: List[str], dest: Path, progress: Optional[ProgressFn], cancel: Optional[threading.Event],
-            sha256: str, expected_size: int, retries: int) -> Path:
+            sha256: str, expected_size: int, retries: int, strict: bool = False) -> Path:
     """Одним соединением (маленький файл или сервер без кусков): докачка, если сервер умеет,
-    повторы, пока есть прогресс, источники по кругу."""
+    повторы, пока есть прогресс, источники по кругу. ``strict`` — ответ с другим размером (зеркало
+    отдало страницу ошибки с кодом 200) не качается: берётся следующий источник."""
     part = dest.with_name(dest.name + ".part")
     dest.with_name(dest.name + ".part.json").unlink(missing_ok=True)
     fails = 0
@@ -725,6 +760,8 @@ def _stream(urls: List[str], dest: Path, progress: Optional[ProgressFn], cancel:
                 if have and resp.status != 206:
                     have = 0  # сервер не умеет докачку — начинаем заново
                 length = int(resp.headers.get("Content-Length") or 0)
+                if strict and expected_size and length and have + length != expected_size:
+                    raise NetError(f"на сервере другой файл ({have + length} байт вместо {expected_size})")
                 total = (have + length) if length else expected_size
                 done = have
                 last = 0.0

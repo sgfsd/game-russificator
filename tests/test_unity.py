@@ -57,30 +57,39 @@ def test_detect_not_unity(tmp_path):
 # ---------- строки из кода ----------
 
 def _metadata(strings, version=29) -> bytes:
+    """global-metadata.dat: с v35 у литералов нет длины, с v38 разделы заголовка — тройки."""
     data = b"".join(s.encode("utf-8") for s in strings)
     table = b""
     pos = 0
     for s in strings:
         n = len(s.encode("utf-8"))
-        table += struct.pack("<Ii", n, pos)
+        table += struct.pack("<i", pos) if version >= 35 else struct.pack("<Ii", n, pos)
         pos += n
-    header_size = 8 + 4 * 4
-    sl_off = header_size
+    triples = version >= 38
+    sl_off = 8 + (6 if triples else 4) * 4
     sld_off = sl_off + len(table)
-    head = struct.pack("<Ii", 0xFAB11BAF, version) + struct.pack("<iiii", sl_off, len(table), sld_off, len(data))
-    return head + table + data
+    sections = struct.pack("<6i", sl_off, len(table), len(strings), sld_off, len(data), len(data)) if triples \
+        else struct.pack("<iiii", sl_off, len(table), sld_off, len(data))
+    return struct.pack("<Ii", 0xFAB11BAF, version) + sections + table + data
 
 
 def test_il2cpp_literals_real_layout(tmp_path):
+    """v24–v31 — записи (длина, начало); Unity 6000.3 убрал длины (v35) и сделал разделы заголовка
+    тройками (v38/v39), Unity 6.5+ — v104+. Раньше строки Unity 6.3 не читались, а файл считался
+    зашифрованным (Demonic Mahjong)."""
     meta = tmp_path / "global-metadata.dat"
-    meta.write_bytes(_metadata(["Hello there!", "Привет", "PlayerPrefsKey"]))
-    assert extract.il2cpp_literals(meta) == ["Hello there!", "Привет", "PlayerPrefsKey"]
+    for version in (24, 31, 35, 39, 104, 108):
+        meta.write_bytes(_metadata(["Hello there!", "Привет", "PlayerPrefsKey"], version))
+        assert extract.il2cpp_literals(meta) == ["Hello there!", "Привет", "PlayerPrefsKey"], version
+        assert extract.metadata_version(meta) == version
 
 
 def test_il2cpp_literals_encrypted_is_empty(tmp_path):
     meta = tmp_path / "global-metadata.dat"
     meta.write_bytes(b"\x13\x37" * 100)
-    assert extract.il2cpp_literals(meta) == []
+    assert extract.il2cpp_literals(meta) == [] and extract.metadata_version(meta) is None
+    meta.write_bytes(struct.pack("<Ii", 0xFAB11BAF, 31) + struct.pack("<iiii", 24, 1 << 20, 24, 8))
+    assert extract.il2cpp_literals(meta) == []                  # таблица за концом файла — не падаем
 
 
 def test_dotnet_user_strings_from_real_assembly():
@@ -173,6 +182,53 @@ def test_config_has_partial_and_limits(tmp_path):
     assert "MaxCharactersPerTranslation=2500" in ini
 
 
+def test_config_ignores_line_breaks_the_game_adds(tmp_path):
+    """Реплику «The Sacred↵Sword», которую игра сама разбила на строки (NGUI, Celestian Tales),
+    XUnity находит в словаре как «The Sacred Sword»: переносы при сопоставлении не учитываются."""
+    from russificator.core.backup import GameBackup
+    root = _fake_game(tmp_path)
+    game = detect.inspect(root)
+    xunity.write_config(game, GameBackup(root), live=True, tmp_font=None)
+    ini = (root / "BepInEx" / "config" / "AutoTranslatorConfig.ini").read_text(encoding="utf-8")
+    assert "IgnoreWhitespaceInNGUI=True" in ini and "IgnoreWhitespaceInDialogue=True" in ini
+
+
+def test_mod_archive_with_escaping_paths_is_not_unpacked(tmp_path):
+    """Архив модов с «..» или абсолютным путём внутри (подменённый по дороге) не ставится вовсе:
+    ни одного файла ни в игре, ни за её пределами."""
+    import zipfile
+    from russificator.core.backup import GameBackup
+    root = tmp_path / "Game"
+    root.mkdir()
+    for evil in ("../evil.dll", "BepInEx/../../evil.dll", "C:/evil.dll"):
+        archive = tmp_path / "mod.zip"
+        with zipfile.ZipFile(archive, "w") as z:
+            z.writestr("BepInEx/core/BepInEx.dll", b"ok")
+            z.writestr(evil, b"evil")
+        with pytest.raises(RuntimeError, match="недопустимый путь"):
+            xunity._unzip(archive, root, GameBackup(root), track_top_level=True)
+        assert not (tmp_path / "evil.dll").exists() and not (root / "BepInEx").exists()
+    archive = tmp_path / "good.zip"
+    with zipfile.ZipFile(archive, "w") as z:
+        z.writestr("BepInEx/core/BepInEx.dll", b"ok")
+    xunity._unzip(archive, root, GameBackup(root), track_top_level=True)
+    assert (root / "BepInEx" / "core" / "BepInEx.dll").read_bytes() == b"ok"
+
+
+def test_pinned_mod_archives_cover_every_download():
+    """Каждый архив, который программа ставит в игру, скачивается с известным хешем и размером."""
+    from russificator.engines.unity.detect import UnityGame
+    for backend in ("mono", "il2cpp"):
+        for arch in ("x64", "x86"):
+            g = UnityGame(root=Path("."), data=Path("."), exe=None, backend=backend, arch=arch, version="2021.3.1f1",
+                          uses_tmp=False)
+            for url in (xunity.bepinex_url(g), xunity.xua_url(g)):
+                name = url.rsplit("/", 1)[-1].replace("%2B", "+")
+                sha, size = xunity.PINNED[name]
+                assert len(sha) == 64 and size > 100_000
+    assert xunity.TMP_FONTS_URL.rsplit("/", 1)[-1] in xunity.PINNED
+
+
 def test_bepinex_entrypoint_is_monobehaviour(tmp_path):
     """Загрузчик BepInEx стартует из MonoBehaviour..cctor: из Application..cctor XUnity создаёт свой
     компонент раньше, чем движок готов, — старые Unity (Crawl, 5.4) падали прямо при запуске."""
@@ -202,6 +258,99 @@ def test_bepinex_entrypoint_is_monobehaviour(tmp_path):
                    encoding="utf-8")
     xunity.write_config(game, GameBackup(root), live=True, tmp_font=None)
     assert xunity.ini_value(cfg.read_text(encoding="utf-8"), "Preloader.Entrypoint", "Type") == "Camera"
+
+
+def test_owners_bepinex_config_is_left_alone(tmp_path):
+    """BepInEx, который стоял в игре до русификатора (моды игрока), не трогаем: Mad Island после
+    переноса точки входа на MonoBehaviour..cctor падал на моде игрока («Graphics device is null»).
+    BepInEx, поставленный русификатором, получает точку входа MonoBehaviour..cctor, как раньше."""
+    from russificator.core.backup import GameBackup
+    root = _fake_game(tmp_path)
+    game = detect.inspect(root)
+    core = root / "BepInEx" / "core"
+    core.mkdir(parents=True)
+    (core / "BepInEx.dll").write_bytes(b"x")
+    cfg = root / "BepInEx" / "config" / "BepInEx.cfg"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    owner = "[Preloader.Entrypoint]\nAssembly = UnityEngine.dll\nType = Application\nMethod = .cctor\n"
+    cfg.write_text(owner, encoding="utf-8")
+    xunity.write_config(game, GameBackup(root), live=True, tmp_font=None)
+    assert cfg.read_text(encoding="utf-8") == owner
+    backup = GameBackup(root)
+    backup.track_new(root / "BepInEx")                       # BepInEx поставил русификатор
+    assert backup.is_ours(core / "BepInEx.dll") and not backup.is_ours(tmp_path.parent / "x.dll")
+    xunity.write_config(game, backup, live=True, tmp_font=None)
+    assert xunity.ini_value(cfg.read_text(encoding="utf-8"), "Preloader.Entrypoint", "Type") == "MonoBehaviour"
+
+
+def test_bundle_named_zip_is_opened_as_bundle(tmp_path, monkeypatch):
+    """UnityPy открывает путь «*.zip» как zip-архив: бандл с таким именем (Mad Island: StreamingAssets/
+    dlc_00.zip) не открывался — «File is not a zip file», текст в нём не переводился. Теперь он
+    открывается из байтов; настоящий zip — по пути, как раньше."""
+    import UnityPy
+
+    from russificator.engines.unity import unitypy_io
+    seen = []
+    monkeypatch.setattr(UnityPy, "load", lambda src: seen.append(src) or "env")
+    bundle = tmp_path / "dlc_00.zip"
+    bundle.write_bytes(b"UnityFS\0" + b"\0" * 64)
+    assert unitypy_io.open_env(bundle) == "env" and seen[-1] == bundle.read_bytes()
+    real = tmp_path / "real.zip"
+    with zipfile.ZipFile(real, "w") as z:
+        z.writestr("a.txt", "x")
+    unitypy_io.open_env(real)
+    assert seen[-1] == str(real)
+
+
+def _i2_raw(langs, terms) -> bytes:
+    """Сырые байты базы I2 Localization, как в Fractal Space (Unity 6.3): термин — ключ, тип, N строк,
+    N флагов, пустой Languages_Touch; затем mLanguages — Name, Code, флаг."""
+    def s(t):
+        b = t.encode("utf-8")
+        return struct.pack("<i", len(b)) + b + b"\0" * (-len(b) % 4)
+    out = b"\0" * 32 + s("I2Languages") + struct.pack("<i", len(terms))
+    for key, values in terms:
+        out += s(key) + struct.pack("<i", 0) + struct.pack("<i", len(values)) + b"".join(s(v) for v in values)
+        out += struct.pack("<i", len(values)) + b"\0" * len(values) + b"\0" * (-len(values) % 4) + struct.pack("<i", 0)
+    out += struct.pack("<i", len(langs)) + b"".join(s(n) + s(c) + struct.pack("<i", 0) for n, c in langs)
+    return out
+
+
+def test_i2_table_without_typetree_takes_english_and_official_russian():
+    """Unity 6.3: генератор typetree не читает метаданные, база I2 читалась сплошняком — в перевод уходили
+    все 22 её языка (Fractal Space: 25 тыс. строк вместо английского столбца, часы машинного перевода).
+    Теперь — только английский; официальный русский игры берётся вместо машинного. Правка в байтах
+    меняет только английский столбец, даже если тот же текст стоит в столбце другого языка."""
+    from russificator.engines.unity import direct
+    langs = [("English", "en"), ("French", "fr"), ("Russian", "ru")]
+    terms = [("Explore", ["Explore the Stage", "Explorez la scène", "Исследуйте сцену"]),
+             ("Quit", ["Quit Game", "Quitter le jeu", ""]),
+             ("Hint", ["Press Space to jump", "Press Space to jump", ""]),
+             ("Load", ["Loading", "Chargement", "Загрузка"])]
+    data = _i2_raw(langs, terms)
+    table = direct.raw_i2(data)
+    assert [v for _, v in table.english] == ["Explore the Stage", "Quit Game", "Press Space to jump", "Loading"]
+    assert table.russian == {"Explore the Stage": "Исследуйте сцену", "Loading": "Загрузка"}
+
+    col = extract._Collector()
+    extract._from_i2(table, col, "resources.assets")
+    entries = {e.source: e for e in col.entries()}
+    assert "Explorez la scène" not in entries and "Chargement" not in entries
+    assert entries["Explore the Stage"].translation == "Исследуйте сцену" and entries["Explore the Stage"].notes["official"]
+    assert entries["Quit Game"].translation is None
+
+    hint = {b"Press Space to jump": "Нажмите пробел, чтобы прыгнуть".encode()}
+    new, n, amb = direct.patch_raw(data, hint, {off for off, _ in table.english})
+    assert n == 1 and amb == 0                                   # французский столбец не тронут
+    assert [v for _, v in direct.raw_i2(new).english][2] == "Нажмите пробел, чтобы прыгнуть"
+    assert b"Press Space to jump" in new
+
+
+def test_tmp_font_without_character_table_is_legacy():
+    """Шрифт TMP с пустым старым списком глифов и таблицей глифов, но без таблицы символов: KeyError
+    'm_CharacterTable' ронял правку всех шрифтов файла (Mad Island, data.unity3d)."""
+    font = tmp_cyrillic.TmpFont({"m_glyphInfoList": [], "m_GlyphTable": [{"m_Index": 1}]})
+    assert font.v1 and font.chars() == set()
 
 
 def test_unitypy_files_are_closed(tmp_path):
@@ -312,6 +461,111 @@ class _FakeTexture:
 
     def set_image(self, img, target_format=None):
         self.image = img
+
+
+def _ngui_font(tex_w=None, tex_h=None, origin=(0, 0), color=(200, 170, 40)):
+    """Растровый шрифт NGUI с настоящими латинскими буквами PT Sans: (дерево UIFont, текстура,
+    размер шрифта (ш, в)). ``origin`` — левый верхний угол шрифта в текстуре (атлас); без размеров
+    текстура — впритык к буквам шрифта."""
+    from russificator.fonts.library import ensure_font
+    rend = tmp_cyrillic.GlyphRenderer(ensure_font())
+    base, x, y, row = 26, 2, 2, 0
+    placed = []
+    for ch in "HABCDEFGIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz":
+        g = rend.render(ch, 24, 1, 1.0, sdf=False, xscale=1.0)
+        bh, bw = g.bitmap.shape
+        if x + bw > 126:
+            x, y, row = 2, y + row + 2, 0
+        placed.append((ch, g, x, y))
+        x += bw + 2
+        row = max(row, bh)
+    fw, fh = 128, y + row + 2
+    ox, oy = origin
+    tex = _FakeTexture(tex_w or ox + fw, tex_h or oy + fh)
+    px = tex.image.load()
+    saved = []
+    for ch, g, x, y in placed:
+        bh, bw = g.bitmap.shape
+        for r in range(bh):
+            for c in range(bw):
+                if g.bitmap[r, c] > 0:
+                    px[ox + x + c, oy + y + r] = color + (int(round(g.bitmap[r, c] * 255)),)
+        saved.append({"index": ord(ch), "x": x, "y": y, "width": bw, "height": bh,
+                      "offsetX": int(round(g.bearing_x)) - 1, "offsetY": base - (int(round(g.bearing_y)) + 1),
+                      "advance": int(round(g.advance)), "channel": 15, "kerning": []})
+    W, H = tex.image.size
+    tree = {"m_Name": "Menu Font", "mMat": {"m_FileID": 0, "m_PathID": 3}, "mAtlas": {"m_FileID": 0, "m_PathID": 0},
+            "mUVRect": {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0},
+            "mFont": {"mSize": 30, "mBase": base, "mWidth": W, "mHeight": H, "mSpriteName": "",
+                      "mSaved": saved}}
+    return tree, tex, (fw, fh)
+
+
+def test_ngui_bitmap_font_gets_cyrillic_in_its_own_texture():
+    """Celestian Tales: Realms Beyond (NGUI): переведённые кнопки меню были пустыми — в растровых шрифтах
+    NGUI нет русских букв, а программа их не дорисовывала. Буквы — по меркам шрифта и его цветом,
+    двойники латиницы — готовыми глифами, текстура растёт вниз, высота в описании шрифта — новая."""
+    tree, tex, (fw, fh) = _ngui_font()
+    assert tmp_cyrillic.is_ngui_font(tree)
+    before = [dict(c) for c in tree["mFont"]["mSaved"]]
+    added = tmp_cyrillic.patch_ngui_font(tree, tex, None, set(tmp_cyrillic.RUSSIAN))
+    assert added == len(tmp_cyrillic.RUSSIAN)
+    by = {c["index"]: c for c in tree["mFont"]["mSaved"]}
+    assert all(ord(c) in by for c in tmp_cyrillic.RUSSIAN)
+    assert tree["mFont"]["mSaved"][:len(before)] == before            # старые буквы на своих местах
+    W, H = tex.image.size
+    assert W == fw and H > fh and tree["mFont"]["mHeight"] == H and tree["mFont"]["mWidth"] == fw
+    assert by[ord("А")]["x"] == by[ord("A")]["x"]                      # двойник — тот же глиф
+    assert by[ord("а")]["x"] == by[ord("a")]["x"]                      # строчные — строчными
+    zh, h_lat = by[ord("Ж")], by[ord("H")]
+    assert abs(zh["height"] - h_lat["height"]) <= 2
+    assert 0 <= zh["x"] and zh["x"] + zh["width"] <= W and zh["y"] + zh["height"] <= H
+    pix = [tex.image.getpixel((zh["x"] + c, zh["y"] + r)) for r in range(zh["height"]) for c in range(zh["width"])]
+    inked = [p for p in pix if p[3] > 200]
+    assert inked and all(p[:3] == (200, 170, 40) for p in inked)      # цвет — как у букв шрифта
+    assert tmp_cyrillic.patch_ngui_font(tree, tex, None, set(tmp_cyrillic.RUSSIAN)) == 0
+
+
+def test_ngui_font_in_atlas_keeps_other_sprites():
+    """Шрифт в атласе NGUI: координаты глифов — от угла спрайта шрифта, новые буквы — ниже всех
+    спрайтов атласа (их пиксели не трогаются), описание шрифта не меняется (размер спрайта)."""
+    tree, tex, (fw, fh) = _ngui_font(256, 256, origin=(64, 16))
+    tree["mFont"]["mWidth"], tree["mFont"]["mHeight"] = fw, fh
+    region = (64, 16, fw, fh)
+    occupied = 16 + fh + 20                                            # другой спрайт под шрифтом
+    added = tmp_cyrillic.patch_ngui_font(tree, tex, region, set("ЖЩЯ"), occupied)
+    assert added == 3
+    by = {c["index"]: c for c in tree["mFont"]["mSaved"]}
+    zh = by[ord("Ж")]
+    assert 16 + zh["y"] > occupied                                     # ниже занятого
+    ax, ay = 64 + zh["x"], 16 + zh["y"]
+    assert any(tex.image.getpixel((ax + c, ay + r))[3] > 200 for r in range(zh["height"]) for c in range(zh["width"]))
+    assert tree["mFont"]["mHeight"] == fh and tex.image.size[0] == 256
+    # в атласе с масштабом (BMFont другого размера, чем спрайт) — отказ, а не битые буквы
+    tree2, tex2, _ = _ngui_font(256, 256, origin=(64, 16))
+    tree2["mFont"]["mWidth"], tree2["mFont"]["mHeight"] = fw // 2, fh // 2
+    with pytest.raises(RuntimeError):
+        tmp_cyrillic.patch_ngui_font(tree2, tex2, region, set("Ж"))
+
+
+def test_ngui_trimmed_font_sprite_is_untrimmed():
+    """Celestian Tales: спрайты шрифтов NGUI обрезаны упаковщиком атласа (paddingBottom 124 у страницы 256),
+    NGUI обрезал бы по ним дописанные буквы — меню оставалось пустым. Глифы обрезаются как в NGUI
+    (BMGlyph.Trim), спрайт становится страницей без полей — то же место, куда NGUI клал буквы раньше."""
+    tree = {"mFont": {"mWidth": 256, "mHeight": 256, "mSaved": [
+        {"index": 65, "x": 10, "y": 5, "width": 20, "height": 30, "offsetX": 1, "offsetY": 2},
+        {"index": 66, "x": 250, "y": 120, "width": 12, "height": 20, "offsetX": 0, "offsetY": 0}]}}
+    sprite = {"name": "Font", "x": 885, "y": 709, "width": 255, "height": 132, "paddingLeft": 0,
+              "paddingRight": 1, "paddingTop": 0, "paddingBottom": 124}
+    region = tmp_cyrillic.untrim_ngui_font(tree, sprite)
+    assert region == (885, 709, 256, 256)
+    a, b = tree["mFont"]["mSaved"]
+    assert (a["x"], a["y"], a["width"], a["height"]) == (10, 5, 20, 30)          # внутри — как было
+    assert (b["width"], b["height"]) == (5, 12)                                    # торчащее — обрезано
+    tmp_cyrillic.set_untrimmed(sprite, region)
+    assert (sprite["x"], sprite["y"], sprite["width"], sprite["height"]) == region
+    assert not any(sprite[k] for k in ("paddingLeft", "paddingRight", "paddingTop", "paddingBottom"))
+    assert tmp_cyrillic.untrim_ngui_font(tree, sprite) is None
 
 
 def _tmp2_tree(atlas=256):
@@ -684,6 +938,45 @@ def test_loose_text_files_in_streaming_assets(tmp_path):
     assert "dagger_01" not in found
 
 
+def test_sound_bank_metadata_is_not_text(tmp_path):
+    """Описания банков звука Wwise и FMOD — пути объектов и номера событий, а не текст: их «перевод»
+    («\\SoundBanks\\Блок работы по умолчанию\\…») ломает игре загрузку звука (Demonic Mahjong). Путь Windows
+    с пробелами в папках — тоже не текст, где бы он ни встретился."""
+    import json as _json
+    from russificator.translation.filters import looks_technical
+    root = _fake_game(tmp_path)
+    sa = root / "MyGame_Data" / "StreamingAssets"
+    banks = sa / "Audio" / "GeneratedSoundBanks" / "Windows"
+    banks.mkdir(parents=True)
+    (banks / "UISFX.txt").write_text(
+        "Event\tID\tName\t\t\tWwise Object Path\tNotes\n"
+        "\t2361579146\tPlay_BGBaiWanDan\t\t\t\\Default Work Unit\\SFX\\UI\\Play_BGBaiWanDan\t\n", encoding="utf-8")
+    (sa / "Audio" / "SoundbanksInfo.json").write_text(_json.dumps({"SoundBanksInfo": {"SoundBanks": [
+        {"ShortName": "UISFX", "Path": "UISFX.bnk", "ObjectPath": "\\SoundBanks\\Default Work Unit\\UISFX"}]}}),
+        encoding="utf-8")
+    (sa / "Data").mkdir()
+    (sa / "Data" / "items.json").write_text(_json.dumps({"desc": "For those who favour speed and accuracy."}),
+                                            encoding="utf-8")
+    game = detect.inspect(root)
+    assert [p.name for p in extract.loose_text_files(game)] == ["items.json"]
+    assert looks_technical("\\SoundBanks\\Default Work Unit\\UISFX\\BGBaiWanDan")
+    assert looks_technical("2361579146\tPlay_BGBaiWanDan\t\t\t\\Default Work Unit\\SFX\\UI\\Play_BGBaiWanDan")
+    assert looks_technical("E:\\MaJiang\\MaJiang_WwiseProject\\.cache\\14\\x.wem")
+    assert not looks_technical("Save\\Load")
+    assert not looks_technical("Press \\n to continue")
+    # реплики с кодами RPG Maker и строки через «\n» — не пути (сохранённые проекты прошлых игр)
+    for line in ("Uh... do I look \\c[23]red\\c[0] or \\c[23]human\\c[0]?",
+                 "And... .\\ Interact with objects using the \\fbspace bar\\fb or the \\fbmouse\\fb!",
+                 "\\Shake\\c[2]\\{\\{\\{the attic ladder is in the pantry",
+                 "\\fiXM0-124...\\. Identity confirmed.\\fi",
+                 "\\.S\\.o\\.m\\.e\\.t\\.h\\.i\\.n\\.g\\. i\\.s \\.v\\.e\\.r\\.y \\.w\\.r\\.o\\^",
+                 "can \\|you \\|hold \\|my \\|hand?",
+                 "\\>I am ░░░░░░, caretaker of the\\< \\>RUINS.\\< \\.\\^",
+                 "Herzlichen Glückwunsch! \\nSie wird das Abenteuer\\n Dieses Mal\\n geht es",
+                 "\\nWell then\\nLet us go\\nNow"):
+        assert not looks_technical(line), line
+
+
 def test_coverage_harvest_keeps_live_lines_in_project(tmp_path):
     from russificator.engines.unity import coverage
     root = _fake_game(tmp_path)
@@ -824,6 +1117,115 @@ def test_object_table_guard_catches_script_index_change():
     unitypy_io.fix_script_type_index()
 
 
+def test_bundle_scenes_with_same_path_ids_are_told_apart():
+    """data.unity3d хранит все сцены игры, и path_id у них совпадают (missed messages.). Поиск по
+    одному path_id находил чужой объект: вместо атласа TMP-шрифта — текстовый ассет другой сцены
+    («'TextAsset' object has no attribute 'image'»), а проверка записи перевода сличала объект 553
+    одной сцены с объектом 553 другой и отказывалась записывать файл."""
+    from russificator.engines.unity import unitypy_io
+
+    class _Obj:
+        def __init__(self, sf, pid, kind):
+            self.assets_file, self.path_id, self.kind = sf, pid, kind
+
+    class _Sf:
+        def __init__(self, kinds):
+            self.objects = {pid: _Obj(self, pid, k) for pid, k in kinds.items()}
+
+    level0, level1 = _Sf({7: "Texture2D", 8: "MonoBehaviour"}), _Sf({7: "TextAsset"})
+
+    class _Bundle:
+        files = {"level0": level0, "level1": level1}
+
+    class _Env:
+        file = _Bundle()
+        files = {"data.unity3d": file, "neighbour": _Sf({7: "Font"})}   # соседний файл — не в счёт
+
+    env = _Env()
+    assert unitypy_io.own_files(env) == [level0, level1]
+    objs = unitypy_io.own_objects(env)
+    assert {k: o.kind for k, o in objs.items()} == {(0, 7): "Texture2D", (0, 8): "MonoBehaviour",
+                                                    (1, 7): "TextAsset"}
+    assert unitypy_io.file_numbers(env) == {id(level0): 0, id(level1): 1}
+    font = level0.objects[8]
+    assert unitypy_io.local_object(font, {"m_FileID": 0, "m_PathID": 7}).kind == "Texture2D"
+    assert unitypy_io.local_object(level1.objects[7], {"m_FileID": 0, "m_PathID": 8}) is None
+    assert unitypy_io.local_object(font, {"m_FileID": 1, "m_PathID": 7}) is None   # другой файл
+    assert unitypy_io.local_object(font, None) is None
+
+
+def test_bepinex_is_not_installed_into_stripped_games(tmp_path):
+    """Урезанные библиотеки (Managed Stripping Level: High): без AppDomain.AssemblyResolve Doorstop не
+    запускает BepInEx, без события логов Unity BepInEx роняет MonoBehaviour..cctor, а полные
+    библиотеки ломают корутины самой игры. Таким играм BepInEx не ставится."""
+    from russificator.engines.unity import xunity
+    from russificator.engines.unity.detect import UnityGame
+
+    data = tmp_path / "Game_Data"
+    managed = data / "Managed"
+    managed.mkdir(parents=True)
+    game = UnityGame(root=tmp_path, data=data, exe=None, backend="mono", arch="x64", version="2019.1.0f2",
+                     uses_tmp=True)
+    (managed / "UnityEngine.CoreModule.dll").write_bytes(b"MZ..add_logMessageReceived..")
+    (managed / "mscorlib.dll").write_bytes(b"MZ..get_BaseDirectory..")
+    assert "урезанными" in xunity.bepinex_blocker(game)
+    (managed / "mscorlib.dll").write_bytes(b"MZ..add_AssemblyResolve..")
+    assert xunity.bepinex_blocker(game) == ""
+    (managed / "UnityEngine.CoreModule.dll").write_bytes(b"MZ..Application..")
+    assert xunity.bepinex_blocker(game)                       # нет события логов Unity
+    (managed / "UnityEngine.CoreModule.dll").unlink()
+    (managed / "UnityEngine.dll").write_bytes(b"MZ..RegisterLogCallback..")   # Unity 5: старое API
+    assert xunity.bepinex_blocker(game) == ""
+    assert xunity.bepinex_blocker(UnityGame(root=tmp_path, data=data, exe=None, backend="il2cpp", arch="x64",
+                                            version="2021.3.1f1", uses_tmp=True)) == ""
+
+
+def test_bepinex_is_not_installed_where_it_crashes_il2cpp_games(tmp_path):
+    """Unity 6000.3+ (метаданные v38/v39): Il2CppInterop промахивается перехватом Class::Init, и игра
+    падает при запуске (Demonic Mahjong: «при первом запуске качает что должен и закрывается»).
+    Зашифрованные метаданные BepInEx не прочтёт. Таким играм BepInEx не ставится."""
+    from russificator.engines.unity import xunity
+    from russificator.engines.unity.detect import UnityGame
+
+    data = tmp_path / "Game_Data"
+    meta = data / "il2cpp_data" / "Metadata" / "global-metadata.dat"
+    meta.parent.mkdir(parents=True)
+    game = UnityGame(root=tmp_path, data=data, exe=None, backend="il2cpp", arch="x64", version="6000.3.21f1",
+                     uses_tmp=True)
+    assert xunity.bepinex_blocker(game) == ""                   # метаданных нет — судить не по чему
+    meta.write_bytes(_metadata(["Hi"], 31))
+    assert xunity.bepinex_blocker(game) == ""
+    meta.write_bytes(_metadata(["Hi"], 39))
+    assert "новой Unity (6000.3.21f1)" in xunity.bepinex_blocker(game)
+    meta.write_bytes(b"\x13\x37" * 100)
+    assert "зашифрован" in xunity.bepinex_blocker(game)
+
+
+def test_bundle_over_4gb_is_saved_with_lz4():
+    """Несжатый бандл UnityPy пишет одним блоком с 32-битным размером: бандл больше 4 ГБ не сохранялся
+    («'I' format requires 0 <= number <= 4294967295» — шрифты Demonic Mahjong остались без кириллицы).
+    Такой бандл сохраняется сжатым LZ4 блоками по 128 КБ; у файла .assets ошибка не прячется."""
+    from types import SimpleNamespace
+
+    from russificator.engines.unity import unitypy_io
+
+    class Bundle:
+        signature = "UnityFS"
+
+        def save(self, packer=None):
+            if packer is None:
+                struct.pack("<I", 5 << 30)
+            return b"packed:" + packer.encode()
+
+    class Assets:
+        def save(self):
+            struct.pack("<I", -1)
+
+    assert unitypy_io.save_env(SimpleNamespace(file=Bundle())) == b"packed:lz4"
+    with pytest.raises(struct.error):
+        unitypy_io.save_env(SimpleNamespace(file=Assets()))
+
+
 def test_short_texts_are_guarded_from_partial_translations():
     """XUnity с частичными переводами подставлял в одиночные буквы начало чужого перевода (сетка
     ввода имени Crawl: «B» → «Б», «I» → «Вс»). Буквы, цифры и первые 1–2 знака строк словаря —
@@ -931,6 +1333,77 @@ def test_direct_i2_source_keeps_term_keys():
     assert term["Term"] == "Use the battery" and term["Languages"] == ["用電池", "Включи батарейку"]
 
 
+def test_direct_unity_localization_string_table():
+    """Death Must Die: текст игры — в таблицах Unity Localization (бандлы Addressables), с подстановками
+    чисел. XUnity готовую строку («+15% Power Luck») в словаре не находит — перевод пишется в таблицу,
+    и короткие записи тоже: ключи — в общей таблице, здесь только текст."""
+    from russificator.engines.unity.direct import is_string_table, patch_tree
+    smart = "{0:stat(per|0.#|%|s)} <color=#b58d40>Power</color> Luck"
+    tree = {"m_Name": "Items_en", "m_LocaleId": {"m_Code": "en"},
+            "m_SharedData": {"m_FileID": 0, "m_PathID": 7}, "m_Metadata": {"m_Items": []},
+            "m_TableData": [{"m_Id": 11, "m_Localized": smart, "m_Metadata": {"m_Items": []}},
+                            {"m_Id": 12, "m_Localized": "Fire Whip", "m_Metadata": {"m_Items": []}},
+                            {"m_Id": 13, "m_Localized": "Not translated yet", "m_Metadata": {"m_Items": []}}]}
+    assert is_string_table(tree)
+    full = {smart: "{0:stat(per|0.#|%|s)} <color=#b58d40>Сила</color> Удачи", "Fire Whip": "Огненный хлыст"}
+    assert patch_tree(tree, full, {}) == 2
+    assert [r["m_Localized"] for r in tree["m_TableData"]] == [full[smart], "Огненный хлыст", "Not translated yet"]
+    assert tree["m_Name"] == "Items_en"
+    assert not is_string_table({"m_TableData": [{"m_Id": 1}]})
+
+
+def test_other_locale_string_tables_get_russian_by_id():
+    """Mad Island на русской Windows стартует по-японски (язык игры по умолчанию): русский пишется и в таблицы
+    других языков — по номеру записи из английской таблицы того же набора (общая таблица ключей)."""
+    from types import SimpleNamespace
+    from russificator.engines.unity.direct import fill_string_table, patch_string_table, string_table_key
+    shared = {"m_FileID": 2, "m_PathID": 77}
+    en = {"m_SharedData": shared, "m_TableData": [{"m_Id": 1, "m_Localized": "Continue"},
+                                                  {"m_Id": 2, "m_Localized": "New Game"}]}
+    ja = {"m_SharedData": shared, "m_TableData": [{"m_Id": 2, "m_Localized": "はじめから"},
+                                                  {"m_Id": 1, "m_Localized": "つづきから"},
+                                                  {"m_Id": 3, "m_Localized": "終了"}]}
+    ext = [SimpleNamespace(path="archive:/CAB-aa/CAB-aa"), SimpleNamespace(path="archive:/CAB-Shared/CAB-shared")]
+    obj = SimpleNamespace(assets_file=SimpleNamespace(name="CAB-en", externals=ext))
+    assert string_table_key(obj, en) == ("cab-shared", 77)
+    ids = {}
+    assert patch_string_table(en, {"Continue": "Продолжить", "New Game": "Новая игра"}, ids) == 2
+    assert fill_string_table(ja, ids) == 2
+    assert [r["m_Localized"] for r in ja["m_TableData"]] == ["Новая игра", "Продолжить", "終了"]
+
+
+def test_dynamic_tmp_font_without_room_is_patched():
+    """Динамический TMP-шрифт дорисует кириллицу сам, только если в атласе есть место (Death Must Die:
+    атлас меню забит латиницей — в игре видна одна «Г» из «Играть»)."""
+    glyphs = [{"m_Index": i, "m_GlyphRect": {"m_X": 0, "m_Y": 0, "m_Width": 100, "m_Height": 110}} for i in range(9)]
+    base = {"m_GlyphTable": glyphs, "m_CharacterTable": [], "m_AtlasPopulationMode": 1, "m_AtlasPadding": 9}
+    full = tmp_cyrillic.TmpFont({**base, "m_FreeGlyphRects": [{"m_X": 1000, "m_Y": 0, "m_Width": 24,
+                                                                 "m_Height": 1024}]})
+    roomy = tmp_cyrillic.TmpFont({**base, "m_FreeGlyphRects": [{"m_X": 0, "m_Y": 0, "m_Width": 2048,
+                                                                  "m_Height": 1024}]})
+    assert full.is_dynamic() and not full.dynamic_room(66)
+    assert roomy.dynamic_room(66)
+    multi = tmp_cyrillic.TmpFont({**base, "m_FreeGlyphRects": [], "m_IsMultiAtlasTexturesEnabled": 1})
+    assert multi.dynamic_room(66)
+
+
+def test_unicode_reference_table_is_not_text():
+    """Справочник символов в ресурсах игры (Death Must Die, «Unicode table») — не текст для игрока."""
+    from russificator.translation.filters import looks_spoken, looks_technical
+    row = "⊒  \tU+2292 (alt-08850)\tSQUARE ORIGINAL OF OR EQUAL TO"
+    assert looks_technical(row) and not looks_spoken(row)
+    assert not looks_technical("Press U to open the map")
+
+
+def test_foreign_string_table_bundles_by_language_name():
+    from pathlib import Path
+    from russificator.engines.unity.extract import _foreign_bundle
+    d = Path("aa/StandaloneWindows64")
+    bg = d / "localization-string-tables-bulgarian(bg)_assets_all.bundle"
+    en = d / "localization-string-tables-english(en)_assets_all.bundle"
+    assert _foreign_bundle(bg, [bg, en]) and not _foreign_bundle(en, [bg, en])
+
+
 def test_direct_generic_fields_skip_keys():
     from russificator.engines.unity.direct import patch_tree
     phrase = "The door is locked from the inside."
@@ -938,6 +1411,43 @@ def test_direct_generic_fields_skip_keys():
     assert patch_tree(tree, {}, {phrase: "Дверь заперта изнутри."}) == 2
     assert tree["m_Name"] == phrase and tree["questId"] == phrase
     assert tree["description"] == tree["lines"][0] == "Дверь заперта изнутри."
+
+
+def test_direct_short_labels_of_text_components():
+    """Надпись TextMeshPro/UGUI Text переводится и одним словом («Settings» в меню missed messages.):
+    без BepInEx её больше некому перевести. В прочих полях короткие строки — возможные ключи."""
+    from russificator.engines.unity.direct import patch_tree, text_component_field
+    full = {"Settings": "Настройки", "Start": "Начать"}
+    tmp = {"m_text": " Settings", "m_fontAsset": {"m_FileID": 0, "m_PathID": 5}, "m_Name": "Settings"}
+    assert patch_tree(tmp, full, {}) == 1
+    assert tmp["m_text"] == " Настройки" and tmp["m_Name"] == "Settings"
+    ugui = {"m_Text": "Start", "m_FontData": {"m_FontSize": 14}}
+    assert patch_tree(ugui, full, {}) == 1 and ugui["m_Text"] == "Начать"
+    ngui = {"mText": "Settings", "mFont": {"m_FileID": 0, "m_PathID": 9}, "mTrueTypeFont": {"m_PathID": 0}}
+    assert patch_tree(ngui, full, {}) == 1 and ngui["mText"] == "Настройки"   # NGUI UILabel
+    other = {"m_text": "Start", "eventName": "Start"}           # не текстовый компонент
+    assert text_component_field(other) is None
+    assert patch_tree(other, full, {}) == 0 and other["m_text"] == "Start"
+
+
+def test_direct_text_fields_are_learned_from_phrases():
+    """Варианты ответа Fungus (MenuOption.text): рядом с фразой «Go back to work.» у того же класса
+    лежат «Yes» и «Thank you». Поле, где встречаются фразы, — текстовое: в нём переводится и короткое.
+    Поля без фраз (ключи, описания из одного слова) не трогаются."""
+    from russificator.engines.unity.direct import patch_tree, text_fields, tree_signature
+    phrases = {"Go back to work.": "Возвращайся к работе."}
+    full = {**phrases, "Yes": "Да", "Thank you": "Спасибо"}
+    long = {"itemId": 1, "text": "Go back to work.", "description": "", "blockName": "Yes"}
+    short = {"itemId": 2, "text": "Thank you", "description": "Yes", "blockName": "Yes"}
+    fields = text_fields(long, phrases)
+    assert fields == {"text"} and tree_signature(long) == tree_signature(short)
+    assert patch_tree(short, full, phrases) == 0                  # без знания о классе — только фразы
+    assert patch_tree(short, full, phrases, fields) == 1
+    assert short == {"itemId": 2, "text": "Спасибо", "description": "Yes", "blockName": "Yes"}
+    nested = {"options": [{"caption": "Go back to work."}, {"caption": "Yes"}]}
+    assert text_fields(nested, phrases) == {"options/caption"}
+    assert patch_tree(nested, full, phrases, {"options/caption"}) == 2
+    assert nested["options"][1]["caption"] == "Да"
 
 
 def test_tmp_font_upgraded_asset_with_leftover_legacy_list_is_v2():

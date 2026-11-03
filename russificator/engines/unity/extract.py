@@ -34,10 +34,12 @@ import struct
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
-from ...core.universal import Entry, TextKind
+from ...core.universal import Entry, EntryStatus, TextKind
 from ...translation.filters import (halfwidth, looks_like_sentence, looks_spoken, looks_technical,
                                     looks_translatable)
+from ...translation.lang import cjk_letters, cjk_text, has_cjk
 from . import direct, text_assets, unitypy_io
+from . import tmp_cyrillic as _tmp
 from .detect import UnityGame
 
 log = logging.getLogger("russificator.unity.extract")
@@ -102,6 +104,11 @@ class _Collector:
         self.seen: Optional[Dict[str, str]] = None
         #: строки, найденные уверенно (не только «для словаря»): их можно вписывать и в данные игры
         self.confident: set = set()
+        #: официальный русский самой игры (столбец базы I2): строка -> перевод разработчиков
+        self.official: Dict[str, str] = {}
+        #: файлы, где найден текст для данных игры: прямой перевод открывает только их бандлы Addressables
+        #: (в Demonic Mahjong один такой бандл — 2,6 ГБ, лишнее чтение — полчаса и гигабайты памяти)
+        self.text_files: set = set()
 
     def see(self, text: str, origin: str) -> None:
         if self.seen is not None and isinstance(text, str) and text.strip() and len(text) <= 20000:
@@ -117,6 +124,7 @@ class _Collector:
             return
         if not display_only:
             self.confident.add(text)
+            self.text_files.add(origin.split(":", 1)[0])
         prev = self.items.get(text)
         if prev is None or (prev[0] == TextKind.OTHER and kind != TextKind.OTHER):
             self.items[text] = (kind, origin)
@@ -132,9 +140,13 @@ class _Collector:
     def entries(self) -> List[Entry]:
         out = []
         for text, (kind, origin) in self.items.items():
-            out.append(Entry(id=text_key(text), source=text, kind=kind, target_key=text_key(text),
-                             scene=origin, max_length=None,
-                             notes={} if text in self.confident else {"display_only": True}))
+            e = Entry(id=text_key(text), source=text, kind=kind, target_key=text_key(text),
+                      scene=origin, max_length=None,
+                      notes={} if text in self.confident else {"display_only": True})
+            if text in self.official:            # перевод разработчиков лучше машинного — берётся как есть
+                e.translation, e.status = self.official[text], EntryStatus.APPROVED
+                e.notes["official"] = True
+            out.append(e)
         return out + self.pages
 
 
@@ -201,8 +213,14 @@ def _typetree_generator(game: UnityGame, warnings: List[str]):
         return gen
     except Exception as exc:  # noqa: BLE001
         log.info("typetree не построен: %s", exc)
-        warnings.append("Сборки игры не удалось разобрать (возможно, защищены) — текст из сцен "
-                        "будет переведён в игре на лету.")
+        version = metadata_version(game.data / "il2cpp_data" / "Metadata" / "global-metadata.dat") \
+            if game.backend == "il2cpp" else None
+        if version is not None and version > 31:      # Unity 6000.3+: генератор такие метаданные не читает
+            warnings.append(f"Скрипты сцен игры на новой Unity ({game.version}) пока не разбираются — часть "
+                            "текста из сцен переведёт только «Живой перевод».")
+        else:
+            warnings.append("Сборки игры не удалось разобрать (возможно, защищены) — текст из сцен "
+                            "будет переведён в игре на лету.")
         return None
 
 
@@ -247,8 +265,9 @@ def extract_assets(game: UnityGame, col: _Collector, warnings: List[str], progre
                             if tree is None:
                                 _from_raw(obj, col, f.name)
                                 continue
-                        if "m_glyphInfoList" in tree or "m_GlyphTable" in tree:
-                            has_font = True
+                        if ("m_glyphInfoList" in tree or "m_GlyphTable" in tree
+                                or _tmp.is_ex2d_font(tree) or _tmp.is_ngui_font(tree)):
+                            has_font = True             # TMP, ex2D, NGUI — кириллица дорисуется в них
                             continue
                         comp = _from_monobehaviour(tree, col, f.name)
                         if comp is not None:
@@ -366,8 +385,23 @@ def _from_monobehaviour(tree: dict, col: _Collector, origin: str) -> Optional[st
             if looks_translatable(val):
                 col.add(val, TextKind.UI, origin)
             return field
+    table = direct.i2_table(tree)
+    if table is not None:
+        _from_i2(table, col, origin)
+        return None
     _walk_strings(tree, col, origin, depth=0)
     return None
+
+
+def _from_i2(table: "direct.I2Table", col: _Collector, origin: str) -> None:
+    """База I2 Localization: только английский столбец (остальные языки — не исходник) и официальный
+    русский игры, если он есть."""
+    for _, s in table.english:
+        col.see(s, origin)
+        if looks_translatable(s):
+            col.add(s, TextKind.OTHER, origin)
+            if s in table.russian:
+                col.official.setdefault(s, table.russian[s])
 
 
 def _from_utage_grids(grids: list, col: _Collector, origin: str) -> None:
@@ -548,7 +582,8 @@ def raw_strings(data: bytes, start: int = 0) -> List[Tuple[int, str]]:
                 s = data[i + 4:i + 4 + ln].decode("utf-8")
             except UnicodeDecodeError:
                 s = ""
-            if s and all(c.isprintable() or c in "\n\r\t" for c in s) and re.search(r"[A-Za-z]{2}", s):
+            if s and all(c.isprintable() or c in "\n\r\t" for c in s) and (re.search(r"[A-Za-z]{2}", s)
+                                                                           or has_cjk(s)):
                 out.append((i, s))
                 i = (i + 4 + ln + 3) & ~3
                 continue
@@ -560,6 +595,10 @@ def _from_raw(obj, col: _Collector, origin: str) -> None:
     try:
         data = obj.get_raw_data()
     except Exception:  # noqa: BLE001
+        return
+    table = direct.raw_i2(data)
+    if table is not None:
+        _from_i2(table, col, origin)
         return
     # заголовок MonoBehaviour: m_GameObject, m_Enabled, m_Script, затем m_Name — имя объекта не переводим
     for off, s in raw_strings(data, 0):
@@ -753,9 +792,11 @@ def extract_code_strings(game: UnityGame, col: _Collector, warnings: List[str]) 
         meta = game.data / "il2cpp_data" / "Metadata" / "global-metadata.dat"
         if meta.is_file():
             strings = il2cpp_literals(meta)
-            if not strings:
-                warnings.append("global-metadata.dat зашифрован или нестандартный — строки из кода "
-                                "переведутся в игре на лету.")
+            if not strings and metadata_version(meta) is None:
+                warnings.append("global-metadata.dat зашифрован — строки из кода игры переводит только "
+                                "«Живой перевод» поверх экрана.")
+            elif not strings:
+                warnings.append("global-metadata.dat нестандартный — строки из кода переведутся в игре на лету.")
     for s in strings:
         col.see(s, "code")
         if looks_translatable(s, strict=True) and (looks_like_sentence(s) or _ui_word(s) or _format_text(s)):
@@ -772,7 +813,10 @@ _PREFIX_RE = re.compile(r"[A-Z][A-Za-z']*(?: [A-Za-z']+){0,4}(?::| -) ")
 
 
 def _ui_word(s: str) -> bool:
-    """Короткая строка интерфейса: «Continue», «Game Over», «Motion Sensor» (но не «MotionSensor»)."""
+    """Короткая строка интерфейса: «Continue», «Game Over», «Motion Sensor» (но не «MotionSensor»).
+    Иероглифами и каной — от двух знаков без знаков препинания: «決定», «セーブ»."""
+    if cjk_text(s):
+        return 2 <= cjk_letters(s) <= 10 and not re.search(r"[。、，！？!?.,:;_/\\{}<>=]", s)
     words = s.split()
     return (1 <= len(words) <= 4 and s[:1].isupper() and all(w.isalpha() or w[:-1].isalpha() for w in words)
             and not any(re.search(r"[a-z][A-Z]", w) for w in words))
@@ -786,27 +830,50 @@ def _lower_label(s: str) -> bool:
             and any(len(w) >= 3 for w in words))
 
 
+METADATA_MAGIC = 0xFAB11BAF
+
+
+def metadata_version(meta: Path) -> Optional[int]:
+    """Версия global-metadata.dat; None — файла нет или заголовок не IL2CPP (файл зашифрован)."""
+    try:
+        with meta.open("rb") as fh:
+            sanity, version = struct.unpack("<Ii", fh.read(8))
+    except (OSError, struct.error):
+        return None
+    return version if sanity == METADATA_MAGIC else None
+
+
 def il2cpp_literals(meta: Path) -> List[str]:
     """Строковые литералы из global-metadata.dat (только чтение).
 
-    Заголовок: sanity 0xFAB11BAF, version, затем пары (offset, size):
-    stringLiteral (+8/+12) и stringLiteralData (+16/+20). Запись литерала —
-    {uint32 length; int32 dataIndex} (метаданные v24–v31).
+    Заголовок: sanity 0xFAB11BAF, version, затем разделы — таблица литералов (stringLiteral) и их
+    данные (stringLiteralData): до v38 раздел — пара (offset, size), с v38 (Unity 6000.3) — тройка
+    (offset, size, count). Запись литерала до v35 — {uint32 length; int32 dataIndex}; с v35 длины нет,
+    строка тянется до начала следующей (так читает Cpp2IL). Без этого строки Unity 6.3+ не читались,
+    а файл считался зашифрованным.
     """
     try:
         data = meta.read_bytes()
         sanity, version = struct.unpack_from("<Ii", data, 0)
-        if sanity != 0xFAB11BAF or not (16 <= version <= 40):
+        if sanity != METADATA_MAGIC or not (16 <= version <= 200):
             return []
-        sl_off, sl_size, sld_off, sld_size = struct.unpack_from("<iiii", data, 8)
+        if version >= 38:
+            sl_off, sl_size, _, sld_off, sld_size, _ = struct.unpack_from("<6i", data, 8)
+        else:
+            sl_off, sl_size, sld_off, sld_size = struct.unpack_from("<iiii", data, 8)
     except (OSError, struct.error):
         return []
-    if min(sl_off, sl_size, sld_off, sld_size) < 0 or sld_off + sld_size > len(data):
+    if (min(sl_off, sl_size, sld_off, sld_size) < 0 or sl_off + sl_size > len(data)
+            or sld_off + sld_size > len(data)):
         return []
+    if version >= 35:
+        starts = [struct.unpack_from("<i", data, sl_off + i * 4)[0] for i in range(sl_size // 4)]
+        spans = [(start, end - start) for start, end in zip(starts, starts[1:] + [sld_size])]
+    else:
+        spans = [struct.unpack_from("<Ii", data, sl_off + i * 8)[::-1] for i in range(sl_size // 8)]
     out = []
-    for i in range(sl_size // 8):
-        length, index = struct.unpack_from("<Ii", data, sl_off + i * 8)
-        if index < 0 or length == 0 or index + length > sld_size:
+    for index, length in spans:
+        if index < 0 or length <= 0 or index + length > sld_size:
             continue
         try:
             out.append(data[sld_off + index: sld_off + index + length].decode("utf-8"))
@@ -857,7 +924,13 @@ _LANGS = {"fr", "fre", "french", "francais", "de", "ger", "german", "deutsch", "
           "cn", "chs", "cht", "chinese", "schinese", "tchinese", "zhcn", "zhtw", "tw", "ru", "rus", "russian",
           "uk", "ua", "ukrainian", "nl", "dutch", "sv", "swedish", "no", "norwegian", "da", "danish", "fi",
           "finnish", "cs", "czech", "hu", "hungarian", "ro", "romanian", "th", "thai", "vi", "vietnamese", "id",
-          "indonesian", "ar", "arabic", "he", "hebrew", "el", "greek", "latam", "mx"}
+          "indonesian", "ar", "arabic", "he", "hebrew", "el", "greek", "latam", "mx",
+          # Death Must Die: «localization-string-tables-bulgarian(bg)…» рядом с английской таблицей
+          "bg", "bulgarian", "ca", "catalan", "sk", "slovak", "sr", "serbian", "hr", "croatian", "sl",
+          "slovenian", "lt", "lithuanian", "lv", "latvian", "et", "estonian", "be", "belarusian", "kk", "kazakh",
+          "ms", "malay", "hi", "hindi", "fa", "persian", "fil", "filipino", "ka", "georgian", "hy", "armenian",
+          "az", "azerbaijani", "eu", "basque", "gl", "galician", "bn", "bengali", "ur", "urdu", "af", "afrikaans",
+          "sq", "albanian", "mk", "macedonian", "bs", "bosnian", "mn", "mongolian", "ta", "tamil", "te", "telugu"}
 _ENGLISH = {"en", "eng", "english", "enus", "engb"}
 
 
@@ -887,8 +960,18 @@ def _foreign_language(path: Path) -> bool:
     return False
 
 
+#: служебные файлы звуковых движков рядом с банками звука: описания банков Wwise («GeneratedSoundBanks/
+#: *.json, *.txt», SoundbanksInfo) и FMOD. Это пути объектов и номера событий, а не текст: «перевод»
+#: «\SoundBanks\Default Work Unit\…» в «\SoundBanks\Блок работы по умолчанию\…» (Demonic Mahjong, 671 файл)
+#: ломает загрузку банков
+_AUDIO_DATA_DIRS = {"generatedsoundbanks", "wwise", "wwisesoundbanks", "soundbanks", "fmod", "fmodbanks"}
+_AUDIO_DATA_FILES = {"soundbanksinfo.json", "soundbanksinfo.xml", "pluginsinfo.json", "platforminfo.json",
+                     "pluginsinfo.xml", "platforminfo.xml", "guids.txt"}
+
+
 def loose_text_files(game: UnityGame) -> List[Path]:
-    """Текстовые файлы данных игры в StreamingAssets (без каталога Addressables и бандлов)."""
+    """Текстовые файлы данных игры в StreamingAssets (без каталога Addressables, бандлов и служебных файлов
+    звуковых движков)."""
     sa = game.data / "StreamingAssets"
     if not sa.is_dir():
         return []
@@ -902,6 +985,8 @@ def loose_text_files(game: UnityGame) -> List[Path]:
         except ValueError:
             continue
         if not p.is_file() or p.suffix.lower() not in LOOSE_TEXT_EXT or (rel and rel[0].lower() == "aa"):
+            continue
+        if p.name.lower() in _AUDIO_DATA_FILES or any(part.lower() in _AUDIO_DATA_DIRS for part in rel[:-1]):
             continue
         try:
             size = p.stat().st_size

@@ -14,8 +14,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from .. import net
 from .base import TranslatorError
-from .llm import ChatClient, LLMTranslator
+from .llm import ChatClient, LLMTranslator, region_blocked, region_message
 
 
 @dataclass
@@ -44,13 +45,14 @@ PROVIDERS: Dict[str, Provider] = {p.id: p for p in [
              prefer=["deepseek/deepseek-v4", "google/gemini-3", "flash", "deepseek/", ":free"]),
     Provider("gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai",
              "gemini-flash-latest", "https://aistudio.google.com/apikey",
-             "Есть бесплатный лимит запросов в день.",
+             "Есть бесплатный лимит запросов в день. Из России — только через VPN.",
              prefer=["gemini-flash-latest", "flash-lite", "flash"]),
     Provider("openai", "OpenAI", "https://api.openai.com/v1", "gpt-6-luna",
-             "https://platform.openai.com/api-keys", "",
+             "https://platform.openai.com/api-keys", "Из России — только через VPN.",
              prefer=["luna", "mini", "gpt-"]),
     Provider("anthropic", "Anthropic Claude", "https://api.anthropic.com/v1", "claude-haiku-4-5",
-             "https://console.anthropic.com/settings/keys", "Отличное качество литературного перевода.",
+             "https://console.anthropic.com/settings/keys",
+             "Отличное качество литературного перевода. Из России — только через VPN.",
              prefer=["haiku", "sonnet"]),
     Provider("mistral", "Mistral", "https://api.mistral.ai/v1", "mistral-small-latest",
              "https://console.mistral.ai/api-keys", "",
@@ -63,10 +65,13 @@ PROVIDERS: Dict[str, Provider] = {p.id: p for p in [
              "Любой OpenAI-совместимый API: укажите адрес (…/v1), ключ и модель.", needs_key=False),
 ]}
 
-#: модели, которые для перевода не годятся (картинки, речь, эмбеддинги...)
-_NOT_CHAT = re.compile(r"embed|whisper|tts|speech|audio|image|vision-exp|dall-e|moderation|rerank|realtime|"
-                       r"transcri|ocr|search|computer-use|guard|codestral|coder|-code|sora|veo|imagen|lyria",
-                       re.I)
+#: модели не для текста (эмбеддинги, речь, картинки, видео) — в списке их нет совсем
+_NOT_CHAT = re.compile(r"embed|whisper|tts|speech|audio|image|dall-e|moderation|rerank|realtime|"
+                       r"transcri|sora|veo|imagen|lyria", re.I)
+#: текстовые, но заточенные под другое (код, поиск, распознавание, фильтры) — в конце списка, но
+#: выбрать их можно: «qwen2.5-coder» в LM Studio переводит, и прятать его нельзя (было: из
+#: четырёх моделей LM Studio выбрать давало только две)
+_OTHER_JOB = re.compile(r"ocr|search|computer-use|guard|codestral|coder|-code|vision-exp", re.I)
 _SLOW = re.compile(r"reasoner|thinking|-r1|\bo\d|pro-preview|deep-research", re.I)
 
 
@@ -83,7 +88,7 @@ def recommend(provider_id: str, models: List[str]) -> List[str]:
                     pref = i
                     break
         dated = bool(re.search(r"\d{4}-?\d{2}-?\d{2}|-\d{4}$|preview|exp", m))
-        return (pref, bool(_SLOW.search(m)), dated, -_version(m), m)
+        return (bool(_OTHER_JOB.search(m)), pref, bool(_SLOW.search(m)), dated, -_version(m), m)
 
     return sorted(chat, key=score)
 
@@ -104,7 +109,12 @@ def make_client(provider_id: str, api_key: str, base_url: str = "", model: str =
 
 def list_models(provider_id: str, api_key: str, base_url: str = "") -> List[str]:
     """Актуальные модели провайдера, подходящие сверху."""
-    return recommend(provider_id, make_client(provider_id, api_key, base_url).list_models())
+    try:
+        return recommend(provider_id, make_client(provider_id, api_key, base_url).list_models())
+    except net.NetError as exc:
+        if region_blocked(exc):
+            raise TranslatorError(region_message(exc)) from None
+        raise
 
 
 class CloudTranslator(LLMTranslator):

@@ -337,6 +337,7 @@ def _inject(game_root: Path, project, version: Optional[str] = None) -> Tuple[in
     for key, e in done.items():
         by_file.setdefault(key.split("|", 1)[0], {})[key] = e
     count = _plugins_inject(game_root, by_file.pop("plugins.js", {}), project.backup, warnings)
+    names = name_map(project)
 
     for fname, keys in by_file.items():
         f = ddir / fname
@@ -355,19 +356,20 @@ def _inject(game_root: Path, project, version: Optional[str] = None) -> Tuple[in
                 if isinstance(ev, dict):
                     for p_i, page in enumerate(ev.get("pages") or []):
                         page["list"], n = _apply_list(page.get("list") or [], f"{fname}|ev{ev.get('id')}|p{p_i}",
-                                                      keys, box)
+                                                      keys, box, names)
                         count += n
         elif fname in ("CommonEvents.json", "Troops.json"):
             for ev in data or []:
                 if not isinstance(ev, dict):
                     continue
                 if fname == "CommonEvents.json":
-                    ev["list"], n = _apply_list(ev.get("list") or [], f"{fname}|ev{ev.get('id')}|p0", keys, box)
+                    ev["list"], n = _apply_list(ev.get("list") or [], f"{fname}|ev{ev.get('id')}|p0", keys, box,
+                                                names)
                     count += n
                 else:
                     for p_i, page in enumerate(ev.get("pages") or []):
                         page["list"], n = _apply_list(page.get("list") or [], f"{fname}|ev{ev.get('id')}|p{p_i}",
-                                                      keys, box)
+                                                      keys, box, names)
                         count += n
         else:
             for row in data or []:
@@ -381,8 +383,32 @@ def _inject(game_root: Path, project, version: Optional[str] = None) -> Tuple[in
     return count, warnings
 
 
+#: окошко имени плагинов сообщений (YEP_MessageCore и др.): «\n<Имя>», «\nc<Имя>», «\nr<Имя>»
+_NAMEBOX_RE = re.compile(r"(\\n[cr]?<)([^<>\n]{1,40})(>)", re.I)
+
+
+def name_map(project) -> Dict[str, str]:
+    """Переводы имён: имена иероглифами и каной из словаря терминов игры и переведённые имена героев и
+    врагов (в окошке имени — так же, как в меню)."""
+    from ...translation.lang import cjk_text
+    names = {k.strip(): v.strip() for k, v in (getattr(project, "glossary", None) or {}).items()
+             if v and v.strip() and cjk_text(k)}
+    names.update({e.source.strip(): e.translation.strip() for e in project.entries
+                  if e.kind == TextKind.CHARACTER_NAME and e.translation and e.translation.strip()
+                  and e.status in (EntryStatus.TRANSLATED, EntryStatus.APPROVED)})
+    return names
+
+
+def translate_nameboxes(text: str, names: Dict[str, str]) -> str:
+    """Имя в окошке имени — разметка, переводчик его не трогает: «\\n<トレビー>» осталось бы японским
+    в русской игре. Подставляется перевод имени из словаря терминов (если он есть)."""
+    if not names or "<" not in text:
+        return text
+    return _NAMEBOX_RE.sub(lambda m: m.group(1) + names.get(m.group(2).strip(), m.group(2)) + m.group(3), text)
+
+
 def _apply_list(cmds: List[Any], prefix: str, keys: Dict[str, Entry],
-                box: Optional[layout.Box] = None) -> Tuple[List[Any], int]:
+                box: Optional[layout.Box] = None, names: Optional[Dict[str, str]] = None) -> Tuple[List[Any], int]:
     """Новый список команд с переводом (строки сообщений могут добавиться — ветвления это не ломает)."""
     out: List[Any] = []
     count = 0
@@ -412,7 +438,8 @@ def _apply_list(cmds: List[Any], prefix: str, keys: Dict[str, Entry],
                 box = box or layout.DEFAULTS["mv"]
                 # окно не уже, чем английские строки оригинала (игра могла расширить окно)
                 english = max(layout.text_width(str((b.get("parameters") or [""])[0]), box) for b in block)
-                lines = layout.wrap(e.translation, box, face=code == 101 and bool((e.notes or {}).get("face")),
+                lines = layout.wrap(translate_nameboxes(e.translation, names or {}), box,
+                                    face=code == 101 and bool((e.notes or {}).get("face")),
                                     scroll=code == 105, min_width=english)
                 originals = [str((b.get("parameters") or [""])[0]) for b in block]
                 lead = 0

@@ -78,6 +78,8 @@ public class RussificatorUnity : BaseUnityPlugin
 
     static ManualLogSource _log;
     static bool _fitEnabled = true;
+    // игра на китайском, японском или корейском (source= в Russificator.cfg): их письмо — тоже текст
+    static bool _cjkSource;
 
     // надпись о программе (русификатор «для друзей»)
     const float CreditSeconds = 14f;
@@ -168,6 +170,7 @@ public class RussificatorUnity : BaseUnityPlugin
         string v;
         if (cfg.TryGetValue("fit", out v) && v.Trim().ToLowerInvariant() == "false") _fitEnabled = false;
         if (cfg.TryGetValue("credit", out v) && v.Trim().Length > 0) _credit = v.Trim();
+        if (cfg.TryGetValue("source", out v)) _cjkSource = Array.IndexOf(new[] { "ja", "zh", "ko" }, v.Trim()) >= 0;
         try { StartLiveServer(cfg); }
         catch (Exception ex) { _log.LogWarning("Live translation autostart failed: " + ex.Message); }
 
@@ -220,6 +223,11 @@ public class RussificatorUnity : BaseUnityPlugin
             return;
         }
         cfg.TryGetValue("args", out args);
+        if (!TrustedServer(exe, args ?? ""))
+        {
+            _log.LogWarning("Live translation: not the russificator, not started: " + exe);
+            return;
+        }
         ProcessStartInfo psi = new ProcessStartInfo(exe,
             (args ?? "").Replace("{pid}", Process.GetCurrentProcess().Id.ToString()));
         psi.UseShellExecute = false;
@@ -238,6 +246,32 @@ public class RussificatorUnity : BaseUnityPlugin
         });
         waiter.IsBackground = true;
         waiter.Start();
+    }
+
+    // Запускается только сама программа в режиме живого перевода: Russificator.exe (или pythonw/python
+    // при запуске из исходников) вне папки игры, с аргументами «--serve <папка> --pid {pid}». Строку
+    // server пишет программа при русификации, но файл настроек лежит в папке игры: чужой архив
+    // «русификатора» мог бы вписать туда любой exe, и игра запускала бы его при каждом старте.
+    static readonly Regex ServeArgs = new Regex("^(-m russificator\\.ui\\.app )?--serve (\"[^\"]*\"|[^\\s\"]+) --pid \\{pid\\}$");
+
+    static bool TrustedServer(string exe, string args)
+    {
+        try
+        {
+            if (!Path.IsPathRooted(exe)) return false;
+            string name = Path.GetFileName(exe).ToLowerInvariant();
+            bool frozen = name == "russificator.exe";
+            if (!frozen && name != "pythonw.exe" && name != "python.exe") return false;
+            string full = Path.GetFullPath(exe);
+            string game = Path.GetFullPath(Paths.GameRootPath).TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
+            if (full.StartsWith(game, StringComparison.OrdinalIgnoreCase)) return false;
+            Match m = ServeArgs.Match(args.Trim());
+            return m.Success && (m.Groups[1].Success != frozen);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     const int BlockSeconds = 3;
@@ -378,6 +412,7 @@ public class RussificatorUnity : BaseUnityPlugin
             }
         }
         HookForeign(harmony);
+        HookNgui(harmony);
 #endif
     }
 
@@ -693,7 +728,7 @@ public class RussificatorUnity : BaseUnityPlugin
                     value = FitLines(value, st0.Original);
                 return;
             }
-            if (!HasLatinWord(value)) return;
+            if (!HasText(value)) return;
             StateOf(__instance).Original = value;
             string tr, flat;
             if (TryXua(value, out tr) || (Unwrap(value, out flat) && TryXua(flat, out tr)))
@@ -742,7 +777,7 @@ public class RussificatorUnity : BaseUnityPlugin
             foreach (object tm in all)
             {
                 string text = _tmText.GetValue(tm, null) as string;
-                if (text == null || text.Length < 2 || HasCyrillic(text) || !HasLatinWord(text)) continue;
+                if (text == null || text.Length < 2 || HasCyrillic(text) || !HasText(text)) continue;
                 string tr, flat;
                 if (!TryXua(text, out tr) && !(Unwrap(text, out flat) && TryXua(flat, out tr)))
                 {
@@ -839,7 +874,7 @@ public class RussificatorUnity : BaseUnityPlugin
             if (_states.TryGetValue(KeyOf(inst), out st0) && st0.Original != null) return FitLines(value, st0.Original);
             return value;
         }
-        if (!HasLatinWord(value)) return value;
+        if (!HasText(value)) return value;
         StateOf(inst).Original = value;
         string tr, flat;
         if (TryXua(value, out tr) || (Unwrap(value, out flat) && TryXua(flat, out tr))) return FitLines(tr, value);
@@ -926,7 +961,7 @@ public class RussificatorUnity : BaseUnityPlugin
                 foreach (object c in all)
                 {
                     string text = prop.GetValue(c, null) as string;
-                    if (text == null || text.Length < 2 || HasCyrillic(text) || !HasLatinWord(text)) continue;
+                    if (text == null || text.Length < 2 || HasCyrillic(text) || !HasText(text)) continue;
                     string tr = ForeignTranslate(c, text);
                     if (tr == text) continue;
                     _inside = true;
@@ -941,6 +976,118 @@ public class RussificatorUnity : BaseUnityPlugin
             _foreignOff = true;
             _log.LogWarning("Text component scan disabled: " + ex.Message);
         }
+    }
+#endif
+
+#if !IL2CPP
+    // ---------- 6б. NGUI: цветовые теги в тексте ----------
+    // Игры на NGUI красят слова тегами прямо при показе реплики ([1b130a]…[2a780d]Blacksmith[-] —
+    // Celestian Tales): в данных игры и в словаре фраза без тегов, и XUnity её не находит. Здесь у
+    // текста с тегами перевод ищется по фразе без них: теги по краям строки (цвет всей реплики)
+    // остаются, теги отдельных слов пропадают — переведённые слова стоят в другом порядке. Нет в
+    // словаре — текст достаётся XUnity как есть (живой перевод сохраняет теги разметкой).
+    static readonly Regex NguiTag = new Regex("\\[(?:[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?|-|/?[biusc]|/?su[bp]|/?url(?:=[^\\]\\n]*)?)\\]");
+    static readonly Regex NguiLead = new Regex("^\\s*\\[(?:[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?|[biusc]|su[bp])\\]");
+    static readonly Regex NguiTrail = new Regex("\\[(?:-|/[biusc]|/su[bp])\\]\\s*$");
+    static bool _nguiHooked, _nguiOff;
+
+    static void HookNgui(Harmony harmony)
+    {
+        if (_nguiHooked) return;
+        Type label = FindType("UILabel");
+        if (label == null) return;
+        _nguiHooked = true;
+        try
+        {
+            PropertyInfo text = label.GetProperty("text", BindingFlags.Instance | BindingFlags.Public);
+            MethodInfo setter = text != null && text.PropertyType == typeof(string) ? text.GetSetMethod() : null;
+            if (setter == null) return;
+            harmony.Patch(setter, new HarmonyMethod(Own("NguiPrefix")));
+            _log.LogInfo("NGUI hooks installed");
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning("NGUI hooks failed: " + ex.Message);
+        }
+    }
+
+    static void NguiPrefix(object __instance, ref string value)
+    {
+        if (_inside || _nguiOff || value == null || value.Length < 4) return;
+        try
+        {
+            if (HasCyrillic(value))
+            {
+                NguiFit(__instance);
+                return;
+            }
+            if (value.IndexOf('[') < 0 || !NguiTag.IsMatch(value)) return;
+            FindXua();
+            if (_xuaTranslator == null || !XuaTranslating()) return;
+            string tr = NguiTranslate(value);
+            Debug("NGUI", value, tr);
+            if (tr != null)
+            {
+                value = tr;
+                NguiFit(__instance);
+            }
+        }
+        catch (Exception ex)
+        {
+            _nguiOff = true;                     // сбой — эта часть плагина выключается, игра работает дальше
+            _log.LogWarning("NGUI helper disabled: " + ex.Message);
+        }
+    }
+
+    // Русский текст длиннее английского, а надпись NGUI с Overflow.ClampContent лишнее просто обрезает:
+    // от реплики оставалось «…если вы играли в celestic tales: стар» (Celestian Tales). Такой надписи
+    // включается ShrinkContent — NGUI уменьшает шрифт, пока текст не влезет (как автоподбор TMP).
+    static PropertyInfo _nguiOverflow;
+    static object _nguiShrink, _nguiClamp;
+    static bool _nguiFitOff;
+
+    static void NguiFit(object label)
+    {
+        if (!_fitEnabled || _nguiFitOff || label == null) return;
+        try
+        {
+            if (_nguiOverflow == null)
+            {
+                PropertyInfo p = label.GetType().GetProperty("overflowMethod", BindingFlags.Instance | BindingFlags.Public);
+                if (p == null || !p.PropertyType.IsEnum || !p.CanWrite) { _nguiFitOff = true; return; }
+                _nguiShrink = Enum.Parse(p.PropertyType, "ShrinkContent");
+                _nguiClamp = Enum.Parse(p.PropertyType, "ClampContent");
+                _nguiOverflow = p;
+            }
+            if (Equals(_nguiOverflow.GetValue(label, null), _nguiClamp))
+                _nguiOverflow.SetValue(label, _nguiShrink, null);
+        }
+        catch (Exception ex)
+        {
+            _nguiFitOff = true;                  // другая версия NGUI — подгонка выключается, перевод работает
+            _log.LogDebug("NGUI fit disabled: " + ex.Message);
+        }
+    }
+
+    static string NguiTranslate(string value)
+    {
+        string head = "", tail = "", body = value;
+        Match m;
+        while ((m = NguiLead.Match(body)).Success)
+        {
+            head += m.Value;
+            body = body.Substring(m.Length);
+        }
+        while ((m = NguiTrail.Match(body)).Success)
+        {
+            tail = m.Value + tail;
+            body = body.Substring(0, body.Length - m.Length);
+        }
+        string plain = NguiTag.Replace(body, "");
+        if (!HasText(plain)) return null;
+        string tr, flat;
+        if (TryXua(plain, out tr) || (Unwrap(plain, out flat) && TryXua(flat, out tr))) return head + tr + tail;
+        return null;
     }
 #endif
 
@@ -1034,11 +1181,23 @@ public class RussificatorUnity : BaseUnityPlugin
     }
 #endif
 
-    static bool HasLatinWord(string s)
+    // Есть ли что переводить: слово латиницей, а в игре на китайском, японском, корейском (source= в
+    // Russificator.cfg) — и буква их письма. Без этого японский текст плагин пропускал мимо словаря.
+    static bool HasText(string s)
     {
-        for (int i = 1; i < s.Length; i++)
-            if (IsLatin(s[i]) && IsLatin(s[i - 1])) return true;
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (i > 0 && IsLatin(s[i]) && IsLatin(s[i - 1])) return true;
+            if (_cjkSource && IsCjk(s[i])) return true;
+        }
         return false;
+    }
+
+    static bool IsCjk(char c)
+    {
+        // кана, иероглифы (и расширение A), хангыль, полуширинная катакана
+        return (c >= '\u3041' && c <= '\u30FA') || (c >= '\u3400' && c <= '\u4DBF') || (c >= '\u4E00' && c <= '\u9FFF')
+            || (c >= '\uAC00' && c <= '\uD7A3') || (c >= '\uFF66' && c <= '\uFF9D');
     }
 
     static bool IsLatin(char c)

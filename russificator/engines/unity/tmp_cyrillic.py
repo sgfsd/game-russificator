@@ -191,9 +191,11 @@ class TmpFont:
         # остатками до обновления — Date Everything: 325 старых глифов), и новые таблицы. TMP берёт
         # старый список, только когда новых таблиц нет или они пустые (тогда он сам обновляет шрифт при
         # загрузке) — иначе читает новые, и дописывать надо туда: буквы в старом списке игра не видит
+        # (нет таблицы символов — тоже старый формат: иначе KeyError 'm_CharacterTable' ронял правку
+        # всех шрифтов файла — Mad Island, data.unity3d)
         new_tables = bool(tree.get("m_GlyphTable")) and bool(tree.get("m_CharacterTable"))
-        self.v1 = "m_glyphInfoList" in tree and not new_tables and (bool(tree["m_glyphInfoList"])
-                                                                    or "m_GlyphTable" not in tree)
+        self.v1 = "m_glyphInfoList" in tree and not new_tables and (
+            bool(tree["m_glyphInfoList"]) or "m_GlyphTable" not in tree or "m_CharacterTable" not in tree)
 
     @staticmethod
     def match(tree: dict) -> bool:
@@ -211,6 +213,23 @@ class TmpFont:
 
     def is_dynamic(self) -> bool:
         return not self.v1 and int(self.tree.get("m_AtlasPopulationMode", 0)) == 1
+
+    def dynamic_room(self, count: int) -> bool:
+        """Хватит ли динамическому шрифту свободного места в атласе на ``count`` новых букв. TMP дорисует их
+        сам, только если есть куда: в Death Must Die атлас меню 1024×1024 целиком занят латиницей кегля ~100,
+        и из «Играть» в игре видна одна «Г». Второй атлас TMP заводит, только если это включено в шрифте."""
+        if int(self.tree.get("m_IsMultiAtlasTexturesEnabled", 0) or 0):
+            return True
+        free = self.tree.get("m_FreeGlyphRects")
+        rects = [g.get("m_GlyphRect") or {} for g in self.tree.get("m_GlyphTable") or []]
+        sizes = [(int(r.get("m_Width", 0)), int(r.get("m_Height", 0))) for r in rects if r.get("m_Width")]
+        if not isinstance(free, list) or not sizes:
+            return True                    # судить не по чему — как раньше, на TMP
+        pad = 2 * self.padding() + 1
+        gw = sorted(w for w, _ in sizes)[len(sizes) // 2] + pad       # типичная буква с полями
+        gh = sorted(h for _, h in sizes)[len(sizes) // 2] + pad
+        fit = sum((int(r.get("m_Width", 0)) // gw) * (int(r.get("m_Height", 0)) // gh) for r in free)
+        return fit >= count
 
     def is_sdf(self) -> bool:
         if self.v1:
@@ -646,17 +665,15 @@ def _material_texture_id(mtree: dict) -> Optional[int]:
     return None
 
 
-def _source_font(font: TmpFont, objects_by_id: Dict[int, object], patched: Dict[int, bytes]) -> Optional[bytes]:
+def _source_font(font: TmpFont, font_obj, patched: Dict[Tuple[int, int], bytes],
+                 numbers: Dict[int, int]) -> Optional[bytes]:
     """Исходный TTF TMP-шрифта, если он лежит в том же файле (уже дополненный кириллицей, если дополнялся)."""
-    pptr = font.tree.get("m_SourceFontFile") or {}
-    if int(pptr.get("m_FileID", 0)) != 0:
-        return None
-    pid = int(pptr.get("m_PathID", 0))
-    if pid in patched:
-        return patched[pid]
-    obj = objects_by_id.get(pid)
+    obj = unitypy_io.local_object(font_obj, font.tree.get("m_SourceFontFile"))
     if obj is None:
         return None
+    key = (numbers.get(id(obj.assets_file)), obj.path_id)
+    if key in patched:
+        return patched[key]
     try:
         data = font_bytes(obj.read_typetree().get("m_FontData"))
     except Exception:  # noqa: BLE001
@@ -694,11 +711,21 @@ def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, byte
     reports: List[FontReport] = []
     changed = False
     fonts = []
-    material_trees: Dict[int, Tuple] = {}
+    materials: List[Tuple] = []
     legacy = []
     ex2d = []
+    ngui = []
     ttf = []
+    # объект — по (номеру файла в бандле, path_id), ссылки — внутри своего файла (unitypy_io.local_object):
+    # у сцен data.unity3d номера объектов совпадают
+    numbers = unitypy_io.file_numbers(env)
+
+    def key(o) -> Tuple[int, int]:
+        return numbers[id(o.assets_file)], o.path_id
+
     for obj in env.objects:
+        if id(obj.assets_file) not in numbers:
+            continue                        # соседний файл игры, подгруженный UnityPy: здесь не сохраняется
         try:
             if obj.type.name == "MonoBehaviour":
                 tree = obj.read_typetree()
@@ -706,6 +733,8 @@ def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, byte
                     fonts.append((obj, TmpFont(tree)))
                 elif is_ex2d_font(tree):
                     ex2d.append((obj, tree))
+                elif is_ngui_font(tree):
+                    ngui.append((obj, tree))
             elif obj.type.name == "Font":
                 tree = obj.read_typetree()
                 if is_bitmap_font(tree):
@@ -713,15 +742,14 @@ def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, byte
                 elif tree.get("m_FontData"):
                     ttf.append((obj, tree))
             elif obj.type.name == "Material":
-                material_trees[obj.path_id] = (obj, obj.read_typetree())
+                materials.append((obj, obj.read_typetree()))
         except Exception:  # noqa: BLE001
             continue
-    objects_by_id = {o.path_id: o for o in env.objects}
 
     # 1) обычные шрифты (TTF/OTF внутри ассета Font): кириллица дописывается в сам шрифт по его меркам —
     #    ими рисуют UI Text, TextMesh, IMGUI и динамические шрифты TextMeshPro
-    patched: Dict[int, bytes] = {}
-    checks: List[Tuple[int, object, FontReport]] = []        # что перепроверить после сохранения
+    patched: Dict[Tuple[int, int], bytes] = {}
+    checks: List[Tuple[Tuple[int, int], object, FontReport]] = []   # что перепроверить после сохранения
     for obj, tree in ttf:
         rep = FontReport(path.name, str(tree.get("m_Name", "font")))
         try:
@@ -733,10 +761,10 @@ def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, byte
             rep.added = len(cyrillic.missing(sfnt.Font(data), need))
             tree["m_FontData"] = font_list(new, tree["m_FontData"])
             obj.save_typetree(tree)
-            patched[obj.path_id] = new
+            patched[key(obj)] = new
             changed = True
             reports.append(rep)
-            checks.append((obj.path_id, False, rep))
+            checks.append((key(obj), False, rep))
         except Exception as exc:  # noqa: BLE001
             log.warning("Шрифт %s не дополнен: %s", rep.name, exc)
             rep.error = str(exc)
@@ -747,18 +775,19 @@ def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, byte
         rep = FontReport(path.name, font.name)
         reports.append(rep)
         dynamic = font.is_dynamic()
-        source = _source_font(font, objects_by_id, patched)
+        source = _source_font(font, obj, patched, numbers)
+        lacking = len({c for c in need if not c.isspace()} - {chr(c) for c in font.chars()})
         if (dynamic and source is not None and all(ord(c) in _cmap_of(source) for c in need)
-                and not cyrillic.fullwidth_font(sfnt.Font(source))):
-            continue  # динамический шрифт сам дорисует кириллицу из исходного TTF
+                and not cyrillic.fullwidth_font(sfnt.Font(source)) and font.dynamic_room(lacking)):
+            continue  # динамический шрифт сам дорисует кириллицу из исходного TTF: место в атласе есть
         try:
-            pptr = font.atlas_pptr() or {}
-            if int(pptr.get("m_FileID", 0)) != 0 or int(pptr.get("m_PathID", 0)) not in objects_by_id:
+            tex_obj = unitypy_io.local_object(obj, font.atlas_pptr())
+            if tex_obj is None:
                 rep.error = "атлас шрифта лежит в другом файле"
                 continue
-            tex_obj = objects_by_id[int(pptr["m_PathID"])]
             texture = tex_obj.read()
-            mats = [(o, t) for pid, (o, t) in material_trees.items() if _material_texture_id(t) == tex_obj.path_id]
+            mats = [(o, t) for o, t in materials
+                    if o.assets_file is tex_obj.assets_file and _material_texture_id(t) == tex_obj.path_id]
             added = patch_font(font, texture, mats, need, source=source, only_new_area=dynamic)
             if not added:
                 continue
@@ -768,7 +797,7 @@ def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, byte
                 mobj.save_typetree(mtree)
             rep.added = added
             changed = True
-            checks.append((obj.path_id, True, rep))
+            checks.append((key(obj), True, rep))
         except Exception as exc:  # noqa: BLE001
             log.warning("TMP-шрифт %s не починен: %s", font.name, exc)
             rep.error = str(exc)
@@ -777,10 +806,10 @@ def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, byte
     for obj, tree in legacy:
         rep = FontReport(path.name, str(tree.get("m_Name", "font")))
         try:
-            pptr = tree.get("m_Texture") or {}
-            if int(pptr.get("m_FileID", 0)) != 0 or int(pptr.get("m_PathID", 0)) not in objects_by_id:
+            tex_obj = unitypy_io.local_object(obj, tree.get("m_Texture"))
+            if tex_obj is None:
                 continue
-            texture = objects_by_id[int(pptr["m_PathID"])].read()
+            texture = tex_obj.read()
             added = patch_legacy_font(tree, texture, need)
             if added:
                 obj.save_typetree(tree)
@@ -788,24 +817,24 @@ def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, byte
                 rep.added = added
                 changed = True
                 reports.append(rep)
-                checks.append((obj.path_id, False, rep))
+                checks.append((key(obj), False, rep))
         except Exception as exc:  # noqa: BLE001
             log.warning("Растровый шрифт %s не починен: %s", rep.name, exc)
             rep.error = str(exc)
             reports.append(rep)
     # 4) растровые шрифты ex2D (exBitmapFont): текст exSpriteFont XUnity не видит — его переводит
     #    плагин, а буквы для него — здесь
-    ex2d_textures: Dict[int, object] = {}             # одна текстура бывает у нескольких шрифтов
+    ex2d_textures: Dict[Tuple[int, int], object] = {}   # одна текстура бывает у нескольких шрифтов
     for obj, tree in ex2d:
         rep = FontReport(path.name, str(tree.get("m_Name", "ex2D font")))
         try:
-            pptr = ex2d_texture_pptr(tree) or {}
-            if int(pptr.get("m_FileID", 0)) != 0 or int(pptr.get("m_PathID", 0)) not in objects_by_id:
+            tex_obj = unitypy_io.local_object(obj, ex2d_texture_pptr(tree))
+            if tex_obj is None:
                 continue
-            tex_id = int(pptr["m_PathID"])
-            if tex_id not in ex2d_textures:
-                ex2d_textures[tex_id] = objects_by_id[tex_id].read()
-            texture = ex2d_textures[tex_id]
+            tex_key = key(tex_obj)
+            if tex_key not in ex2d_textures:
+                ex2d_textures[tex_key] = tex_obj.read()
+            texture = ex2d_textures[tex_key]
             added = patch_ex2d_font(tree, texture, need)
             if added:
                 obj.save_typetree(tree)
@@ -813,15 +842,59 @@ def _patch_env(env, path: Path, gen, need: Set[str], write: Callable[[Path, byte
                 rep.added = added
                 changed = True
                 reports.append(rep)
-                checks.append((obj.path_id, "ex2d", rep))
+                checks.append((key(obj), "ex2d", rep))
         except Exception as exc:  # noqa: BLE001
             log.warning("Шрифт ex2D %s не починен: %s", rep.name, exc)
             rep.error = str(exc)
             reports.append(rep)
+    # 5) растровые шрифты NGUI (UIFont/NGUIFont): буквы — в их текстуру или атлас; один атлас бывает у
+    #    нескольких шрифтов — текстура общая, чтобы дописанное одним не стёр другой
+    ngui_textures: Dict[Tuple[int, int], object] = {}
+    ngui_atlases: Dict[Tuple[int, int], Tuple[object, dict]] = {}   # дерево атласа — общее у его шрифтов
+    atlases_changed: Set[Tuple[int, int]] = set()
+    for obj, tree in ngui:
+        rep = FontReport(path.name, str(tree.get("m_Name") or "NGUI font"))
+        try:
+            atlas = sprite = untrimmed = None
+            atlas_obj = unitypy_io.local_object(obj, tree["mAtlas"]) if _pptr_set(tree.get("mAtlas")) else None
+            if atlas_obj is not None:
+                if key(atlas_obj) not in ngui_atlases:
+                    ngui_atlases[key(atlas_obj)] = (atlas_obj, atlas_obj.read_typetree())
+                atlas = ngui_atlases[key(atlas_obj)][1]
+                sprite = ngui_sprite(tree, atlas) if isinstance(atlas.get("mSprites"), list) else None
+                if sprite is not None and (need - {chr(int(c["index"])) for c in tree["mFont"]["mSaved"]}):
+                    untrimmed = untrim_ngui_font(tree, sprite)
+            tex_obj, region, occupied, err = ngui_texture(obj, tree, atlas, untrimmed)
+            if err:
+                rep.error = err
+                reports.append(rep)
+                continue
+            tex_key = key(tex_obj)
+            if tex_key not in ngui_textures:
+                ngui_textures[tex_key] = tex_obj.read()
+            texture = ngui_textures[tex_key]
+            added = patch_ngui_font(tree, texture, region, need, occupied)
+            if added:
+                if untrimmed:
+                    set_untrimmed(sprite, untrimmed)
+                    atlases_changed.add(key(atlas_obj))
+                obj.save_typetree(tree)
+                texture.save()
+                rep.added = added
+                changed = True
+                reports.append(rep)
+                checks.append((key(obj), "ngui", rep))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Шрифт NGUI %s не починен: %s", rep.name, exc)
+            rep.error = str(exc)
+            reports.append(rep)
+    for a_key in atlases_changed:
+        a_obj, a_tree = ngui_atlases[a_key]
+        a_obj.save_typetree(a_tree)
     if not changed:
         return reports
     table = unitypy_io.object_table(env)
-    data = env.file.save()
+    data = unitypy_io.save_env(env)
     _verify(data, path, gen, checks, need, table)
     write(path, data)
     return reports
@@ -835,11 +908,11 @@ def _cmap_of(data: bytes) -> Dict[int, int]:
         return {}
 
 
-def _verify(data: bytes, path: Path, gen, checks: List[Tuple[int, object, FontReport]], need: Set[str],
-            table: Optional[dict] = None) -> None:
+def _verify(data: bytes, path: Path, gen, checks: List[Tuple[Tuple[int, int], object, FontReport]],
+            need: Set[str], table: Optional[dict] = None) -> None:
     """Перечитать сохранённый файл и убедиться, что каждый исправленный шрифт покрывает нужные символы.
 
-    ``checks`` — (path_id объекта, это TMP-шрифт, отчёт) для каждого изменённого шрифта. Проверка
+    ``checks`` — ((номер файла в бандле, path_id), это TMP-шрифт, отчёт) для каждого изменённого шрифта. Проверка
     обязана реально прочитать каждый изменённый шрифт и его атлас — если что-то не читается, файл
     не записывается (лучше не тронуть игру, чем записать непроверенное).
     """
@@ -853,26 +926,41 @@ def _verify(data: bytes, path: Path, gen, checks: List[Tuple[int, object, FontRe
         _verify_env(env, gen, checks, need)
 
 
-def _verify_env(env, gen, checks: List[Tuple[int, object, FontReport]], need: Set[str]) -> None:
+def _verify_env(env, gen, checks: List[Tuple[Tuple[int, int], object, FontReport]], need: Set[str]) -> None:
     if gen is not None:
         env.typetree_generator = gen
-    objects = {o.path_id: o for o in env.objects}
-    for pid, is_tmp, rep in checks:
-        obj = objects.get(pid)
+    objects = unitypy_io.own_objects(env)
+
+    def texture_of(obj, pptr, name):
+        tex_obj = unitypy_io.local_object(obj, pptr)
+        if tex_obj is None:
+            raise RuntimeError(f"проверка: текстура шрифта {name} пропала из файла")
+        return tex_obj.read()
+
+    for key, is_tmp, rep in checks:
+        obj = objects.get(key)
         if obj is None:
             raise RuntimeError(f"проверка: шрифт {rep.name} пропал из файла")
         tree = obj.read_typetree()
-        if is_tmp == "ex2d":
+        if is_tmp == "ngui":
+            bm = tree["mFont"]
+            have = {int(c["index"]) for c in bm["mSaved"]}
+            tex_obj, region, _occ, err = ngui_texture(obj, tree)
+            if err:
+                raise RuntimeError(f"проверка: {err}")
+            tex = tex_obj.read()
+            if tex.image.size != (tex.m_Width, tex.m_Height) or (
+                    region is None and (int(bm["mWidth"]), int(bm["mHeight"])) != (tex.m_Width, tex.m_Height)):
+                raise RuntimeError(f"проверка: текстура шрифта {rep.name} не совпадает с его описанием")
+        elif is_tmp == "ex2d":
             have = {int(c["id"]) for c in tree.get("charInfos", [])}
-            pptr = ex2d_texture_pptr(tree) or {}
-            tex = objects[int(pptr["m_PathID"])].read()
+            tex = texture_of(obj, ex2d_texture_pptr(tree), rep.name)
             if tex.image.size != (tex.m_Width, tex.m_Height):
                 raise RuntimeError(f"проверка: текстура шрифта {rep.name} не читается")
         elif is_tmp:
             fresh = TmpFont(tree)
             have = fresh.chars()
-            pptr = fresh.atlas_pptr() or {}
-            tex = objects[int(pptr["m_PathID"])].read()
+            tex = texture_of(obj, fresh.atlas_pptr(), rep.name)
             w, h = fresh.atlas_size()
             if (tex.m_Width, tex.m_Height) != (w, h) or tex.image.size != (w, h):
                 raise RuntimeError(f"проверка: размер атласа {rep.name} не совпадает с описанием шрифта")
@@ -1147,6 +1235,234 @@ def patch_ex2d_font(tree: dict, texture, need: Iterable[str]) -> int:
         texture.set_image(Image.fromarray(rgba, "RGBA"), target_format=texture.m_TextureFormat)
     return len(glyphs) + len(aliases)
 
+# ---------- растровые шрифты NGUI (UIFont / NGUIFont: разметка BMFont + своя текстура или атлас) ----------
+
+def is_ngui_font(tree: dict) -> bool:
+    """Растровый шрифт NGUI: BMFont (``mFont.mSaved`` — глифы) и материал или атлас с его буквами."""
+    bm = tree.get("mFont") if isinstance(tree, dict) else None
+    return (isinstance(bm, dict) and isinstance(bm.get("mSaved"), list) and bool(bm["mSaved"])
+            and ("mMat" in tree or "mAtlas" in tree))
+
+
+def _pptr_set(pptr) -> bool:
+    return isinstance(pptr, dict) and int(pptr.get("m_PathID", 0) or 0) != 0
+
+
+def _texture_of_material(mat_obj):
+    tex_id = _material_texture_id(mat_obj.read_typetree())
+    return mat_obj.assets_file.objects.get(tex_id) if tex_id else None
+
+
+_PADDINGS = ("paddingLeft", "paddingRight", "paddingTop", "paddingBottom")
+
+
+def ngui_sprite(tree: dict, atlas: dict) -> Optional[dict]:
+    """Спрайт шрифта NGUI в его атласе (``mFont.mSpriteName``)."""
+    name = tree["mFont"].get("mSpriteName")
+    return next((s for s in atlas.get("mSprites") or [] if isinstance(s, dict) and s.get("name") == name), None)
+
+
+def untrim_ngui_font(tree: dict, sprite: dict) -> Optional[Tuple[int, int, int, int]]:
+    """Спрайт шрифта, обрезанный упаковщиком атласа (поля ``padding*``): NGUI при загрузке обрезает по
+    нему глифы (``UIFont.Trim``), и буквы, дописанные вне спрайта, пропали бы — в Celestian Tales так
+    пропадал весь русский текст меню. Глифы обрезаются здесь же, как это делает NGUI, после чего спрайт
+    можно считать необрезанным: ``(x, y, w, h)`` целой страницы шрифта в атласе — то же место, на которое
+    NGUI и раньше раскладывал координаты букв. Спрайт без полей — None. Сам спрайт не меняется (см.
+    :func:`set_untrimmed`): если дописать буквы не выйдет, атлас остаётся как был."""
+    pads = [int(sprite.get(k, 0) or 0) for k in _PADDINGS]
+    if not any(pads):
+        return None
+    left, right, top, bottom = pads
+    x, y, w, h = (int(sprite[k]) for k in ("x", "y", "width", "height"))
+    for g in tree["mFont"]["mSaved"]:              # BMGlyph.Trim(xMin, yMin, xMax, yMax) из NGUI
+        gx, gy, gw, gh = (int(g[k]) for k in ("x", "y", "width", "height"))
+        x1, y1 = gx + gw, gy + gh
+        if gx < left:
+            g["offsetX"] = int(g["offsetX"]) + left - gx
+            gw -= left - gx
+            gx = left
+        if gy < top:
+            g["offsetY"] = int(g["offsetY"]) + top - gy
+            gh -= top - gy
+            gy = top
+        gw -= max(0, x1 - (left + w))
+        gh -= max(0, y1 - (top + h))
+        g["x"], g["y"], g["width"], g["height"] = gx, gy, max(0, gw), max(0, gh)
+    return x - left, y - top, w + left + right, h + top + bottom
+
+
+def set_untrimmed(sprite: dict, region: Tuple[int, int, int, int]) -> None:
+    """Спрайт шрифта — на всю страницу шрифта, без полей (глифы уже обрезаны :func:`untrim_ngui_font`)."""
+    sprite["x"], sprite["y"], sprite["width"], sprite["height"] = region
+    for k in _PADDINGS:
+        sprite[k] = 0
+
+
+def ngui_texture(obj, tree: dict, atlas: Optional[dict] = None,
+                 region: Optional[Tuple[int, int, int, int]] = None):
+    """(объект текстуры, место шрифта в ней (x, y, w, h) или None — вся текстура, нижняя граница
+    занятого спрайтами атласа, ошибка). Шрифт в атласе — спрайт ``mFont.mSpriteName`` атласа
+    UIAtlas/NGUIAtlas (координаты в пикселях, сверху вниз). ``atlas`` — уже прочитанное дерево атласа
+    (общее у шрифтов одного атласа), ``region`` — место спрайта с отступами после :func:`untrim_ngui_font`."""
+    if _pptr_set(tree.get("mAtlas")):
+        atlas_obj = unitypy_io.local_object(obj, tree["mAtlas"])
+        if atlas_obj is None:
+            return None, None, 0, "атлас шрифта NGUI лежит в другом файле"
+        atlas = atlas if atlas is not None else atlas_obj.read_typetree()
+        mat_obj = unitypy_io.local_object(atlas_obj, atlas.get("material") or atlas.get("mMat")
+                                          or atlas.get("mMaterial"))
+        tex_obj = _texture_of_material(mat_obj) if mat_obj is not None else None
+        if tex_obj is None:
+            return None, None, 0, "текстура атласа шрифта NGUI лежит в другом файле"
+        sprites = atlas.get("mSprites")
+        if not isinstance(sprites, list):
+            return None, None, 0, "атлас NGUI старого формата — не поддерживается"
+        sp = ngui_sprite(tree, atlas)
+        if sp is None:
+            return None, None, 0, f"в атласе нет спрайта шрифта «{tree['mFont'].get('mSpriteName')}»"
+        if region is None and any(int(sp.get(k, 0) or 0) for k in _PADDINGS):
+            # NGUI обрезает глифы по такому спрайту (Trim) — буквы вне него пропали бы
+            return None, None, 0, "спрайт шрифта NGUI с отступами — не поддерживается"
+        occupied = max((int(s.get("y", 0)) + int(s.get("height", 0)) for s in sprites if isinstance(s, dict)),
+                       default=0)
+        region = region or (int(sp["x"]), int(sp["y"]), int(sp["width"]), int(sp["height"]))
+        return tex_obj, region, occupied, ""
+    mat_obj = unitypy_io.local_object(obj, tree.get("mMat"))
+    tex_obj = _texture_of_material(mat_obj) if mat_obj is not None else None
+    if tex_obj is None:
+        return None, None, 0, "текстура шрифта NGUI лежит в другом файле"
+    return tex_obj, None, 0, ""
+
+
+def _bm_base(chars: List[dict]) -> int:
+    """Базовая линия BMFont (от верха строки) — по низу букв без выносных."""
+    bottoms = [int(c["offsetY"]) + int(c["height"]) for c in chars
+               if 0 < int(c["index"]) < 0x110000 and chr(int(c["index"])) in _EX2D_BASE_CHARS and int(c["height"]) > 0]
+    if not bottoms:
+        return int(max((int(c["offsetY"]) + int(c["height"]) for c in chars), default=0))
+    bottoms.sort()
+    return bottoms[len(bottoms) // 2]
+
+
+def patch_ngui_font(tree: dict, texture, region: Optional[Tuple[int, int, int, int]], need: Iterable[str],
+                    occupied: int = 0) -> int:
+    """Дорисовать недостающие символы в растровый шрифт NGUI — по меркам его же букв (как у ex2D);
+    двойники латиницы — готовыми глифами. Новые буквы — ниже всего занятого (буквами и, в атласе,
+    спрайтами), при нехватке места текстура растёт вниз: координаты NGUI отсчитываются сверху, старые
+    буквы и спрайты остаются на местах. Цвет новых букв — как у букв шрифта (бывает не белым)."""
+    import numpy as np
+    from PIL import Image
+
+    bm = tree["mFont"]
+    chars = bm["mSaved"]
+    have = {int(c["index"]) for c in chars}
+    missing = sorted({c for c in need if ord(c) not in have and not c.isspace()})
+    if not missing:
+        return 0
+    if any(int(c.get("channel", 15) or 0) not in (0, 15) for c in chars):
+        raise RuntimeError("шрифт NGUI упакован по каналам текстуры — не поддерживается")
+    img = texture.image.convert("RGBA")
+    W, H = img.size
+    tw, th = int(bm.get("mWidth") or 0), int(bm.get("mHeight") or 0)
+    if region is not None:
+        rx, ry, rw, rh = region
+        if (tw, th) != (rw, rh):
+            raise RuntimeError("шрифт NGUI в атласе уменьшен или увеличен — не поддерживается")
+    else:
+        rx = ry = 0
+        if (tw, th) != (W, H):
+            raise RuntimeError("размер текстуры шрифта NGUI не совпадает с описанием шрифта")
+    rgba = np.asarray(img, dtype=np.uint8).copy()
+    alpha = rgba[..., 3].astype(np.float32) / 255.0
+    from ...fonts import cyrillic
+    base = _bm_base(chars)
+    boxes: Dict[str, cyrillic.GlyphBox] = {}
+    ink = []
+    for c in chars:
+        code = int(c["index"])
+        if not 0 < code < 0x110000:
+            continue
+        x, y, w, h = rx + int(c["x"]), ry + int(c["y"]), int(c["width"]), int(c["height"])
+        crop = alpha[y:y + h, x:x + w] >= 0.5 if w > 0 and h > 0 else None
+        mask = crop if crop is not None and crop.size and crop.any() else None
+        if mask is not None:
+            ink.append(rgba[y:y + h, x:x + w][mask][:, :3])
+        boxes[chr(code)] = cyrillic.GlyphBox(float(w), float(h), float(c["offsetX"]), float(base - int(c["offsetY"])),
+                                             float(c["advance"]), mask)
+    color = np.median(np.concatenate(ink), axis=0).astype(np.uint8) if ink else np.array([255, 255, 255], np.uint8)
+    size = float(bm.get("mSize") or 16)
+    pixel = 1.0 if _binary(alpha[ry:ry + th, rx:rx + tw]) else None
+    aliases, rest, rend, size = plan_atlas(boxes, size, missing, None, pixel)
+    pad = 1
+    glyphs = [rend.render(c, size, pad, 1.0, sdf=False, xscale=1.0) for c in rest] if rend is not None else []
+    if pixel:
+        for g in glyphs:
+            if g.bitmap.size:
+                g.bitmap = (g.bitmap >= 0.5).astype(np.float32)
+
+    used = max([occupied] + [ry + int(c["y"]) + int(c["height"]) for c in chars])
+    ink_rows = np.nonzero(alpha.max(axis=1) > 0)[0]
+    if len(ink_rows):                               # спрайты и буквы, которых нет в разметке
+        used = max(used, int(ink_rows[-1]) + 1)
+    placements: Dict[str, Tuple[int, int]] = {}
+    for attempt in range(6):
+        shelf = _Shelf(W, used + 1, H)
+        placements, ok = {}, True
+        for g in glyphs:
+            if g.bitmap.size == 0:
+                continue
+            bh, bw = g.bitmap.shape
+            pos = shelf.place(bw, bh)
+            if pos is None:
+                ok = False
+                break
+            placements[g.char] = pos
+        if ok:
+            break
+        grow = max(16, int(math.ceil(H * 0.5)))
+        rgba = np.vstack([rgba, np.zeros((grow, W, 4), np.uint8)])
+        alpha = np.vstack([alpha, np.zeros((grow, W), np.float32)])
+        H += grow
+        if H > MAX_ATLAS:
+            raise RuntimeError("текстура шрифта NGUI слишком велика")
+    else:
+        raise RuntimeError("не удалось разместить символы в текстуре шрифта NGUI")
+
+    by_code = {int(c["index"]): c for c in chars}
+    template = by_code.get(ord("H")) or chars[0]
+    for g in glyphs:
+        entry = copy.deepcopy(template)
+        entry["index"] = ord(g.char)
+        entry["advance"] = int(round(g.advance))
+        if isinstance(entry.get("kerning"), list):
+            entry["kerning"] = []
+        if g.char not in placements:
+            entry.update({"x": 0, "y": 0, "width": 0, "height": 0, "offsetX": 0, "offsetY": 0})
+        else:
+            px, py = placements[g.char]
+            bh, bw = g.bitmap.shape
+            region_a = alpha[py:py + bh, px:px + bw]
+            np.maximum(region_a, g.bitmap, out=region_a)
+            entry.update({"x": px - rx, "y": py - ry, "width": bw, "height": bh,
+                          "offsetX": int(round(g.bearing_x)) - pad,
+                          "offsetY": base - (int(round(g.bearing_y)) + pad)})
+        chars.append(entry)
+    for c, t in aliases.items():
+        src = by_code.get(ord(t))
+        if src is not None:
+            entry = copy.deepcopy(src)
+            entry["index"] = ord(c)
+            chars.append(entry)
+    if glyphs:
+        new_ink = alpha > (rgba[..., 3].astype(np.float32) / 255.0 + 1e-6)
+        rgba[new_ink, 0:3] = color
+        rgba[..., 3] = np.maximum(rgba[..., 3], np.round(alpha * 255).astype(np.uint8))
+        if region is None:
+            bm["mHeight"] = H                       # своя текстура: NGUI делит координаты на её размер
+        texture.set_image(Image.fromarray(rgba, "RGBA"), target_format=texture.m_TextureFormat)
+    return len(glyphs) + len(aliases)
+
+
 # ---------- вся игра ----------
 
 def fix_game(files: Iterable[Path], gen, translations: Iterable[str], backup,
@@ -1184,7 +1500,7 @@ def fix_game(files: Iterable[Path], gen, translations: Iterable[str], backup,
         try:
             reports += patch_file(f, gen, need, write)
         except Exception as exc:  # noqa: BLE001
-            log.warning("Шрифты в %s не исправлены: %s", f.name, exc)
+            log.warning("Шрифты в %s не исправлены: %s", f.name, exc, exc_info=True)
             problems.append(f"{f.name}: шрифты не исправлены ({exc})")
     if written:
         from . import addressables

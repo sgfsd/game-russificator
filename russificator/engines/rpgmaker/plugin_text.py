@@ -23,14 +23,19 @@ from ...translation.filters import looks_technical, looks_translatable
 _TEXT_KEY = re.compile(r"text|name|label|title|message|msg|help|desc|command|cmd|vocab|term|caption|header|"
                        r"format|word|string|display|prompt|tip|hint|button|option|question|answer|choice|"
                        r"quest|objective|tutorial|popup|info|menu|window|tooltip|subtitle|dialog|line|content|"
-                       r"notif|victory|defeat|escape|confirm|cancel|yes|no\b", re.I)
+                       r"notif|victory|defeat|escape|confirm|cancel|yes|no\b|"
+                       # японские плагины называют параметры по-японски
+                       r"テキスト|文字列|文章|名前|名称|表示名|用語|メッセージ|説明|ヘルプ|コマンド|タイトル|"
+                       r"ラベル|見出し|項目名|ボタン名|選択肢|ヒント|台詞|セリフ", re.I)
 _NOT_TEXT_KEY = re.compile(r"file|image|img|picture|\bpic|icon|face|sound|\bse\b|bgm|bgs|\bme\b|audio|volume|"
                            r"pitch|\bpan\b|font|switch|variable|\bvar\b|\bid\b|\bkey|symbol|eval|code|script|"
                            r"formula|condition|colou?r|opacity|^x$|^y$|width|height|size|rect|anchor|plugin|tag|"
                            r"url|path|folder|\bdir|speed|rate|count|\bmax|\bmin|offset|padding|margin|align|"
                            r"index|frame|animation|sprite|json|regex|pattern|mode|type|style|position|layer|scale|"
                            r"skin|note\s*tag|notetag|element|state|class|troop|weapon|armor|armour|actor|enemy|"
-                           r"map|region|terrain|tile|event|common|param", re.I)
+                           r"map|region|terrain|tile|event|common|param|"
+                           r"ファイル|画像|ピクチャ|アイコン|顔|効果音|音声|フォント|スイッチ|変数|番号|座標|"
+                           r"幅|高さ|サイズ|色|透明|コード|スクリプト|条件|速度|位置|揃え|フレーム|アニメ", re.I)
 #: ключи-настройки: порядок/ключевые слова команд, флаги «Show …», «Enable …», «Use …»
 _SETTING_KEY = re.compile(r"order|keyword|setting|config|^\s*(?:show|hide|enable|disable|use|allow|is|has|auto)\b", re.I)
 #: значение-флаг или выбор из списка: так плагин и сравнивает (== "yes"), перевод его сломает

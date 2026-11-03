@@ -108,6 +108,36 @@ def test_backup_restore_roundtrip(tmp_path):
     assert not (game / "russificator_backup").exists()
 
 
+def test_forged_backup_list_cannot_touch_files_outside_the_game(tmp_path):
+    """Список отката лежит в папке игры, его можно подделать: путь с «..», абсолютный, «C:файл» или в
+    саму папку бэкапа откат не удаляет и не перезаписывает — такие записи отбрасываются."""
+    import json
+    from russificator.core.backup import GameBackup
+    from russificator.core.restore import restore_backups
+    game = tmp_path / "Game"
+    (game / "russificator_backup").mkdir(parents=True)
+    outside = tmp_path / "victim.txt"
+    outside.write_text("keep me", encoding="utf-8")
+    (game / "mine.txt").write_text("created by russificator", encoding="utf-8")
+    manifest = {"version": 2, "modified": {"../victim.txt": "x", str(outside): "y"},
+                "created": ["../victim.txt", "..\\victim.txt", str(outside), "C:victim.txt",
+                            "russificator_backup/manifest.json", "mine.txt"]}
+    (game / "russificator_backup" / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    b = GameBackup(game)
+    assert b.created == ["mine.txt"] and not b.modified
+    restore_backups(game)
+    assert outside.read_text(encoding="utf-8") == "keep me"
+    assert not (game / "mine.txt").exists()
+
+
+def test_inside_keeps_paths_in_their_folder(tmp_path):
+    from russificator import paths
+    root = tmp_path / "game"
+    assert paths.inside(root, "BepInEx/plugins/x.dll") == (root / "BepInEx/plugins/x.dll").resolve()
+    for bad in ("../x", "a/../../x", "/x", "C:x", "C:/x", "\\\\server\\share\\x", "", None, "a\x00b"):
+        assert paths.inside(root, bad) is None, bad
+
+
 def test_backup_keeps_first_original(tmp_path):
     from russificator.core.backup import GameBackup
     game = tmp_path / "Game"

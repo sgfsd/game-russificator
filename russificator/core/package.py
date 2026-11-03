@@ -589,7 +589,7 @@ def install_package(pkg: Package, game_dir: Path, status: StatusFn = _noop) -> D
                      "installed": time.strftime("%Y-%m-%d %H:%M"), "method": pkg.info.get("method", "")})
     status("Готово", 1.0)
     return {"ok": True, "notes": notes, "translated": translated,
-            "total": (pkg.info.get("stats") or {}).get("total", 0)}
+            "total": _count((pkg.info.get("stats") or {}).get("total", 0))}
 
 
 def _install_files(pkg: Package, game_dir: Path, status: StatusFn, notes: List[str]) -> int:
@@ -598,7 +598,8 @@ def _install_files(pkg: Package, game_dir: Path, status: StatusFn, notes: List[s
     files = pkg.info.get("files") or []
     src_root = pkg.data / "files"
     # папки, которые русификатор создаёт целиком, — откат удалит их со всем содержимым
-    for rel in sorted(pkg.info.get("created_paths") or [], key=len):
+    for rel in sorted(pkg.info.get("created_paths") or [], key=lambda r: len(str(r))):
+        _check_rel(rel)
         dest = game_dir / rel
         if not dest.exists() and (src_root / rel).is_dir():
             dest.mkdir(parents=True, exist_ok=True)
@@ -613,6 +614,7 @@ def _install_files(pkg: Package, game_dir: Path, status: StatusFn, notes: List[s
     for n, p in enumerate(patches):
         rel = p["path"]
         _check_rel(rel)
+        _check_rel(p["patch"], pkg.data)
         target = game_dir / rel
         status(f"Патч: {Path(rel).name}", 0.6 + 0.35 * n / max(1, len(patches)))
         reason = ""
@@ -635,6 +637,7 @@ def _install_files(pkg: Package, game_dir: Path, status: StatusFn, notes: List[s
     for f in pkg.info.get("full") or []:
         rel = f["path"]
         _check_rel(rel)
+        _check_rel(f["file"], pkg.data)
         target = game_dir / rel
         if f.get("orig_sha1") and target.is_file() and sha1_file(target) != f["orig_sha1"]:
             if f.get("required"):
@@ -645,13 +648,43 @@ def _install_files(pkg: Package, game_dir: Path, status: StatusFn, notes: List[s
     if skipped:
         notes.append(f"Ваша версия игры отличается от той, для которой сделан русификатор: {skipped} файл(ов) "
                      "оставлены как есть. Текст переведён, но часть шрифтов может выглядеть иначе.")
-    return int((pkg.info.get("stats") or {}).get("translated", 0))
+    _strip_launch_settings(game_dir)
+    return _count((pkg.info.get("stats") or {}).get("translated", 0))
 
 
-def _check_rel(rel: str) -> None:
-    parts = Path(rel).parts
-    if Path(rel).is_absolute() or ".." in parts or (parts and parts[0].lower() == BACKUP_DIR):
-        raise PackageError(f"Недопустимый путь в архиве: {rel}")
+def _count(value) -> int:
+    """Число из package.json (архив чужой: там может оказаться что угодно, в том числе разметка)."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _check_rel(rel: str, root: Optional[Path] = None) -> None:
+    """Путь из package.json — внутри папки игры (или ``root`` — папки самого архива) и не в папке
+    отката. «..», абсолютный путь и диск Windows («C:файл» — относительно текущей папки диска)
+    вывели бы запись или чтение за её пределы."""
+    if not isinstance(rel, str) or paths.inside(root or Path("."), rel) is None:
+        raise PackageError(f"Недопустимый путь в архиве: {rel!r}")
+    if root is None and rel.replace("\\", "/").split("/", 1)[0].lower() == BACKUP_DIR:
+        raise PackageError(f"Недопустимый путь в архиве: {rel!r}")
+
+
+#: строки настроек плагина Unity, которые запускают программу (живой перевод): из чужого архива они
+#: не берутся — архив мог бы прописать туда любой exe, который игра запустит при старте
+_LAUNCH_KEYS = ("server", "args", "workdir")
+
+
+def _strip_launch_settings(game_dir: Path) -> None:
+    cfg = game_dir / "BepInEx" / "config" / "Russificator.cfg"
+    try:
+        text = cfg.read_text(encoding="utf-8-sig")
+    except OSError:
+        return
+    keep = [ln for ln in text.splitlines()
+            if ln.split("=", 1)[0].strip().lower() not in _LAUNCH_KEYS]
+    if len(keep) != len(text.splitlines()):
+        cfg.write_text("\n".join(keep) + "\n", encoding="utf-8")
 
 
 def _install_reinject(pkg: Package, game_dir: Path, status: StatusFn, notes: List[str]) -> int:

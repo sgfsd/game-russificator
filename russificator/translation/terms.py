@@ -29,6 +29,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from ..core.universal import Entry, EntryStatus, TextKind
 from . import markup
 from .filters import is_cyrillic, looks_translatable
+from .lang import cjk_letters, cjk_text
 from .glossary import RESOURCES, apply_glossary, match_case
 
 log = logging.getLogger("russificator.terms")
@@ -40,7 +41,13 @@ MAX_TERMS = 300
 _HIGHLIGHT_RES = [
     re.compile(r"<(color|b|u)(?:=[^<>\n]*)?>([^<>{}\n]{2,40})</\1>"),
     re.compile(r"\{(color|b|u)(?:=[^{}\n]*)?\}([^<>{}\n]{2,40})\{/\1\}"),
-    re.compile(r"(\\C\[\d+\])([^\\<>{}\n]{2,40})\\C\[0\]"),
+    re.compile(r"(\\[Cc]\[\d+\])([^\\<>{}\n]{2,40})\\[Cc]\[0\]"),
+    # имя в скобках у японских игр: «\c[8]【 トレビー 】\c[0]<br>「…」»
+    re.compile(r"(【)\s*([^【】\n]{1,20}?)\s*】"),
+    # окошко имени RPG Maker «\n<トレビー>» — разметка, имя в нём переводится по словарю терминов (mv_mz);
+    # только иероглифами и каной: латинское имя игрок и так прочтёт, а машинный перевод сделал бы из
+    # «Will» «Волю»
+    re.compile(r"(\\[Nn][CcRr]?<)\s*([^<>\n]{0,19}[぀-ヿ㐀-鿿가-힣][^<>\n]{0,19}?)\s*>"),
 ]
 _COMPOUND_RE = re.compile(r"(?<![\w$])[A-Z][a-z]+[A-Z][a-z]+(?![\w$])")
 
@@ -68,8 +75,12 @@ def genres(sources: List[str]) -> List[str]:
 
 
 def _term_like(t: str) -> bool:
-    """Название, а не фраза и не число: 1–4 слова, первое — с заглавной, без конца предложения."""
+    """Название, а не фраза и не число: 1–4 слова, первое — с заглавной, без конца предложения.
+    Иероглифами и каной (заглавных там нет) — до 12 знаков без пунктуации («トレビー», «魔法の剣»)."""
     t = t.strip()
+    if cjk_text(t):
+        return (1 <= cjk_letters(t) <= 12 and len(t) <= 16
+                and not re.search(r"[。、，！？!?.,:;「」『』【】{}<>\[\]\\=_@#$%]", t))
     words = t.split()
     return (1 <= len(words) <= 4 and t[:1].isalpha() and t[:1].isupper() and not re.search(r"[.!?…:;,\"]$", t)
             and not is_cyrillic(t) and sum(c.isalpha() for c in t) >= 0.6 * len(t)

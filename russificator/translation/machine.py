@@ -53,6 +53,14 @@ BIG_NAME = "opus-mt-tc-big-en-ru"
 BIG_REPO = "https://huggingface.co/NothingSoftware/opus-mt-tc-big-en-zle-ct2-int8/resolve/" \
            "60e35c8d683875ff7ead041d6b9c2ef69237e4e7/"
 BIG_FILES = ("config.json", "shared_vocabulary.json", "source.spm", "target.spm", "model.bin")
+#: SHA-256 и размер файлов сборки выше (сверены с X-Linked-ETag Hugging Face на этом коммите)
+BIG_PINS = {
+    "config.json": ("72901fbd8abd89fb5cf4a388f26fc681f5c4c58a1e1a88b30b879f107270e7ee", 233),
+    "shared_vocabulary.json": ("558fb7414f75540fc3e9f272dac90cb85272083014978e5a8f81c7e35ae2a49b", 2152164),
+    "source.spm": ("3612abfe04bf08344ba91115f0e15e228a7a15a621ea856bfd548097dbaeb43c", 802747),
+    "target.spm": ("22940e744b3a9fd166a04880938fb61f7dfa8ba4b5d2d3f6371a6c4ba8f3b019", 1017004),
+    "model.bin": ("fbd24e6fdfa27fb69d4bbce7968eccef693b7a6249ec09733269e96cf2d1a319", 242630403),
+}
 #: официальный архив той же модели (Tatoeba-MT, Helsinki-NLP) — если сборки выше нет
 BIG_OFFICIAL = "https://object.pouta.csc.fi/Tatoeba-MT-models/eng-zle/" \
                "opusTCv20210807+bt_transformer-big_2022-03-13.zip"
@@ -150,7 +158,9 @@ def _download_big(dest: Path, status: StatusFn, cancel: Optional[threading.Event
                 status(f"Скачивание модели перевода: {done >> 20} из {(total >> 20) or total_mb} МБ",
                        done / total if total else None)
         status("Скачивание модели перевода…", 0.0 if name == "model.bin" else None)
-        net.download(BIG_REPO + name, dest / name, progress=progress, cancel=cancel)
+        sha, size = BIG_PINS[name]
+        net.download(BIG_REPO + name, dest / name, progress=progress, cancel=cancel, sha256=sha,
+                     expected_size=size, strict=True)
 
 
 def _convert_official(dest: Path, status: StatusFn, cancel: Optional[threading.Event]) -> None:
@@ -204,7 +214,9 @@ def install_argos(status: StatusFn = _noop, cancel: Optional[threading.Event] = 
                 rel = Path(*parts[1:])
                 if rel.parts[0] not in ("model", "sentencepiece.model", "metadata.json"):
                     continue  # stanza и README не нужны
-                dest = tmp / rel
+                dest = paths.inside(tmp, rel.as_posix())
+                if dest is None:          # «model/../../файл» — запись мимо папки модели
+                    raise TranslatorError("В архиве модели недопустимый путь — архив не распакован.")
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(info) as src, dest.open("wb") as out:
                     shutil.copyfileobj(src, out)
@@ -286,6 +298,9 @@ class MachineTranslator(Translator):
         self._sp = None
         self._big: Optional[_BigModel] = None
         self.cache_id = "mt:argos-en-ru"
+
+    def supports(self, lang: str) -> bool:
+        return lang == "en"           # обе модели (OPUS-MT, Argos) — с английского на русский
 
     # ---------- подготовка ----------
 
@@ -417,7 +432,7 @@ class MachineTranslator(Translator):
                     lead, core, trail = _strip(sent)
                     caps = _is_caps(core)
                     src = core.lower().capitalize() if caps else core
-                    if markup.has_words(core.replace(sign, " ")):
+                    if markup.has_latin(core.replace(sign, " ")):
                         enqueue(src)
                     sentences.append((lead, src, trail, caps))
                 lines.append((masked, originals, sign, sentences))
@@ -515,7 +530,7 @@ class MachineTranslator(Translator):
         for line in text.split("\n"):
             chunks = [part for is_tag, c in markup.split_by_markup(line)
                       for part in ([(True, c)] if is_tag else self._split_unknown(c))]
-            todo = [c for is_tag, c in chunks if not is_tag and markup.has_words(c)]
+            todo = [c for is_tag, c in chunks if not is_tag and markup.has_latin(c)]
             done = dict(zip(todo, self._run([c.strip() for c in todo])))
             rebuilt = []
             for is_tag, c in chunks:

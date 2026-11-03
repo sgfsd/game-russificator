@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from ..core.universal import Entry, EntryStatus, TextKind, TranslationProject
-from . import filters, keys, markup, terms
+from . import filters, keys, lang, markup, terms
 from .base import Translator, TranslatorError
 from .glossary import GlossaryBuilder, apply_glossary
 from . import edges
@@ -91,10 +91,12 @@ class TranslationService:
         glossary = {**project.glossary, **project.forced_glossary}
 
         groups: Dict[Key, List[Entry]] = {}
+        src = project.meta.get("source_lang") or "en"
         for e in project.entries:
             if e.status not in (EntryStatus.NEW, EntryStatus.FAILED):
                 continue
-            if not markup.has_words(e.source) or markup.is_cyrillic(e.source) or filters.is_brand(e.source):
+            if (not lang.translatable(e.source, src) or markup.is_cyrillic(e.source)
+                    or filters.is_brand(e.source)):
                 e.status = EntryStatus.SKIPPED      # названия («Discord», «Made with Unity») не переводятся
                 stats.skipped += 1
                 continue
@@ -133,7 +135,7 @@ class TranslationService:
                     stats.skipped += 1
                     continue
                 tr = markup.normalize_layout(key[0], tr)    # записи прошлых версий — тоже в порядок
-                checked, why = edges.check(key[0], tr, pending[key][0].speaker)
+                checked, why = edges.check(key[0], tr, pending[key][0].speaker, src)
                 if why:                                    # мусор прошлых версий — переводится заново
                     continue
                 tr = edges.fix(key[0], checked)
@@ -303,7 +305,7 @@ class TranslationService:
         cur: List[Key] = []
         chars = 0
         for key in pending:  # dict сохраняет порядок игры
-            size = len(key[0]) + 20
+            size = lang.display_width(key[0]) + 20      # иероглиф — два знака: перевод вдвое длиннее
             if cur and (len(cur) >= self.tr.max_batch_items or chars + size > self.tr.max_batch_chars):
                 batches.append(cur)
                 cur, chars = [], 0
@@ -334,7 +336,7 @@ class TranslationService:
                 if tr is None:
                     log.info("Разметка потеряна в «%s»: %s", rep.source[:60], lost)
             if tr and tr.strip():
-                tr, why = edges.check(rep.source, tr, rep.speaker)
+                tr, why = edges.check(rep.source, tr, rep.speaker, getattr(self.tr, "source_lang", "en"))
                 if why:
                     log.info("Перевод «%s» отброшен: %s", rep.source[:60], why)
             if not tr or not tr.strip():
@@ -392,11 +394,12 @@ def translate_by_segments(translator: Translator, entry: Entry, glossary: Dict[s
     lines = entry.source.split("\n")
     pieces: List[Tuple[int, int, str]] = []   # (строка, кусок, текст)
     plan: List[List[Tuple[bool, str]]] = []
+    src = getattr(translator, "source_lang", "en")
     for li, line in enumerate(lines):
         chunks = markup.split_by_markup(line)
         plan.append(chunks)
         for ci, (is_tag, text) in enumerate(chunks):
-            if not is_tag and markup.has_words(text):
+            if not is_tag and lang.translatable(text, src):
                 pieces.append((li, ci, text))
     if not pieces:
         return None

@@ -436,3 +436,41 @@ def test_release_readme_has_contacts(tmp_path):
     spec.loader.exec_module(mod)
     text = mod.write(tmp_path).read_text(encoding="utf-8-sig")
     assert branding.GITHUB_URL in text and branding.TELEGRAM_URL in text
+
+
+def test_package_paths_cannot_leave_the_game_folder(tmp_path):
+    """Пути из package.json чужого архива: «..», абсолютный путь и «C:файл» (на Windows — от текущей
+    папки диска) не выводят запись за пределы игры; файлы патчей — только из самого архива."""
+    from russificator.core.package import _check_rel
+    for bad in ("../x.dll", "..\\x.dll", "C:x.dll", "C:/Windows/x.dll", "/etc/x", "a/../../x", "russificator_backup/m.json",
+                "", None, 5):
+        with pytest.raises(PackageError):
+            _check_rel(bad)
+    _check_rel("BepInEx/plugins/x.dll")
+    with pytest.raises(PackageError):
+        _check_rel("../../secret.txt", tmp_path)
+    _check_rel("patches/0.rud", tmp_path)
+
+
+def test_archive_cannot_make_the_game_launch_a_program(tmp_path):
+    """Архив «для друга» с подложенной строкой server= в настройках плагина: при установке строки
+    запуска убираются — игра не запустит чужой exe (плагин к тому же запускает только саму программу)."""
+    game = tmp_path / "Fake"
+    _fake_unity(game)
+    friend = tmp_path / "friend" / "Fake"
+    shutil.copytree(game, friend)
+    _fake_unity_russification(game, tmp_path)
+    z = _export(game, tmp_path / "out")
+    pkg = open_package(z)
+    try:
+        cfg = pkg.data / "files" / "BepInEx" / "config" / "Russificator.cfg"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text("port=47631\nserver=C:/Users/Public/evil.exe\nargs=--serve x --pid {pid}\n"
+                       "workdir=C:/\nfit=true\n", encoding="utf-8")
+        if not any(f["path"] == "BepInEx/config/Russificator.cfg" for f in pkg.info["files"]):
+            pkg.info["files"].append({"path": "BepInEx/config/Russificator.cfg"})
+        install_package(pkg, friend)
+    finally:
+        pkg.close()
+    text = (friend / "BepInEx" / "config" / "Russificator.cfg").read_text(encoding="utf-8")
+    assert "server=" not in text and "args=" not in text and "workdir=" not in text and "fit=true" in text

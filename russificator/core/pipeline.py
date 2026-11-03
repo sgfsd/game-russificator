@@ -79,6 +79,8 @@ class PipelineResult:
     injected: bool = False
     live: bool = False            # можно включить «живой» перевод (Unity)
     game_exe: str = ""
+    #: что нашлось в игре (:func:`found_summary`): строки, уникальные, слова, файлы, типы текста
+    found: Dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> str:
         lines = [f"Движок: {self.engine_title}" + (f" ({self.detection_details})" if self.detection_details else "")]
@@ -101,12 +103,84 @@ class PipelineResult:
         return "\n".join(lines)
 
 
-def _fallback_translator(primary):
-    """Запасной переводчик для строк, которые не дались основному: машинный, если он уже скачан."""
+def _fallback_translator(primary, lang: str = "en"):
+    """Запасной переводчик для строк, которые не дались основному: машинный, если он уже скачан (и игра
+    на английском — с других языков он не переводит)."""
     from ..translation import machine
-    if isinstance(primary, machine.MachineTranslator) or not machine.is_installed():
+    if isinstance(primary, machine.MachineTranslator) or not machine.is_installed() or lang != "en":
         return None
     return machine.MachineTranslator()
+
+
+#: тип текста -> как назвать во фразе «что нашлось»
+_KIND_WORDS = {"dialogue": "реплик", "narration": "описаний", "choice": "вариантов выбора", "ui": "надписей интерфейса",
+               "character_name": "имён", "item_name": "названий предметов", "item_description": "описаний предметов",
+               "system": "сообщений", "other": "прочего текста"}
+
+
+def found_summary(project: TranslationProject) -> Dict[str, Any]:
+    """Что нашлось в игре: строк, уникальных, слов (в китайском и японском — по два знака на слово), файлов,
+    сколько каких типов текста (по уникальным строкам)."""
+    from ..translation import lang, markup
+    unique: Dict[str, Any] = {}
+    files = set()
+    for e in project.entries:
+        unique.setdefault(e.source, e.kind)
+        where = e.scene or (e.target_key or "").split("|", 1)[0]
+        where = where.split(":", 1)[0]
+        if where and where not in ("code", "code-template", "prefix") and not where.startswith("term"):
+            files.add(where)
+    words = 0
+    for text in unique:
+        p = markup.plain_text(text)
+        words += len(re.findall(r"[^\W\d_]+(?:['’-][^\W\d_]+)*", re.sub(lang.CJK_RE, " ", p)))
+        words += (lang.cjk_letters(p) + 1) // 2
+    kinds: Dict[str, int] = {}
+    for kind in unique.values():
+        key = getattr(kind, "value", str(kind))
+        kinds[key] = kinds.get(key, 0) + 1
+    return {"lines": len(project.entries), "unique": len(unique), "words": words, "files": len(files),
+            "kinds": dict(sorted(kinds.items(), key=lambda kv: -kv[1]))}
+
+
+def describe_found(found: Dict[str, Any]) -> str:
+    """«Уникальных строк 5400, слов 61 000, файлов 12: реплик 3100, надписей интерфейса 900, …»."""
+    def num(n: int) -> str:
+        return f"{n:,}".replace(",", " ")
+    head = (f"Уникальных строк {num(found.get('unique', 0))}, слов {num(found.get('words', 0))}"
+            + (f", файлов {num(found['files'])}" if found.get("files") else ""))
+    parts = [f"{_KIND_WORDS.get(k, k)} {num(n)}" for k, n in (found.get("kinds") or {}).items() if n]
+    return head + (": " + ", ".join(parts[:6]) if parts else "")
+
+
+def pick_samples(entries, src: str, count: int = 20, offset: int = 0) -> list:
+    """Строки для пробного перевода: из разных мест игры (равномерно по её порядку) — в основном реплики и
+    описания от четырёх слов, четверть — короткие надписи; без повторов, уже русского, названий. ``offset`` —
+    другая выборка («Другие строки»): места сдвигаются."""
+    from ..translation import filters, lang, markup
+    seen = set()
+    phrases, labels = [], []
+    for e in entries:
+        s = e.source
+        if s in seen or not lang.translatable(s, src) or markup.is_cyrillic(s) or filters.is_brand(s):
+            continue
+        seen.add(s)
+        p = markup.plain_text(s)
+        words = lang.cjk_letters(p) // 2 if lang.cjk_text(p) else len(p.split())
+        if 4 <= words <= 40:
+            phrases.append(e)
+        elif words and len(p.strip()) <= 40:
+            labels.append(e)
+
+    shift = (offset * 0.618) % 1.0
+
+    def spread(items: list, n: int) -> list:
+        if n <= 0 or not items:
+            return []
+        step = len(items) / n
+        return [items[int((i + shift) * step) % len(items)] for i in range(min(n, len(items)))]
+    n_labels = min(len(labels), max(1, count // 4))
+    return spread(phrases, count - n_labels) + spread(labels, count - min(len(phrases), count - n_labels))
 
 
 class _NothingToTranslate(Exception):
@@ -205,7 +279,10 @@ class Pipeline:
             result.errors.append("В игре не найден текст для перевода — ничего не изменено.")
             result.warnings.extend(project.warnings)
             return self._finish(result, project, plugin, save=False)
+        self._source_language(project)
+        result.found = found_summary(project)
         self.info(f"Найдено строк: {len(project.entries)}")
+        self.info(describe_found(result.found))
         self._merge_previous(project, work_dir)
         project.save()
 
@@ -215,6 +292,14 @@ class Pipeline:
             if not project.entries:
                 raise _NothingToTranslate()
             self.stage("translator")
+            src = project.meta.get("source_lang") or "en"
+            if not self.translator.supports(src):
+                from ..translation import lang
+                raise TranslatorError(
+                    f"Игра на {lang.name(src, 3)} языке, а {self.translator.title.lower()} — только с "
+                    "английского. Выберите нейросеть — облачную (DeepSeek и другие) или на вашем ПК: она "
+                    f"переводит и с {lang.name(src, 2)}.")
+            self.translator.source_lang = src
             self.translator.prepare(lambda msg, frac=None: self.emit(type="status", message=msg, fraction=frac),
                                     self.cancel)
             if self.options.use_memory:
@@ -224,7 +309,7 @@ class Pipeline:
                     log.warning("Память переводов недоступна: %s", exc)
             self.stage("translate")
             service = TranslationService(
-                self.translator, memory, cancel=self.cancel, fallback=_fallback_translator(self.translator),
+                self.translator, memory, cancel=self.cancel, fallback=_fallback_translator(self.translator, src),
                 on_progress=lambda d, t, m: self.emit(type="progress", done=d, total=t, message=m))
             stats = service.run(project)
             result.from_memory = stats.from_memory
@@ -283,7 +368,119 @@ class Pipeline:
             log.warning("Снимок состояния не записан: %s", exc)
         return self._finish(result, project, plugin)
 
+    # ---------- пробный перевод ----------
+
+    def preview(self, game_dir: Path, count: int = 20, work_dir: Optional[Path] = None,
+                offset: int = 0) -> Dict[str, Any]:
+        """Пробный перевод до русификации: найти текст игры и перевести выбранным способом ``count`` строк из
+        разных мест (реплики, описания, интерфейс) — оценить качество, не переводя всю игру. Игра не меняется:
+        текст берётся из прошлого проекта (у русифицированной игры файлы уже русские) или извлекается во
+        временную папку. Переводы остаются в памяти — полный перевод тем же способом их не повторит."""
+        import tempfile
+        from ..translation import edges, filters, lang, markup
+        game_dir = Path(game_dir).resolve()
+        work_dir = Path(work_dir) if work_dir else project_dir(game_dir)
+        self.stage("detect")
+        plugin, det = detect_engine(game_dir)
+        plugin.status = lambda msg, frac=None: self.emit(type="status", message=msg, fraction=frac)
+        plugin.cancel = self.cancel
+        project = None
+        if (work_dir / TranslationProject.PROJECT_FILE).is_file():
+            try:
+                project = TranslationProject.load(work_dir)
+            except Exception as exc:  # noqa: BLE001
+                log.info("прошлый проект не прочитан: %s", exc)
+        tmp = None
+        if project is None or not project.entries:
+            if GameBackup(game_dir).exists:
+                raise TranslatorError("Игра уже русифицирована, а её проекта перевода нет — сначала откатите "
+                                      "русификацию.")
+            self.stage("extract")
+            tmp = tempfile.TemporaryDirectory(prefix="ru_preview_")
+            project = TranslationProject(game_dir, plugin.engine_id, Path(tmp.name))
+            project.backup = GameBackup(game_dir)
+            prepared = plugin.pre_extract(game_dir, project)
+            plugin.extract(Path(prepared) if prepared else game_dir, project)
+            self._source_language(project)
+        try:
+            src = project.meta.get("source_lang") or lang.detect(e.source for e in project.entries)
+            found = describe_found(found_summary(project))
+            samples = pick_samples(project.entries, src, count, offset)
+            if not samples:
+                raise TranslatorError("В игре не нашлось текста для пробного перевода.")
+            self.stage("translator")
+            if not self.translator.supports(src):
+                raise TranslatorError(f"Игра на {lang.name(src, 3)} языке, а {self.translator.title.lower()} — "
+                                      "только с английского. Выберите нейросеть.")
+            self.translator.source_lang = src
+            self.translator.prepare(lambda msg, frac=None: self.emit(type="status", message=msg, fraction=frac),
+                                    self.cancel)
+            self.stage("translate")
+            done: Dict[str, str] = {}
+            step = max(1, self.translator.max_batch_items)
+            for i in range(0, len(samples), step):
+                if self.cancel.is_set():
+                    break
+                self.emit(type="progress", done=i, total=len(samples), message=f"Пробный перевод: {i} из "
+                                                                                f"{len(samples)}")
+                done.update(self.translator.translate(samples[i:i + step], dict(project.glossary)) or {})
+            pairs, keep = [], {}
+            for e in samples:
+                tr = done.get(e.id)
+                why = None
+                if tr:
+                    tr = markup.normalize_layout(e.source, tr)
+                    tr, why = edges.check(e.source, tr, e.speaker, src)
+                    if tr and not markup.same_markup(e.source, tr):
+                        tr, why = None, "потеряна разметка"
+                    if tr:
+                        tr = edges.fix(e.source, tr)
+                        keep[(e.source, e.speaker if self.translator.context_aware else None)] = tr
+                pairs.append({"source": e.source, "translation": tr or "", "problem": "" if tr else
+                              (why or "переводчик не ответил"), "kind": getattr(e.kind, "value", str(e.kind))})
+            self._remember(keep)
+            return {"pairs": pairs, "lang": src, "lang_name": lang.name(src, 1), "found": found,
+                    "translator": self.translator.title}
+        finally:
+            try:
+                self.translator.close()
+            except Exception:  # noqa: BLE001
+                pass
+            if tmp is not None:
+                tmp.cleanup()
+
+    def _remember(self, pairs: Dict[Any, str]) -> None:
+        """Переводы пробного прохода — в память переводов (полный перевод их не повторит)."""
+        if not pairs or not self.options.use_memory:
+            return
+        try:
+            memory = TranslationMemory(paths.cache_dir() / "translations.db")
+            try:
+                by_ns: Dict[str, Dict[Any, str]] = {}
+                for key, tr in pairs.items():
+                    by_ns.setdefault(self.translator.memory_ns(key[0]), {})[key] = tr
+                for ns, part in by_ns.items():
+                    memory.put_many(ns, part)
+            finally:
+                memory.close()
+        except Exception as exc:  # noqa: BLE001
+            log.info("пробные переводы не запомнены: %s", exc)
+
     # ---------- помощники ----------
+
+    def _source_language(self, project: TranslationProject) -> None:
+        """Язык оригинала (``translation.lang``). Строки другого письма — другие языки игры (китайская
+        локализация рядом с английской, «日本語» в выборе языка), а не её текст: в перевод они не идут."""
+        from ..translation import lang
+        src = lang.detect(e.source for e in project.entries)
+        project.meta["source_lang"] = src
+        before = len(project.entries)
+        project.entries = [e for e in project.entries
+                           if lang.translatable(e.source, src) or not lang.has_cjk(e.source)]
+        if src != "en":
+            self.info(f"Язык оригинала: {lang.name(src, 1)}")
+        if before != len(project.entries):
+            log.info("Строки на других языках игры (%d) не переводятся", before - len(project.entries))
 
     def _merge_previous(self, project: TranslationProject, work_dir: Path) -> None:
         # переводы прошлого прохода берём, только если переводил тот же способ и та же модель:
@@ -311,8 +508,13 @@ class Pipeline:
         from ..translation.length import over_limit, was_trimmed
         version = self.translator.rules_version()
         old_version = int(old.meta.get("rules", 0) or 0)
+        from ..translation import filters
         for e in project.entries:        # переводы прошлых версий программы — к нынешним правилам
             if not e.translation:
+                continue
+            if filters.is_brand(e.source) and not (e.notes or {}).get("edited"):
+                e.translation, e.status = None, EntryStatus.SKIPPED  # «English» в выборе языка — как в игре
+                n -= 1
                 continue
             if keys.stale(e.source, e.translation):
                 e.translation, e.status = None, EntryStatus.NEW      # клавиши — по правилу, не из прошлого
@@ -328,7 +530,7 @@ class Pipeline:
                 e.translation, e.status = None, EntryStatus.NEW
                 n -= 1
                 continue
-            checked, why = edges.check(e.source, e.translation, e.speaker)
+            checked, why = edges.check(e.source, e.translation, e.speaker, project.meta.get("source_lang") or "en")
             if not why and not same_markup(e.source, normalize_layout(e.source, e.translation)):
                 why = "разметка не совпадает"                         # правила разметки уточнились
             if why:                                                   # мусор вместо перевода — заново

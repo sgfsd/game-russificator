@@ -92,6 +92,11 @@ def main(argv=None) -> int:
 
     sub.add_parser("games", help="установленные игры на компьютере")
 
+    p = sub.add_parser("table", help="таблица перевода «оригинал — перевод» и словарь терминов (CSV для Excel)")
+    p.add_argument("game_dir")
+    p.add_argument("--out", default=".", help="куда сохранить таблицы")
+    p.add_argument("--load", default="", help="загрузить исправленную таблицу (или словарь терминов) в проект")
+
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s: %(message)s")
@@ -187,6 +192,24 @@ def main(argv=None) -> int:
             return 1
         finally:
             pkg.close()
+
+    if args.cmd == "table":
+        from russificator.core import table
+        from russificator.core.pipeline import project_dir
+        game = Path(args.game_dir)
+        try:
+            if args.load:
+                res = table.import_table(project_dir(game), Path(args.load))
+                print(f"Загружено: переводов {res['translations']}, терминов {res['terms']}. Русифицируйте игру "
+                      "ещё раз (тем же способом) — исправления лягут в игру.")
+            else:
+                res = table.export_table(project_dir(game), Path(args.out), game.resolve().name)
+                print(f"Таблица: {res['table']} ({res['rows']} строк)")
+                print(f"Термины: {res['glossary']} ({res['terms']})")
+        except table.TableError as exc:
+            print(f"Ошибка: {exc}")
+            return 2
+        return 0
 
     if args.cmd == "games":
         from russificator.library import discover

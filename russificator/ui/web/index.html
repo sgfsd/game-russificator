@@ -159,6 +159,7 @@
                   <button class="icon-btn" id="refreshModels" title="Загрузить список моделей у провайдера"><span class="i" data-icon="refresh"></span></button>
                 </div>
                 <datalist id="modelList"></datalist>
+                <div class="mpicks hidden" id="modelPick"></div>
                 <span class="muted small" id="modelHint"></span>
               </label>
             </div>
@@ -182,6 +183,7 @@
           <div class="run-actions">
             <button class="btn ghost" id="restoreBtn" disabled title="Вернуть игре оригинальные файлы"><span class="i" data-icon="undo"></span>Откатить</button>
             <button class="btn" id="exportBtn" disabled title="Архив с установщиком — отправьте другу"><span class="i" data-icon="package"></span>Создать файл русификатора</button>
+            <button class="btn" id="previewBtn" disabled title="Перевести 20 строк из разных мест игры — оценить качество до полного перевода"><span class="i" data-icon="eye"></span>Пробный перевод</button>
             <button class="btn primary big" id="startBtn" disabled><span class="i" data-icon="play"></span>Русифицировать</button>
           </div>
         </div>
@@ -608,6 +610,27 @@
 </div>
 
 <!-- ============ полнота перевода ============ -->
+<div class="modal hidden" id="previewModal">
+  <div class="modal-card export cov">
+    <button class="modal-x" data-close><span class="i" data-icon="x"></span></button>
+    <div class="export-hero">
+      <div class="export-badge"><span class="i" data-icon="eye"></span></div>
+      <h2>Пробный перевод</h2>
+      <p>Двадцать строк из разных мест игры <b id="pvGame"></b>, переведённые выбранным способом, — чтобы оценить
+        качество до полного перевода. Игра не меняется, а переведённое запомнится.</p>
+    </div>
+    <div class="export-body">
+      <div class="dl hidden" id="pvProgress"><div class="bar indeterminate"><div class="bar-fill"></div></div><div class="dl-text muted"></div></div>
+      <div id="pvBody" class="cov-body"></div>
+    </div>
+    <div class="row gap end export-foot">
+      <button class="btn ghost" data-close>Закрыть</button>
+      <button class="btn" id="pvAgain"><span class="i" data-icon="refresh"></span>Другие строки</button>
+      <button class="btn primary" id="pvGo"><span class="i" data-icon="play"></span>Русифицировать</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal hidden" id="covModal">
   <div class="modal-card export cov">
     <button class="modal-x" data-close><span class="i" data-icon="x"></span></button>
@@ -638,6 +661,18 @@
     <div class="row gap end">
       <button class="btn ghost" data-close>Отмена</button>
       <button class="btn primary" id="confirmOk">Да</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal hidden" id="choiceModal">
+  <div class="modal-card confirm">
+    <h2 id="choiceTitle"></h2>
+    <p class="muted" id="choiceText"></p>
+    <div class="row gap end">
+      <button class="btn ghost" data-close>Отмена</button>
+      <button class="btn" id="choiceAlt"></button>
+      <button class="btn primary" id="choiceMain"></button>
     </div>
   </div>
 </div>

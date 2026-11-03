@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 from ..core.universal import Entry
 from . import markup
 from .base import Translator
+from .lang import display_width
 
 
 #: во сколько раз русский текст может быть длиннее английского, не выходя за место оригинала
@@ -27,7 +28,8 @@ _ROOM = 1.2
 
 
 def _visible_len(text: str) -> int:
-    return len(markup.plain_text(text).strip())
+    """Место оригинала в знаках латиницы: иероглиф и полноширинный знак занимают два."""
+    return display_width(markup.plain_text(text).strip())
 
 
 #: короткому слову запас нужен больше, чем длинной фразе: «About» → «О программе», «Load» → «Загрузить»

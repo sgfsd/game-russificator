@@ -41,6 +41,13 @@ class Server:
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
+                if mode == "html":                          # прокси вместо файла отдал страницу с кодом 200
+                    page = b"<html><body>Access denied</body></html>"
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(page)))
+                    self.end_headers()
+                    self.wfile.write(page)
+                    return
                 data = DATA if mode != "other" else DATA[:-1] + b"x"
                 m = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range") or "")
                 if mode == "norange" or not m:
@@ -192,3 +199,34 @@ def test_everything_hangs_error_keeps_downloaded_part(srv, tmp_path, monkeypatch
     msg = str(e.value)
     assert "нет данных" in msg and "Скачать" in msg and "127.0.0.1" in msg
     assert dest.with_name("m.gguf.part").is_file() and dest.with_name("m.gguf.part.json").is_file()
+
+
+def test_strict_download_ignores_what_the_server_says(srv, tmp_path):
+    """Исполняемые архивы (BepInEx, XUnity, llama.cpp) и зеркала GitHub: файл принимается только с
+    SHA-256, записанной в программе. Зеркало с другим файлом (и своим хешем в заголовке) не годится,
+    хотя без strict его хеш был бы важнее записанного."""
+    with pytest.raises(net.NetError):
+        net.download([srv.url("other")], tmp_path / "x.zip", sha256=SHA, strict=True)
+    assert not (tmp_path / "x.zip").exists()
+    out = net.download([srv.url("other"), srv.url("ok")], tmp_path / "m.zip", sha256=SHA, strict=True)
+    _check(out)
+    with pytest.raises(ValueError):
+        net.download([srv.url("ok")], tmp_path / "y.zip", strict=True)          # strict без хеша — ошибка
+
+
+def test_strict_download_skips_a_mirror_that_answers_with_a_page(srv, tmp_path):
+    """github.com не открывается, первое зеркало вместо архива отдаёт страницу с кодом 200: её размер не
+    становится «правильным», нормальное зеркало не отбраковывается — файл скачивается с него."""
+    out = net.download([srv.url("html"), srv.url("ok")], tmp_path / "a.zip", sha256=SHA, expected_size=SIZE,
+                       strict=True)
+    _check(out)
+    out = net.download([srv.url("html"), srv.url("norange")], tmp_path / "b.zip", sha256=SHA, expected_size=SIZE,
+                       strict=True)                                            # без кусков — одним потоком
+    _check(out)
+
+
+def test_github_mirrors_follow_the_original():
+    urls = net.with_github_mirrors(["https://github.com/a/b/releases/download/v1/x.zip", "https://example.com/y"])
+    assert urls[0] == "https://github.com/a/b/releases/download/v1/x.zip" and urls[1] == "https://example.com/y"
+    assert all(u.endswith("github.com/a/b/releases/download/v1/x.zip") for u in urls[2:])
+    assert len(urls) == 2 + len(net.GITHUB_PROXIES)

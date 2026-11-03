@@ -375,12 +375,12 @@ class App:
     def _on_package(self, pkg) -> None:
         self.pkg = pkg
         g = pkg.game
-        st = pkg.info.get("stats") or {}
+        st = pkg.info.get("stats") if isinstance(pkg.info.get("stats"), dict) else {}
         self.root.title(f"Русификатор — {pkg.title}")
         self.title_lbl.configure(text=pkg.title)
         meta = [str(g.get("engine_title") or pkg.engine)]
         if st.get("total"):
-            total = int(st.get("total", 0) or 0)
+            total = _count(st.get("total"))
             word = "строки" if total % 10 == 1 and total % 100 != 11 else "строк"
             meta.append(f"переведено {_n(st.get('translated', 0))} из {_n(total)} {word}")
         if pkg.info.get("translator"):
@@ -562,6 +562,14 @@ class App:
             self.play_btn.show()
         else:
             self.play_btn.hide()
+
+
+def _count(v: Any) -> int:
+    """Неотрицательное целое из package.json чужого архива или 0."""
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _n(v: Any) -> str:

@@ -320,6 +320,31 @@ def test_llm_bad_key_is_fatal(fake_api):
     assert err.value.fatal and "Ключ" in str(err.value)
 
 
+def test_llm_region_block_is_explained(fake_api, monkeypatch):
+    """Gemini, OpenAI и Claude не работают из России: 403 выглядел как «ключ не подходит», а 400 от
+    Gemini — как отказ в одном запросе, и перевод шёл дальше, проваливая строку за строкой."""
+    from russificator import net
+    from russificator.translation import cloud
+    for status, payload in [
+            (400, [{"error": {"code": 400, "message": "User location is not supported for the API use.",
+                              "status": "FAILED_PRECONDITION"}}]),
+            (403, {"error": {"code": "unsupported_country_region_territory",
+                             "message": "Country, region, or territory not supported", "type": "request_forbidden"}}),
+            (403, {"type": "error", "error": {"type": "forbidden", "message": "Request not allowed"}})]:
+        _FakeOpenAI.script = [(status, payload)]
+        tr = cloud.CloudTranslator("custom", "k", base_url=fake_api, model="m")
+        with pytest.raises(TranslatorError) as err:
+            tr.translate([Entry(id="a", source="Hi")], {})
+        assert err.value.fatal and "VPN" in str(err.value) and "Ключ" not in str(err.value)
+
+    def blocked(self):
+        raise net.NetError("HTTP 403: Country, region, or territory not supported", status=403,
+                           body='{"error": {"code": "unsupported_country_region_territory"}}')
+    monkeypatch.setattr(cloud.ChatClient, "list_models", blocked)
+    with pytest.raises(TranslatorError, match="VPN"):                     # «Обновить список моделей»
+        cloud.list_models("openai", "k")
+
+
 def test_llm_splits_batch_on_garbage(fake_api):
     from russificator.translation.cloud import CloudTranslator
     garbage = {"choices": [{"message": {"content": "sorry, I can't"}, "finish_reason": "stop"}]}
@@ -334,6 +359,16 @@ def test_cloud_list_models_recommends(fake_api):
     models = list_models("custom", "k", fake_api)
     assert "whisper-1" not in models
     assert models[0] == "model-flash"  # «думающие» модели — в конце
+
+
+def test_lmstudio_models_are_not_hidden():
+    """LM Studio: две «сайги», Qwen-coder и эмбеддинг — выбрать давало только две «сайги».
+    Не для текста только эмбеддинг; кодерская модель в конце списка, но есть."""
+    from russificator.translation.cloud import recommend
+    got = recommend("lmstudio", ["saiga_llama3_8b", "qwen2.5-coder-7b-instruct", "saiga_mistral_7b",
+                                 "text-embedding-nomic-embed-text-v1.5"])
+    assert set(got) == {"saiga_llama3_8b", "saiga_mistral_7b", "qwen2.5-coder-7b-instruct"}
+    assert got[-1] == "qwen2.5-coder-7b-instruct"
 
 
 # ============================= живой перевод =============================
@@ -377,6 +412,33 @@ def test_live_server_waits_for_translator_and_never_errors_on_bad_markup():
         assert _get(port, "N0D3H3X3R") == (200, "N0D3H3X3R")
     finally:
         srv.stop()
+
+
+def test_live_server_leaves_other_locale_strings_alone():
+    """Английская игра: строки китайской, японской локализации приходят в живой перевод, но английская
+    модель их не переводит («攻撃», «UI尺寸» → каша). В японской игре те же строки — текст игры."""
+    from russificator.translation.live_server import LiveServer
+
+    calls = []
+
+    def fn(e):
+        calls.append(e.source)
+        return "Атака" if e.source == "攻撃" else "RU:" + e.source
+
+    for src, expected in (("en", {"攻撃": "攻撃", "UI尺寸": "UI尺寸", "Hello there": "RU:Hello there",
+                                  "\\c[0]Put it down and\\c[23] 捨てぷ 番号\\c[0].": "RU:\\c[0]Put it down and\\c[23] 捨てぷ 番号\\c[0]."}),
+                          ("ja", {"攻撃": "Атака", "Hello there": "RU:Hello there"})):
+        tr = FakeTranslator(fn=fn)
+        tr.source_lang = src
+        srv = LiveServer(tr)
+        port = _free_port()
+        srv.start(port, prepare=lambda: None)
+        try:
+            for text, want in expected.items():
+                assert _get(port, text) == (200, want), (src, text)
+        finally:
+            srv.stop()
+    assert "攻撃" in calls and calls.count("攻撃") == 1       # английская игра её не отправляла
 
 
 def test_live_server_reports_failed_preparation():
@@ -633,11 +695,22 @@ def test_edges_follow_the_original(source, translation, expected):
      '{"9": "Есть время и место", "type": "dialogue", "speak', None),                   # кусок JSON
     ("Some places have a pull on people, don't they? Sometimes you think you have a choice.",
      "Места тянут.", None),                                                              # пересказ
+    # машинный перевод зациклился на протяжном звуке (Date Everything, Undertale 2, Parasitic Evil…)
+    ("Ohhhh, the dishes go in that way! Nailed it.", "О" * 60, None),
+    ("\\n<???>HelloOOOOOOOOOOOOOOO...", "\\n<???>Hello" + "O" * 48, None),
 ])
 def test_garbage_translations_are_rejected(source, translation, speaker):
     from russificator.translation import edges
     fixed, why = edges.check(source, translation, speaker)
     assert fixed is None and why
+
+
+def test_drawn_out_sounds_are_kept():
+    """Протяжный звук оригинала («Noooooo!», «AAAAAAAAAAAAAHHHHH») переводится таким же — это не зацикливание."""
+    from russificator.translation import edges
+    assert edges.check("Noooooooooooo!", "Нееееееееееет!")[1] is None
+    assert edges.check("Aaaaaaaaaah!", "Аааааааааах!")[1] is None
+    assert edges.check("''OooOooOooooOOoo! I'm a ghost!''", "''Ооооооооооо! Я призрак!''")[1] is None
 
 
 def test_json_reply_with_one_russian_string_is_salvaged():
@@ -677,6 +750,87 @@ def test_live_local_model_fits_free_vram(monkeypatch):
     roomy = local_llm.LocalTranslator("gemma4-12b", fit_vram=True)
     roomy._fit_to_vram(lambda m, f=None: None)
     assert roomy.preset.id == "gemma4-12b"
+
+
+def test_local_model_falls_back_when_the_engine_crashes(monkeypatch, tmp_path):
+    """RTX 5070, живой перевод: «Нейросеть не запустилась: … srv llama_server: initializing» — llama.cpp
+    падал при подключении к видеокарте (оверлеи, драйвер). Теперь: ещё раз без встраиваемых слоёв
+    Vulkan, затем на процессоре копией без модуля видеокарты; удачный вариант запоминается."""
+    from russificator.translation import local_llm
+    monkeypatch.setattr(local_llm, "_START_MODE", "")
+    tried = []
+
+    def fake_start(self, status=None, cancel=None, timeout=600):
+        mode = ("cpu" if "cpu" in str(self.exe) else
+                "gpu-no-layers" if self.env.get("VK_LOADER_LAYERS_DISABLE") else "gpu")
+        tried.append((mode, self.use_gpu))
+        if mode != "cpu":
+            raise local_llm.ServerCrashed("Нейросеть не запустилась", 0xC0000005)
+        self.port = 1
+
+    monkeypatch.setattr(local_llm.LlamaServer, "start", fake_start)
+    monkeypatch.setattr(local_llm, "cpu_runtime_exe", lambda: tmp_path / "llama.cpp-cpu" / "llama-server.exe")
+    tr = local_llm.LocalTranslator("gemma4-e2b")
+    msgs = []
+    server = tr._start_server(tmp_path / "llama.cpp" / "llama-server.exe", tmp_path / "m.gguf",
+                              lambda m, f=None: msgs.append(m), None)
+    assert [m for m, _ in tried] == ["gpu", "gpu-no-layers", "cpu"] and tried[-1][1] is False
+    assert "llama.cpp-cpu" in str(server.exe) and local_llm._START_MODE == "cpu"
+    assert any("процессоре" in m for m in msgs)
+    tried.clear()                                             # следующий запуск — сразу удачным способом
+    tr._start_server(tmp_path / "llama.cpp" / "llama-server.exe", tmp_path / "m.gguf", lambda m, f=None: None, None)
+    assert [m for m, _ in tried] == ["cpu"]
+
+    monkeypatch.setattr(local_llm, "_START_MODE", "")
+    monkeypatch.setattr(local_llm.LlamaServer, "start",
+                        lambda self, *a, **k: (_ for _ in ()).throw(local_llm.ServerCrashed("упал", 0xC0000135)))
+    with pytest.raises(local_llm.TranslatorError) as e:
+        tr._start_server(tmp_path / "x.exe", tmp_path / "m.gguf", lambda m, f=None: None, None)
+    assert "машинный перевод" in str(e.value) and "llama-server.log" in str(e.value)
+
+
+def test_engine_env_drops_overlay_layers(monkeypatch):
+    from russificator.translation import local_llm
+    monkeypatch.setenv("ENABLE_VK_LAYER_VALVE_steam_overlay_1", "1")
+    monkeypatch.setenv("VK_INSTANCE_LAYERS", "VK_LAYER_x")
+    env = local_llm.runtime_env()
+    assert "ENABLE_VK_LAYER_VALVE_steam_overlay_1" not in env and "VK_INSTANCE_LAYERS" not in env
+    assert env["DISABLE_VK_LAYER_VALVE_steam_overlay_1"] == "1" and "VK_LOADER_LAYERS_DISABLE" not in env
+    assert local_llm.runtime_env(no_layers=True)["VK_LOADER_LAYERS_DISABLE"] == "~implicit~"
+    assert "Visual C++" in local_llm.exit_reason(0xC0000135) and "0xC0000005" in local_llm.exit_reason(-1073741819)
+
+
+def test_crashed_gpu_probe_is_not_called_missing_gpu(monkeypatch, tmp_path):
+    """«Видеокарта не найдена» при RTX 5070: опрос видеокарт падал, и пустой список выдавался за
+    отсутствие видеокарты. Теперь видна причина, а опрос повторяется без встраиваемых слоёв."""
+    import subprocess
+    from types import SimpleNamespace
+    from russificator.translation import local_llm
+    exe = tmp_path / "llama-server.exe"
+    exe.write_bytes(b"MZ")
+    monkeypatch.setattr(local_llm, "server_exe", lambda: exe)
+    calls = []
+
+    def run(args, **kw):
+        calls.append(kw["env"].get("VK_LOADER_LAYERS_DISABLE"))
+        if len(calls) == 1:
+            return SimpleNamespace(returncode=0xC0000005, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stderr="",
+                               stdout="Available devices:\n  Vulkan0: NVIDIA GeForce RTX 5070 (12227 MiB, 11000 MiB free)\n")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    devs = local_llm.gpu_devices()
+    assert calls == [None, "~implicit~"] and devs[0]["name"] == "NVIDIA GeForce RTX 5070"
+    assert local_llm.gpu_probe_error() == ""
+    monkeypatch.setattr(subprocess, "run", lambda args, **kw: SimpleNamespace(returncode=0xC0000005, stdout="", stderr=""))
+    assert local_llm.gpu_devices() == [] and "0xC0000005" in local_llm.gpu_probe_error()
+
+
+def test_ngui_color_tags_are_kept_by_translation():
+    """Цветовые теги NGUI ([1b130a]…[2a780d]Blacksmith[-]) — разметка: переводчик их не трогает."""
+    s = "[1b130a]My opinion differs. Look for a suitable [2a780d]Blacksmith[-]. [b]Now[/b]"
+    assert [m.group(0) for m in markup.MARKUP_RE.finditer(s)] == ["[1b130a]", "[2a780d]", "[-]", "[b]", "[/b]"]
+    assert markup.same_markup(s, "[1b130a]Я думаю иначе. Найдите [2a780d]Кузнеца[-]. [b]Сейчас[/b]")
 
 
 # ---------- клавиши, имена, мусор живого перевода (отзыв 2026-10-27) ----------
@@ -733,6 +887,23 @@ def test_edges_reject_mixed_script_and_fix_ukrainian_letters():
     assert edges.check("WHAT? No way!", "ЧТO? Не может быть!") == ("ЧТО? Не может быть!", None)
     assert edges.check("DAVID MOST", "ДЕЙВІД МОСТ") == ("ДЕЙВИД МОСТ", None)
     assert edges.check("Use the iPhone app", "Используй приложение для iPhone") == ("Используй приложение для iPhone", None)
+
+
+def test_slash_n_line_breaks_are_markup():
+    """«/n» — перенос строки у части игр (Mad Island). «nYou» считался названием из кода, а «/nЕсли» в
+    переводе — словом из двух алфавитов: реплики уходили на повтор и пропадали. «com/news», «and/nor»
+    и склейка «буква/n+строчная» переносом не считаются — одинаково в оригинале и в переводе."""
+    from russificator.translation import edges
+    assert markup.tokens("My bad.../nI'm ready now...") == ["/n"]
+    assert markup.tokens("this island/nI've wanted to come") == ["/n"]
+    assert markup.tokens("Agh♥/nI'll never give in!") == ["/n"]
+    assert markup.tokens("for now.../nlet's stay") == ["/n"]
+    assert markup.tokens("see x.com/news and/nor") == [] and markup.tokens("so empty/nit was") == []
+    assert markup.tokens("Type /name to rename") == [] and markup.tokens("/new game") == []
+    assert markup.tokens("MikuMikuDance") == ["MikuMikuDance"]                      # названия — как были
+    assert markup.same_markup("Wait, what??/nSanta’s been looking for me?!", "Что??/nСанта меня искал?!")
+    assert edges.check("真的……能改变吗？/n那样的话", "Правда?/nЕсли так") == ("Правда?/nЕсли так", None)
+    assert edges.check("so empty/nit was easy", "так пусто/nчто было легко")[1] is None
 
 
 def test_machine_retry_helpers():
